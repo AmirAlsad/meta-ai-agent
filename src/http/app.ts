@@ -5,9 +5,18 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import type pino from 'pino';
 import type { Config } from '../config/loader.js';
 import { createMetaSignatureVerifier } from './security.js';
+import { traceMiddleware, requestContextFromLocals } from './trace.js';
+import { validateAdminToken } from './auth.js';
+import { redactConversationRecord, redactStatusRecord } from './redaction.js';
 import { parseMetaWebhook } from '../meta/parser.js';
 import type { IncomingMessage, ParseResult, StatusUpdate } from '../meta/types.js';
 import type { ConversationAgent } from '../conversation/agent.js';
+import type { AgentMetrics } from '../metrics/registry.js';
+import type { MetricsCollector } from '../metrics/collector.js';
+import { renderPrometheus, PROMETHEUS_CONTENT_TYPE } from '../metrics/prometheus.js';
+import type { StatusTracker } from '../status/tracker.js';
+import type { ConversationStore } from '../conversation/store.js';
+import type { BufferScheduler } from '../conversation/scheduler.js';
 
 export interface AppDeps {
   config: Config;
@@ -19,6 +28,22 @@ export interface AppDeps {
    * {@link dispatchWebhook}.
    */
   agent?: ConversationAgent;
+  /**
+   * Stage 6 observability deps — ALL OPTIONAL so the Stage 5 call sites
+   * (`createApp({config, logger})` / `createApp({config, logger, agent})`) keep
+   * compiling and behaving exactly as before. Each one independently gates a
+   * piece of the observability surface:
+   *  - `metrics`          → webhook counters on the POST /webhook path.
+   *  - `metricsCollector` → required (with adminApiToken) to MOUNT GET /metrics.
+   *  - `statusTracker`    → required (with adminApiToken) to MOUNT GET /admin/status.
+   *  - `store`            → required (with adminApiToken) to MOUNT GET /admin/conversations.
+   *  - `scheduler`        → drives the GET /ready dependency check.
+   */
+  metrics?: AgentMetrics;
+  metricsCollector?: MetricsCollector;
+  statusTracker?: StatusTracker;
+  store?: ConversationStore;
+  scheduler?: BufferScheduler;
 }
 
 /**
@@ -30,7 +55,7 @@ export type Channel = 'whatsapp' | 'messenger' | 'instagram' | 'unknown';
 
 type RawBodyRequest = Request & { rawBody?: Buffer };
 
-const PACKAGE_VERSION: string = (() => {
+export const PACKAGE_VERSION: string = (() => {
   try {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const pkgPath = path.resolve(here, '../../package.json');
@@ -78,13 +103,26 @@ export function objectToChannel(object: unknown): Channel {
  * Returns the {@link ParseResult} so callers (unit tests) can act on it. The
  * HTTP route handler discards the (promised) return value after ACKing 200 —
  * Meta retries non-2xx for 7 days so we ACK before we parse.
+ *
+ * `opts.metrics` (OPTIONAL) increments the webhook counters here, keyed on the
+ * channel summary: `webhook_received_total{result:'accepted'|'parse_error'}` and
+ * (on the defensive parse catch) `webhook_parse_failures_total`. `opts.traceId`/
+ * `opts.requestLogger` carry the trace context the HTTP layer stamped — when a
+ * request logger is supplied it REPLACES the base logger for this dispatch (so
+ * every log line, including the agent's, shares the request's traceId) and the
+ * traceId is threaded into the agent's handle* calls.
  */
 export async function dispatchWebhook(
   body: unknown,
   logger: pino.Logger,
   _config: Config,
-  agent?: ConversationAgent
+  agent?: ConversationAgent,
+  opts?: { metrics?: AgentMetrics; traceId?: string; requestLogger?: pino.Logger }
 ): Promise<ParseResult> {
+  // Prefer the request-scoped child logger (carries traceId + route) when the
+  // HTTP layer supplied one, so this dispatch's logs correlate to the webhook.
+  const log = opts?.requestLogger ?? logger;
+  const metrics = opts?.metrics;
   const objectField =
     body !== null && typeof body === 'object'
       ? (body as { object?: unknown }).object
@@ -103,19 +141,29 @@ export async function dispatchWebhook(
   try {
     result = parseMetaWebhook(body);
   } catch (err) {
-    logger.error({ err, channel }, 'dispatcher parse failed unexpectedly');
+    log.error({ err, channel }, 'dispatcher parse failed unexpectedly');
+    // A defensive-catch parse failure: count both the failure (with a reason)
+    // and the webhook with a `parse_error` disposition. Optional-chained so the
+    // metric-less callers (parse+log-only tests) are unaffected.
+    metrics?.webhookParseFailures.inc({ channel, reason: 'exception' });
+    metrics?.webhookReceived.inc({ channel, result: 'parse_error' });
     result = { messages: [], statuses: [] };
+    return result;
   }
+  // Parsed successfully (the parser returns an empty result for malformed-but-
+  // recognized payloads rather than throwing). Count one accepted webhook per
+  // channel summary.
+  metrics?.webhookReceived.inc({ channel, result: 'accepted' });
 
   // Per-message logs. Use `warn` for `type: 'unknown'` so unmodeled inbounds
   // surface in observability; `info` for everything else.
   for (const msg of result.messages) {
-    logIncomingMessage(logger, msg);
+    logIncomingMessage(log, msg);
   }
 
   // Per-status logs are always `info` — status updates are routine.
   for (const status of result.statuses) {
-    logStatusUpdate(logger, status);
+    logStatusUpdate(log, status);
   }
 
   // Channel-level summary log. Kept as the FINAL emit so its position in the
@@ -130,9 +178,9 @@ export async function dispatchWebhook(
   };
 
   if (channel === 'unknown') {
-    logger.warn({ ...summaryFields, objectField }, 'inbound webhook with unknown object field');
+    log.warn({ ...summaryFields, objectField }, 'inbound webhook with unknown object field');
   } else {
-    logger.info(summaryFields, 'inbound webhook received');
+    log.info(summaryFields, 'inbound webhook received');
   }
 
   // Route parsed messages/statuses into the conversation agent when one is
@@ -145,10 +193,20 @@ export async function dispatchWebhook(
     // conversation sees its batched messages in arrival order. The agent's
     // per-key lock independently prevents the read-modify-write clobber. Every
     // `handle*` is fail-soft (logs and swallows internally; never throws out),
-    // so the loop cannot reject. traceId is `undefined` until Stage 6 wires
-    // trace middleware.
-    const traceId: string | undefined = undefined;
-    const handleOpts = traceId !== undefined ? { traceId } : undefined;
+    // so the loop cannot reject.
+    //
+    // Stage 6: thread the request-scoped trace context (set by traceMiddleware
+    // and pulled off res.locals in the POST handler) into every handle* call so
+    // the agent's log lines — and the traceId it persists on the conversation
+    // record — chain back to the originating webhook. Both are optional: omitted
+    // entirely when the HTTP layer didn't supply them (e.g. unit-test callers).
+    const handleOpts =
+      opts?.traceId !== undefined || opts?.requestLogger !== undefined
+        ? {
+            ...(opts?.traceId !== undefined ? { traceId: opts.traceId } : {}),
+            ...(opts?.requestLogger !== undefined ? { logger: opts.requestLogger } : {})
+          }
+        : undefined;
     for (const msg of result.messages) {
       // Reactions ARE IncomingMessages (type: 'reaction') and `handleReaction`
       // just delegates to `handleInbound`, so routing every message through
@@ -169,8 +227,11 @@ function logIncomingMessage(logger: pino.Logger, msg: IncomingMessage): void {
     traceMarker: 'inbound.message' as const,
     messageType: msg.type,
     channelMessageId: msg.channelMessageId,
-    // PII redaction is a Stage 6 concern — log full ids for now so the
-    // wiring is debuggable end-to-end. Stage 6 will gate on config.nodeEnv.
+    // KNOWN GAP: the dispatch logs still emit the full user id at `info` so the
+    // wiring stays debuggable end-to-end. Stage 6 only redacts the ADMIN-route
+    // OUTPUT (see redaction.ts), not these per-dispatch logs. Gating dispatch-log
+    // PII (e.g. on config.nodeEnv / a log-redaction serializer) is deferred to
+    // Stage 10 — left here as an accepted gap, not an unfulfilled TODO.
     channelScopedUserId: msg.channelScopedUserId,
     channelScopedBusinessId: msg.channelScopedBusinessId,
     timestamp: msg.timestamp,
@@ -199,8 +260,52 @@ function logStatusUpdate(logger: pino.Logger, status: StatusUpdate): void {
   logger.info(fields, 'inbound status update');
 }
 
+/** Shape of one readiness sub-check in the GET /ready response. */
+type ReadinessCheck = { status: string; [field: string]: unknown };
+
+/**
+ * Build the GET /ready dependency report. NEVER throws — each check is wrapped so
+ * a thrown/rejected check degrades to `{ status: 'error' }` for THAT check (and
+ * fails overall readiness) rather than 500ing the route.
+ *
+ * Stage 6 checks:
+ *  - `scheduler`: call `getStats()` — healthy if it resolves; the report carries
+ *    the impl `kind` + the returned stats. A missing scheduler is reported as
+ *    `not_configured` (still ready — Stage 5 apps may run without one wired here).
+ *  - `redis`: reported as `not_configured` when `config.redisUrl` is unset, else
+ *    `configured`. WHY no ping: a real Redis ping (and the Redis-backed store /
+ *    BullMQ scheduler it would gate) lands in Stage 10; until then we only report
+ *    whether a URL is present, and a configured-but-unpinged Redis does NOT fail
+ *    readiness.
+ */
+async function buildReadinessReport(deps: {
+  scheduler?: BufferScheduler;
+  config: Config;
+}): Promise<{ ready: boolean; checks: Record<string, ReadinessCheck> }> {
+  const checks: Record<string, ReadinessCheck> = {};
+  let ready = true;
+
+  // scheduler check
+  if (!deps.scheduler) {
+    checks.scheduler = { status: 'not_configured' };
+  } else {
+    try {
+      const stats = deps.scheduler.getStats ? await deps.scheduler.getStats() : undefined;
+      checks.scheduler = { status: 'ok', kind: deps.scheduler.kind, ...(stats ? { stats } : {}) };
+    } catch (err) {
+      ready = false;
+      checks.scheduler = { status: 'error', error: (err as Error).message };
+    }
+  }
+
+  // redis check — presence-only until Stage 10 adds the real ping.
+  checks.redis = { status: deps.config.redisUrl ? 'configured' : 'not_configured' };
+
+  return { ready, checks };
+}
+
 export function createApp(deps: AppDeps): express.Express {
-  const { config, logger, agent } = deps;
+  const { config, logger, agent, metrics, metricsCollector, statusTracker, store, scheduler } = deps;
   const app = express();
   const startedAtMs = Date.now();
 
@@ -213,6 +318,14 @@ export function createApp(deps: AppDeps): express.Express {
     })
   );
 
+  // Trace middleware is mounted AFTER express.json (so the raw-body `verify`
+  // hook still captures req.rawBody for signature verification — the verify hook
+  // only runs inside the json parser) and BEFORE every route, so each handler
+  // can pull the request-scoped traceId + child logger off res.locals via
+  // requestContextFromLocals(res). It also stamps the `x-trace-id` response
+  // header (echoing a valid inbound one, else a fresh uuid).
+  app.use(traceMiddleware({ logger }));
+
   app.get('/health', (_req: Request, res: Response) => {
     res.status(200).json({
       status: 'ok',
@@ -221,6 +334,34 @@ export function createApp(deps: AppDeps): express.Express {
       nodeVersion: process.version
     });
   });
+
+  // GET /ready — readiness probe. Always mounted, NO auth (like /health). Runs
+  // each dependency check defensively (a thrown check fails that check rather
+  // than 500ing the route) and returns 503 if ANY check fails, 200 otherwise.
+  app.get('/ready', (_req: Request, res: Response) => {
+    void buildReadinessReport({ scheduler, config }).then(({ ready, checks }) => {
+      res
+        .status(ready ? 200 : 503)
+        .json({ status: ready ? 'ready' : 'not_ready', checks });
+    });
+  });
+
+  // GET /metrics — Prometheus exposition, token-gated. GUARDED AT REGISTRATION:
+  // mounted ONLY when an admin token is configured AND a collector is wired. When
+  // adminApiToken is unset the route is never registered, so it 404s — we never
+  // expose metrics on an unauthenticated endpoint (a 401-on-unmounted approach
+  // would still advertise the route's existence). See the security note below.
+  if (config.adminApiToken && metricsCollector) {
+    const adminToken = config.adminApiToken;
+    const collector = metricsCollector;
+    app.get('/metrics', (req: Request, res: Response) => {
+      if (!validateAdminToken(req, adminToken)) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
+      res.type(PROMETHEUS_CONTENT_TYPE).send(renderPrometheus(collector.snapshot()));
+    });
+  }
 
   app.get('/webhook', (req: Request, res: Response) => {
     const mode = typeof req.query['hub.mode'] === 'string' ? req.query['hub.mode'] : undefined;
@@ -278,11 +419,76 @@ export function createApp(deps: AppDeps): express.Express {
     // dispatchWebhook. The dispatcher is fail-soft internally; the trailing
     // `.catch` is belt-and-suspenders so a fire-and-forget rejection can never
     // become a process-killing unhandled rejection.
+    //
+    // Pull the request-scoped trace context (set by traceMiddleware) and pass it
+    // — plus the metrics handle for the webhook counters — into the dispatcher.
+    // The verifier 401s an invalid signature BEFORE this handler, so the
+    // webhook_received counter only counts signature-valid requests here; see
+    // the security.ts note re: signature-rejection metrics being deferred.
+    const ctx = requestContextFromLocals(res);
     res.status(200).send('EVENT_RECEIVED');
-    void dispatchWebhook(req.body, logger, config, agent).catch(err => {
+    void dispatchWebhook(req.body, logger, config, agent, {
+      ...(metrics !== undefined ? { metrics } : {}),
+      ...(ctx?.traceId !== undefined ? { traceId: ctx.traceId } : {}),
+      ...(ctx?.logger !== undefined ? { requestLogger: ctx.logger } : {})
+    }).catch(err => {
       logger.error({ err }, 'dispatchWebhook rejected unexpectedly');
     });
   });
+
+  // ── Admin introspection routes (token-gated, GUARDED AT REGISTRATION) ──────
+  // SECURITY: these are registered ONLY when config.adminApiToken is set AND the
+  // backing dep is present. When the token is unset the routes do not exist at
+  // all (they 404), rather than being mounted and returning 401 — never advertise
+  // an admin surface on a deploy that hasn't configured a token. /health and
+  // /ready (above) are the only always-on, unauthenticated routes.
+  if (config.adminApiToken && store) {
+    const adminToken = config.adminApiToken;
+    const conversationStore = store;
+    // GET /admin/conversations/:key — PII-redacted by default (the record holds
+    // the user's phone-number-like id and message bodies). `?reveal=true` returns
+    // the raw record, gated behind the same token.
+    app.get('/admin/conversations/:key', (req: Request, res: Response) => {
+      if (!validateAdminToken(req, adminToken)) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
+      // `:key` is a single named segment, so it's a string at runtime; the
+      // Express 5 types widen it to `string | string[]`, so coerce defensively.
+      const key = String(req.params.key);
+      void conversationStore.getConversation(key).then(record => {
+        if (record === undefined) {
+          res.status(404).json({ error: 'not_found' });
+          return;
+        }
+        res.json(redactConversationRecord(record, { reveal: req.query.reveal === 'true' }));
+      });
+    });
+  }
+
+  if (config.adminApiToken && statusTracker) {
+    const adminToken = config.adminApiToken;
+    const tracker = statusTracker;
+    // GET /admin/status/:messageId — delivery-status history for one outbound id.
+    // PII-redacted by default: a StatusRecord carries the user-side `recipientId`
+    // and a `conversationKey` whose third segment embeds the raw user id, so the
+    // redactor masks both. `?reveal=true` returns the raw record, gated behind
+    // the same token (mirrors /admin/conversations).
+    app.get('/admin/status/:messageId', (req: Request, res: Response) => {
+      if (!validateAdminToken(req, adminToken)) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
+      // `:messageId` is a single named segment (string at runtime); coerce
+      // defensively against the Express 5 `string | string[]` param typing.
+      const rec = tracker.getStatus(String(req.params.messageId));
+      if (rec === undefined) {
+        res.status(404).json({ error: 'not_found' });
+        return;
+      }
+      res.json(redactStatusRecord(rec, { reveal: req.query.reveal === 'true' }));
+    });
+  }
 
   app.use((req: Request, res: Response) => {
     logger.debug({ method: req.method, path: req.path, traceMarker: '404' }, 'no route matched');

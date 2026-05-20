@@ -23,6 +23,11 @@ import type {
 } from '../../src/meta/shared/adapter.js';
 import type { Channel, IncomingMessage, StatusUpdate } from '../../src/meta/types.js';
 import { defaultConversationConfig, type Config } from '../../src/config/loader.js';
+import { InMemoryMetricsCollector } from '../../src/metrics/collector.js';
+import { createAgentMetrics, type AgentMetrics } from '../../src/metrics/registry.js';
+import { InMemoryStatusTracker } from '../../src/status/tracker.js';
+import type { IdentityResolver, IdentityLookupRequest } from '../../src/identity/resolver.js';
+import type { Contact } from '../../src/identity/types.js';
 
 /* ──────────────────────────────────────────────────────────────────────── */
 /* Fixtures                                                                  */
@@ -138,12 +143,23 @@ interface Harness {
   scheduler: InMemoryBufferScheduler;
   chat: ReturnType<typeof makeChatClient>;
   adapters: Partial<Record<Channel, FakeAdapter>>;
+  /** Present only when the harness was built with Stage 6 observability. */
+  collector?: InMemoryMetricsCollector;
+  metrics?: AgentMetrics;
+  statusTracker?: InMemoryStatusTracker;
+  identityResolver?: IdentityResolver;
 }
 
 function makeHarness(opts: {
   responses: NormalizedChatResponse[];
   adapters?: Partial<Record<Channel, FakeAdapter>>;
   configMutate?: (c: Config) => void;
+  /** Wire a real in-memory metrics collector + registry. */
+  withMetrics?: boolean;
+  /** Wire a real in-memory status tracker. */
+  withStatusTracker?: boolean;
+  /** Optional identity resolver (fake). */
+  identityResolver?: IdentityResolver;
 }): Harness {
   const config = makeConfig();
   opts.configMutate?.(config);
@@ -154,6 +170,9 @@ function makeHarness(opts: {
     whatsapp: makeAdapter('whatsapp', whatsappSupports, { template: true }),
     messenger: makeAdapter('messenger', messengerSupports)
   };
+  const collector = opts.withMetrics ? new InMemoryMetricsCollector() : undefined;
+  const metrics = collector ? createAgentMetrics(collector) : undefined;
+  const statusTracker = opts.withStatusTracker ? new InMemoryStatusTracker() : undefined;
   const agent = new ConversationAgent({
     store,
     scheduler,
@@ -163,9 +182,66 @@ function makeHarness(opts: {
     logger: silentLogger,
     random: () => 0.5, // mid-range jitter, fully deterministic
     now: () => FIXED_NOW,
-    sleep: async () => undefined // no-op so typing delays don't wait
+    sleep: async () => undefined, // no-op so typing delays don't wait
+    ...(metrics ? { metrics } : {}),
+    ...(statusTracker ? { statusTracker } : {}),
+    ...(opts.identityResolver ? { identityResolver: opts.identityResolver } : {})
   });
-  return { agent, store, scheduler, chat, adapters };
+  return {
+    agent,
+    store,
+    scheduler,
+    chat,
+    adapters,
+    ...(collector ? { collector } : {}),
+    ...(metrics ? { metrics } : {}),
+    ...(statusTracker ? { statusTracker } : {}),
+    ...(opts.identityResolver ? { identityResolver: opts.identityResolver } : {})
+  };
+}
+
+/* ──────────────────────────────────────────────────────────────────────── */
+/* Stage 6 helpers: metric snapshot readers + a fake identity resolver       */
+/* ──────────────────────────────────────────────────────────────────────── */
+
+/** Read a counter series value for `name` matching `labels` (0 if absent). */
+function counterValue(
+  collector: InMemoryMetricsCollector,
+  name: string,
+  labels: Record<string, string>
+): number {
+  const metric = collector.snapshot().metrics.find(m => m.name === name);
+  if (!metric || metric.kind !== 'counter') return 0;
+  const series = metric.series.find(s =>
+    Object.entries(labels).every(([k, v]) => s.labels[k] === v)
+  );
+  return series ? (series as { value: number }).value : 0;
+}
+
+/** Read a histogram series `count` for `name` matching `labels` (0 if absent). */
+function histogramCount(
+  collector: InMemoryMetricsCollector,
+  name: string,
+  labels: Record<string, string>
+): number {
+  const metric = collector.snapshot().metrics.find(m => m.name === name);
+  if (!metric || metric.kind !== 'histogram') return 0;
+  const series = metric.series.find(s =>
+    Object.entries(labels).every(([k, v]) => s.labels[k] === v)
+  );
+  return series ? (series as { count: number }).count : 0;
+}
+
+/** A fake {@link IdentityResolver} that returns a fixed result and counts calls. */
+function makeResolver(result: Contact | undefined): IdentityResolver & { calls: IdentityLookupRequest[] } {
+  const calls: IdentityLookupRequest[] = [];
+  return {
+    calls,
+    async resolve(req: IdentityLookupRequest): Promise<Contact | undefined> {
+      calls.push(req);
+      return result;
+    }
+  };
 }
 
 /** Advance fake timers far enough to fire the longest possible buffer flush. */
@@ -212,6 +288,130 @@ describe('ConversationAgent', () => {
 
     expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledTimes(1);
     expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledWith('user-1', 'hi there');
+  });
+
+  describe('read receipts (READ_RECEIPTS_ENABLED)', () => {
+    const enableReadReceipts = (c: Config): void => {
+      c.conversation.readReceiptsEnabled = true;
+    };
+
+    it('marks the most recent inbound read at flush, before the chat call', async () => {
+      const h = makeHarness({ responses: [textResponse('hi')], configMutate: enableReadReceipts });
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.r1', text: 'hello' }));
+      await flushBuffer();
+
+      const markRead = h.adapters.whatsapp!.markRead;
+      expect(markRead).toHaveBeenCalledTimes(1);
+      expect(markRead).toHaveBeenCalledWith('user-1', 'wamid.r1');
+      // Fired BEFORE the chat dispatch — that's what lets silence/reaction-only/
+      // error turns still mark read.
+      expect(markRead.mock.invocationCallOrder[0]!).toBeLessThan(
+        h.chat.complete.mock.invocationCallOrder[0]!
+      );
+    });
+
+    it('marks read even when the chat response is silence', async () => {
+      const h = makeHarness({
+        responses: [{ actions: [], silence: true }],
+        configMutate: enableReadReceipts
+      });
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.r2' }));
+      await flushBuffer();
+
+      expect(h.adapters.whatsapp!.markRead).toHaveBeenCalledWith('user-1', 'wamid.r2');
+      expect(h.adapters.whatsapp!.sendText).not.toHaveBeenCalled();
+    });
+
+    it('marks read on a reaction-only turn (no text, no typing)', async () => {
+      const h = makeHarness({
+        responses: [{ actions: [{ type: 'reaction', emoji: '👍', targetMessageId: 'wamid.r3' }] }],
+        configMutate: enableReadReceipts
+      });
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.r3' }));
+      await flushBuffer();
+
+      expect(h.adapters.whatsapp!.markRead).toHaveBeenCalledWith('user-1', 'wamid.r3');
+      expect(h.adapters.whatsapp!.sendReaction).toHaveBeenCalledTimes(1);
+      expect(h.adapters.whatsapp!.sendText).not.toHaveBeenCalled();
+    });
+
+    it('does NOT mark read when READ_RECEIPTS_ENABLED is false (default)', async () => {
+      const h = makeHarness({ responses: [textResponse('hi')] });
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.r4' }));
+      await flushBuffer();
+
+      expect(h.adapters.whatsapp!.markRead).not.toHaveBeenCalled();
+      expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT mark read when the adapter lacks read_receipt support', async () => {
+      const noReadSupport = (f: ChannelFeature): boolean => f !== 'read_receipt' && whatsappSupports(f);
+      const adapter = makeAdapter('whatsapp', noReadSupport, { template: true });
+      const h = makeHarness({
+        responses: [textResponse('hi')],
+        adapters: { whatsapp: adapter },
+        configMutate: enableReadReceipts
+      });
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.r5' }));
+      await flushBuffer();
+
+      expect(adapter.markRead).not.toHaveBeenCalled();
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+    });
+
+    it('is fail-soft: a markRead failure does not block the turn', async () => {
+      const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+      adapter.markRead.mockRejectedValueOnce(new Error('mark-read boom'));
+      const h = makeHarness({
+        responses: [textResponse('still replies')],
+        adapters: { whatsapp: adapter },
+        configMutate: enableReadReceipts
+      });
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.r6' }));
+      await flushBuffer();
+
+      expect(adapter.markRead).toHaveBeenCalledTimes(1);
+      expect(h.chat.complete).toHaveBeenCalledTimes(1);
+      expect(adapter.sendText).toHaveBeenCalledWith('user-1', 'still replies');
+    });
+
+    it('Messenger marks the thread seen once per turn', async () => {
+      // The real MessengerClient supports read_receipt (markSeen); the shared
+      // fake omits it, so use an adapter whose supports() matches the real one.
+      const messengerReadSupports = (f: ChannelFeature): boolean =>
+        f === 'read_receipt' || messengerSupports(f);
+      const adapter = makeAdapter('messenger', messengerReadSupports);
+      const h = makeHarness({
+        responses: [textResponse('hi')],
+        adapters: { messenger: adapter },
+        configMutate: enableReadReceipts
+      });
+      await h.agent.handleInbound(
+        inbound({ channel: 'messenger', channelMessageId: 'm_r7', channelScopedUserId: 'psid-1' })
+      );
+      await flushBuffer();
+
+      expect(adapter.markRead).toHaveBeenCalledTimes(1);
+      expect(adapter.markRead).toHaveBeenCalledWith('psid-1', 'm_r7');
+    });
+
+    it('records a mark_read outbound-send metric on success', async () => {
+      const h = makeHarness({
+        responses: [textResponse('hi')],
+        configMutate: enableReadReceipts,
+        withMetrics: true
+      });
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.r8' }));
+      await flushBuffer();
+
+      expect(
+        counterValue(h.collector!, 'outbound_send_total', {
+          channel: 'whatsapp',
+          operation: 'mark_read',
+          result: 'success'
+        })
+      ).toBe(1);
+    });
   });
 
   it('dedupe: the same channelMessageId twice is buffered/processed once', async () => {
@@ -743,6 +943,220 @@ describe('ConversationAgent', () => {
     expect(h.adapters.whatsapp!.sendText).toHaveBeenNthCalledWith(2, 'user-1', 'two');
     const record = await h.store.getConversation('whatsapp:biz-1:user-1');
     expect(record!.currentOutboundIndex).toBe(1); // advanced once, now waiting on item 2's status
+    await h.agent.close();
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Stage 6: identity enrichment (OPTIONAL, fail-open)                      */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  it('identity: a resolver returning a contact → ChatRequest carries it, record.contact set, metric resolved', async () => {
+    const contact: Contact = {
+      channel: 'whatsapp',
+      channelScopedUserId: 'user-1',
+      firstName: 'Ada',
+      tags: ['tier:gold']
+    };
+    const resolver = makeResolver(contact);
+    const h = makeHarness({ responses: [textResponse('hi')], withMetrics: true, identityResolver: resolver });
+
+    await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.id1' }));
+    await flushBuffer();
+
+    expect(resolver.calls).toHaveLength(1);
+    expect(resolver.calls[0]).toEqual({
+      channel: 'whatsapp',
+      channelScopedUserId: 'user-1',
+      channelScopedBusinessId: 'biz-1'
+    });
+    // The resolved contact rides on the chat request and is persisted.
+    expect(h.chat.calls[0]!.contact).toEqual(contact);
+    const record = await h.store.getConversation('whatsapp:biz-1:user-1');
+    expect(record!.contact).toEqual(contact);
+    expect(counterValue(h.collector!, 'identity_lookup_total', { result: 'resolved' })).toBe(1);
+  });
+
+  it('identity: a resolver returning undefined → no contact, metric none', async () => {
+    const resolver = makeResolver(undefined);
+    const h = makeHarness({ responses: [textResponse('hi')], withMetrics: true, identityResolver: resolver });
+
+    await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.id2' }));
+    await flushBuffer();
+
+    expect(resolver.calls).toHaveLength(1);
+    expect(h.chat.calls[0]!.contact).toBeUndefined();
+    const record = await h.store.getConversation('whatsapp:biz-1:user-1');
+    expect(record!.contact).toBeUndefined();
+    expect(counterValue(h.collector!, 'identity_lookup_total', { result: 'none' })).toBe(1);
+  });
+
+  it('identity: no resolver → metric disabled, no contact', async () => {
+    const h = makeHarness({ responses: [textResponse('hi')], withMetrics: true });
+
+    await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.id3' }));
+    await flushBuffer();
+
+    expect(h.chat.calls[0]!.contact).toBeUndefined();
+    expect(counterValue(h.collector!, 'identity_lookup_total', { result: 'disabled' })).toBe(1);
+  });
+
+  it('identity: resolver is called only ONCE per conversation (cached on the record)', async () => {
+    const contact: Contact = { channel: 'whatsapp', channelScopedUserId: 'user-1', displayName: 'Ada' };
+    const resolver = makeResolver(contact);
+    const h = makeHarness({ responses: [textResponse('a'), textResponse('b')], withMetrics: true, identityResolver: resolver });
+
+    // First inbound → resolves + flush completes (back to idle).
+    await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.id4a' }));
+    await flushBuffer();
+    // Second inbound on the SAME conversation → record.contact already set → skip.
+    await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.id4b' }));
+    await flushBuffer();
+
+    expect(resolver.calls).toHaveLength(1); // not re-resolved
+    // Only the single resolved outcome was counted (skip path is uncounted).
+    expect(counterValue(h.collector!, 'identity_lookup_total', { result: 'resolved' })).toBe(1);
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Stage 6: metrics across the inbound→flush→send lifecycle                */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  it('metrics: a full inbound→flush→send records dedupe/inbound/dispatch/outbound', async () => {
+    // Messenger so the send completes synchronously (on_send) and the queue
+    // reaches idle in one flush, exercising the full success path.
+    const h = makeHarness({ responses: [textResponse('reply')], withMetrics: true });
+
+    await h.agent.handleInbound(
+      inbound({ channel: 'messenger', channelMessageId: 'm_met1', channelScopedUserId: 'fb-user' })
+    );
+    await flushBuffer();
+
+    const c = h.collector!;
+    expect(counterValue(c, 'inbound_dedupe_total', { result: 'claimed' })).toBe(1);
+    expect(counterValue(c, 'inbound_messages_total', { channel: 'messenger', type: 'text' })).toBe(1);
+    expect(histogramCount(c, 'chat_dispatch_duration_seconds', { result: 'success' })).toBe(1);
+    expect(counterValue(c, 'buffer_flush_total', { result: 'dispatched' })).toBe(1);
+    expect(
+      counterValue(c, 'outbound_send_total', {
+        channel: 'messenger',
+        operation: 'message',
+        result: 'success',
+        error_code: 'none'
+      })
+    ).toBe(1);
+    expect(histogramCount(c, 'outbound_send_duration_seconds', { channel: 'messenger', operation: 'message' })).toBe(1);
+  });
+
+  it('metrics: a duplicate inbound increments inbound_dedupe{duplicate}', async () => {
+    const h = makeHarness({ responses: [textResponse('reply')], withMetrics: true });
+    const msg = inbound({ channelMessageId: 'wamid.metdup' });
+
+    await h.agent.handleInbound(msg);
+    await h.agent.handleInbound({ ...msg }); // redelivery
+    await flushBuffer();
+
+    expect(counterValue(h.collector!, 'inbound_dedupe_total', { result: 'claimed' })).toBe(1);
+    expect(counterValue(h.collector!, 'inbound_dedupe_total', { result: 'duplicate' })).toBe(1);
+  });
+
+  it('metrics: a silence response records buffer_flush{silence} and no outbound', async () => {
+    const h = makeHarness({ responses: [{ actions: [], silence: true }], withMetrics: true });
+
+    await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.metsil' }));
+    await flushBuffer();
+
+    expect(histogramCount(h.collector!, 'chat_dispatch_duration_seconds', { result: 'success' })).toBe(1);
+    expect(counterValue(h.collector!, 'buffer_flush_total', { result: 'silence' })).toBe(1);
+    expect(counterValue(h.collector!, 'buffer_flush_total', { result: 'dispatched' })).toBe(0);
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Stage 6: status tracker (WhatsApp per-message + Messenger watermark)    */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  it('status tracker: a WhatsApp delivered status records history + metric', async () => {
+    const h = makeHarness({ responses: [textResponse('hi')], withMetrics: true, withStatusTracker: true });
+
+    await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.tr1' }));
+    await flushBuffer();
+
+    const sentId = (await (h.adapters.whatsapp!.sendText.mock.results[0]!.value as Promise<SendResult>)).messageId;
+    await h.agent.handleStatus(status(sentId, 'delivered'));
+
+    const tracked = h.statusTracker!.getStatus(sentId);
+    expect(tracked).toBeDefined();
+    expect(tracked!.current).toBe('delivered');
+    expect(tracked!.conversationKey).toBe('whatsapp:biz-1:user-1');
+    expect(counterValue(h.collector!, 'status_callback_total', { channel: 'whatsapp', status: 'delivered' })).toBe(1);
+
+    await h.agent.close();
+  });
+
+  it('watermark read (Messenger): both sent ids marked read; queue unaffected', async () => {
+    // Messenger is on_send: two messages both send and the queue reaches idle.
+    const h = makeHarness({
+      responses: [{ actions: [{ type: 'message', text: 'one' }, { type: 'message', text: 'two' }] }],
+      adapters: { messenger: makeAdapter('messenger', messengerSupports) },
+      withMetrics: true,
+      withStatusTracker: true
+    });
+
+    await h.agent.handleInbound(
+      inbound({ channel: 'messenger', channelMessageId: 'm_wm1', channelScopedUserId: 'fb-user' })
+    );
+    await flushBuffer();
+
+    const key = 'messenger:biz-1:fb-user';
+    const beforeRecord = await h.store.getConversation(key);
+    expect(beforeRecord!.state).toBe('idle');
+    expect(beforeRecord!.currentOutboundIndex).toBe(2); // both advanced on send
+    const firstId = (await (h.adapters.messenger!.sendText.mock.results[0]!.value as Promise<SendResult>)).messageId;
+    const secondId = (await (h.adapters.messenger!.sendText.mock.results[1]!.value as Promise<SendResult>)).messageId;
+
+    // The tracker only advances ids it already knows about. Seed both with a
+    // `sent` (as the live transport's status pipeline would) before the read.
+    h.statusTracker!.applyStatusUpdate({ channelMessageId: firstId, channel: 'messenger', status: 'sent', timestamp: FIXED_NOW });
+    h.statusTracker!.applyStatusUpdate({ channelMessageId: secondId, channel: 'messenger', status: 'sent', timestamp: FIXED_NOW });
+
+    // Feed a read watermark covering both sentAt timestamps (= FIXED_NOW).
+    await h.agent.handleStatus({
+      channel: 'messenger',
+      channelMessageId: String(FIXED_NOW), // watermark, not a per-message id
+      channelScopedUserId: 'fb-user',
+      channelScopedBusinessId: 'biz-1',
+      status: 'read',
+      timestamp: FIXED_NOW,
+      raw: {}
+    });
+
+    // Both messages now show read.
+    expect(h.statusTracker!.getStatus(firstId)!.current).toBe('read');
+    expect(h.statusTracker!.getStatus(secondId)!.current).toBe('read');
+    expect(counterValue(h.collector!, 'status_callback_total', { channel: 'messenger', status: 'read' })).toBe(1);
+
+    // The queue is NOT touched by the read (advance-on-send already completed it).
+    const afterRecord = await h.store.getConversation(key);
+    expect(afterRecord!.state).toBe('idle');
+    expect(afterRecord!.currentOutboundIndex).toBe(2);
+
+    await h.agent.close();
+  });
+
+  it('regression: optional deps absent → behavior unchanged (no metrics/tracker required)', async () => {
+    // A plain harness (no withMetrics/withStatusTracker/identityResolver) must
+    // still complete a full turn exactly as Stage 5 did.
+    const h = makeHarness({ responses: [textResponse('hi there')] });
+    expect(h.collector).toBeUndefined();
+    expect(h.statusTracker).toBeUndefined();
+
+    await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.noopt' }));
+    await flushBuffer();
+
+    expect(h.chat.complete).toHaveBeenCalledTimes(1);
+    expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledWith('user-1', 'hi there');
+    // A status with no tracker/metrics wired is a benign no-op (does not throw).
+    const sentId = (await (h.adapters.whatsapp!.sendText.mock.results[0]!.value as Promise<SendResult>)).messageId;
+    await expect(h.agent.handleStatus(status(sentId, 'delivered'))).resolves.toBeUndefined();
     await h.agent.close();
   });
 });

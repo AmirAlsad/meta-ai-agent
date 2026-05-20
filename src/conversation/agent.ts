@@ -49,15 +49,33 @@ import type {
 } from '../meta/shared/adapter.js';
 import type { Channel, IncomingMessage, StatusUpdate } from '../meta/types.js';
 import type { WhatsAppClient } from '../meta/whatsapp/client.js';
+import type { AgentMetrics } from '../metrics/registry.js';
+import { normalizeErrorCodeLabel } from '../metrics/registry.js';
+import type { IdentityResolver } from '../identity/resolver.js';
+import type { StatusTracker } from '../status/tracker.js';
 import { calculateBufferTimeout } from './buffering.js';
 import type { BufferScheduler } from './scheduler.js';
 import type { ConversationStore } from './store.js';
+import type { ConversationRecord } from './types.js';
 import {
   conversationKeyFor,
   createIdleConversation,
   isWindowOpen,
   MESSAGING_WINDOW_MS
 } from './types.js';
+
+/**
+ * Request-scoped options threaded through every public handler. `traceId` is
+ * persisted on the conversation record (as in Stage 5); `logger` is an OPTIONAL
+ * request-scoped child (carrying that traceId) that, when present, is preferred
+ * over the agent's base logger for THAT operation's logging — so a log line
+ * emitted while handling one webhook carries the same trace id the HTTP layer
+ * already stamped, without re-deriving it.
+ */
+export interface HandleOptions {
+  traceId?: string;
+  logger?: pino.Logger;
+}
 
 /**
  * Every {@link ChannelFeature} value, enumerated once so {@link
@@ -105,6 +123,16 @@ export interface ConversationAgentDeps {
   now?: () => number;
   /** Injectable sleep so tests don't really wait; defaults to setTimeout. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * OPTIONAL Stage 6 observability. ALL THREE are additive: when absent the agent
+   * behaves exactly as in Stage 5 (metric calls are skipped via optional-chain,
+   * identity enrichment is treated as `disabled`, status history is not tracked).
+   */
+  metrics?: AgentMetrics;
+  /** Optional identity enrichment, fail-open. Absent ⇒ never resolve a contact. */
+  identityResolver?: IdentityResolver;
+  /** Optional delivery-status history sink. Absent ⇒ no status tracking. */
+  statusTracker?: StatusTracker;
 }
 
 export class ConversationAgent {
@@ -117,6 +145,10 @@ export class ConversationAgent {
   private readonly random: () => number;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
+  /** OPTIONAL Stage 6 deps — undefined ⇒ that observability facet is inert. */
+  private readonly metrics?: AgentMetrics;
+  private readonly identityResolver?: IdentityResolver;
+  private readonly statusTracker?: StatusTracker;
 
   /**
    * Per-conversation delivery-timeout fallback timers, keyed by conversation
@@ -152,6 +184,9 @@ export class ConversationAgent {
     this.random = deps.random ?? Math.random;
     this.now = deps.now ?? Date.now;
     this.sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
+    this.metrics = deps.metrics;
+    this.identityResolver = deps.identityResolver;
+    this.statusTracker = deps.statusTracker;
 
     // Register the buffer-flush handler exactly once. The scheduler fires this
     // after a conversation's burst window elapses (see calculateBufferTimeout).
@@ -242,14 +277,18 @@ export class ConversationAgent {
    * SAME conversation can't clobber each other's buffer append (see the
    * entry-point/internal comment block above {@link runExclusive}).
    */
-  async handleInbound(message: IncomingMessage, opts?: { traceId?: string }): Promise<void> {
+  async handleInbound(message: IncomingMessage, opts?: HandleOptions): Promise<void> {
     await this.runExclusive(conversationKeyFor(message), () => this.handleInboundImpl(message, opts));
   }
 
   /** Lock-free body of {@link handleInbound}. Assumes the per-key lock is held. */
-  private async handleInboundImpl(message: IncomingMessage, opts?: { traceId?: string }): Promise<void> {
+  private async handleInboundImpl(message: IncomingMessage, opts?: HandleOptions): Promise<void> {
     const traceId = opts?.traceId;
-    const logger = this.childLogger(traceId);
+    // WHY prefer opts.logger: when the HTTP layer supplies a request-scoped child
+    // (already carrying this request's traceId + route), reusing it keeps THIS
+    // operation's log lines correlated to the originating webhook. Absent one we
+    // fall back to a child built from traceId (or the base logger).
+    const logger = opts?.logger ?? this.childLogger(traceId);
     try {
       // WHY filter echoes: Meta echoes business-sent messages back on the same
       // webhook (Messenger/IG `is_echo`). Treating an echo as inbound would loop
@@ -265,13 +304,17 @@ export class ConversationAgent {
       // PRIMARY dedupe: an atomic SETNX-with-TTL claim. A redelivered webhook
       // (Meta retries until it sees a 200) returns false here and is dropped so
       // a single inbound is processed exactly once.
-      if (!(await this.store.claimInboundHandle(message.channelMessageId))) {
+      const claimed = await this.store.claimInboundHandle(message.channelMessageId);
+      this.metrics?.inboundDedupe.inc({ result: claimed ? 'claimed' : 'duplicate' });
+      if (!claimed) {
         logger.debug(
           { channel: message.channel, channelMessageId: message.channelMessageId },
           'skipping duplicate inbound (already claimed)'
         );
         return;
       }
+      // A genuinely-new (claimed) message accepted for processing.
+      this.metrics?.inboundMessages.inc({ channel: message.channel, type: message.type });
 
       const key = conversationKeyFor(message);
       const now = this.now();
@@ -284,6 +327,46 @@ export class ConversationAgent {
           channelScopedBusinessId: message.channelScopedBusinessId,
           now
         });
+
+      // Identity enrichment (Stage 6, OPTIONAL + fail-open). Runs UNDER the per-key
+      // lock (handleInboundImpl already holds it) so the awaited resolve serializes
+      // with other ops for this key, then rides on the chat request via
+      // `record.contact`. Enrich only when not already set, so the lookup endpoint
+      // is hit at most once per conversation.
+      //
+      // WHY a coarse `resolved | none | disabled` metric split: the resolver
+      // contract returns `undefined` INDISTINGUISHABLY for a cache miss, an HTTP
+      // miss, a non-2xx, a timeout, or a parse failure (fail-open swallows the
+      // reason). We therefore cannot honestly emit the registry's finer labels
+      // (cached/error/...) from here — the only facts we can observe are "we had a
+      // resolver and it produced a contact" (resolved), "we had a resolver and it
+      // produced nothing" (none), and "no resolver wired" (disabled).
+      if (record.contact !== undefined) {
+        // Already enriched on a prior inbound — skip the lookup entirely (no
+        // re-resolve). Not counted: there was no lookup outcome to record.
+      } else if (this.identityResolver) {
+        try {
+          const contact = await this.identityResolver.resolve({
+            channel: message.channel,
+            channelScopedUserId: message.channelScopedUserId,
+            channelScopedBusinessId: message.channelScopedBusinessId
+          });
+          if (contact) {
+            record.contact = contact;
+            this.metrics?.identityLookupTotal.inc({ result: 'resolved' });
+          } else {
+            this.metrics?.identityLookupTotal.inc({ result: 'none' });
+          }
+        } catch (error) {
+          // resolve() is contractually fail-open and never throws, but stay
+          // defensive: a misbehaving resolver must not break message delivery.
+          this.metrics?.identityLookupTotal.inc({ result: 'none' });
+          logger.warn({ err: error, channel: message.channel }, 'identity resolve threw; proceeding without enrichment');
+        }
+      } else {
+        // No resolver wired (or a Noop) — enrichment is disabled for this deploy.
+        this.metrics?.identityLookupTotal.inc({ result: 'disabled' });
+      }
 
       // Append to the buffer and refresh the activity/window bookkeeping. The
       // 24h messaging window restarts from every inbound (`lastInboundAt + 24h`).
@@ -337,7 +420,7 @@ export class ConversationAgent {
    * `handleInbound`, which acquires. Acquiring here too would deadlock (a
    * lock-holder calling a same-key acquirer). See the runExclusive comment block.
    */
-  async handleReaction(message: IncomingMessage, opts?: { traceId?: string }): Promise<void> {
+  async handleReaction(message: IncomingMessage, opts?: HandleOptions): Promise<void> {
     await this.handleInbound(message, opts);
   }
 
@@ -381,6 +464,12 @@ export class ConversationAgent {
         return;
       }
 
+      // Read receipt for this turn — fired BEFORE the chat call so a silent,
+      // reaction-only, or even chat-error turn still marks the user's message
+      // read. Decoupled from the typing indicator (which only marks read as a
+      // WhatsApp side effect when a text reply is sent). Best-effort.
+      await this.maybeMarkRead(record, adapter, logger);
+
       const capabilities = this.capabilitiesOf(adapter);
       const now = this.now();
       const request: ChatRequest = {
@@ -401,9 +490,14 @@ export class ConversationAgent {
       };
 
       let resp;
+      // Time only the chat dispatch (the developer's endpoint round-trip), using
+      // the injectable clock so tests stay deterministic.
+      const t0 = this.now();
       try {
         resp = await this.chatClient.complete(request);
       } catch (error) {
+        this.metrics?.chatDispatchDuration.observe({ result: 'error' }, (this.now() - t0) / 1000);
+        this.metrics?.bufferFlushTotal.inc({ result: 'error' });
         // Fail soft: Stage 10 adds retry. For now a chat-endpoint failure ends
         // the turn quietly (the user simply gets no reply).
         if (error instanceof ChatEndpointError) {
@@ -414,9 +508,11 @@ export class ConversationAgent {
         await this.transitionToIdle(key);
         return;
       }
+      this.metrics?.chatDispatchDuration.observe({ result: 'success' }, (this.now() - t0) / 1000);
 
       // An explicit silence (or an empty action list) means "send nothing".
       if (resp.silence === true || resp.actions.length === 0) {
+        this.metrics?.bufferFlushTotal.inc({ result: 'silence' });
         logger.debug({ conversationKey: key, silence: resp.silence === true }, 'chat response produced no outbound');
         await this.transitionToIdle(key);
         return;
@@ -427,11 +523,16 @@ export class ConversationAgent {
         logger.debug({ conversationKey: key, skipped }, 'some chat actions were skipped/downgraded');
       }
       if (items.length === 0) {
-        // Every action was unsupported and skipped (no downgrade produced an item).
+        // Every action was unsupported and skipped (no downgrade produced an
+        // item). No outbound is dispatched, so count it as a silent flush.
+        this.metrics?.bufferFlushTotal.inc({ result: 'silence' });
         logger.debug({ conversationKey: key }, 'no deliverable items after capability filtering');
         await this.transitionToIdle(key);
         return;
       }
+
+      // We have at least one deliverable item — the flush dispatched outbound work.
+      this.metrics?.bufferFlushTotal.inc({ result: 'dispatched' });
 
       // Reload to pick up any record mutations (e.g. lastInboundMessageId from a
       // concurrent inbound) before we attach the queue, then enter `sending`.
@@ -507,6 +608,10 @@ export class ConversationAgent {
     }
 
     let sendResult: { messageId: string } | undefined;
+    // Time each adapter (Meta Graph API) call; injectable clock keeps it
+    // deterministic in tests. `operation` is the item kind so the histogram
+    // distinguishes text vs. reaction vs. template latency.
+    const sendT0 = this.now();
     try {
       switch (item.kind) {
         case 'message':
@@ -556,7 +661,29 @@ export class ConversationAgent {
           logger.warn({ conversationKey: key, kind: item.kind }, 'unexpected outbound item kind; skipping');
           break;
       }
+      // The send returned (or was a benign no-op skip). Record success — for the
+      // no-op skip kinds (media/silence/unhandled) the adapter call didn't run,
+      // but counting them as a zero-latency success keeps the metric simple and
+      // these kinds don't reach here in normal Stage 6 flows anyway.
+      this.metrics?.outboundSendTotal.inc({
+        channel: record.channel,
+        operation: item.kind,
+        result: 'success',
+        error_code: 'none'
+      });
+      this.metrics?.outboundSendDuration.observe(
+        { channel: record.channel, operation: item.kind },
+        (this.now() - sendT0) / 1000
+      );
     } catch (error) {
+      // On a Meta API failure, bound the error_code label to the known set.
+      const errorCode = error instanceof MetaApiError ? normalizeErrorCodeLabel(error.errorCode) : 'other';
+      this.metrics?.outboundSendTotal.inc({
+        channel: record.channel,
+        operation: item.kind,
+        result: 'error',
+        error_code: errorCode
+      });
       if (error instanceof MetaApiError) {
         logger.error({ err: error, conversationKey: key, kind: item.kind }, 'outbound send failed; skipping item');
       } else {
@@ -676,22 +803,56 @@ export class ConversationAgent {
    * then run the (lock-free) body under that key's lock — serializing it against
    * sendNext/flush/handleInbound so a status can't double-advance or clobber an
    * in-flight send. The body re-reads the mapping under the lock (the cheap
-   * pre-lookup is only to find the key). An unmapped status has no conversation
-   * to serialize on, so it runs unlocked straight to the benign no-op path.
+   * pre-lookup is only to find the key).
+   *
+   * MESSENGER/INSTAGRAM READ WATERMARK (Stage 6): a `read` event on those
+   * channels carries NO per-message id — `channelMessageId` is a WATERMARK
+   * timestamp, not a wamid, so the pre-lookup finds no mapping. Rather than fall
+   * through to the benign no-op path (Stage 5 behaviour), we derive the
+   * conversation key from the status's user/business ids and run a SEPARATE,
+   * observability-only impl under THAT key's lock. An unmapped status that is
+   * NOT such a read still runs unlocked straight to the benign no-op.
    */
-  async handleStatus(status: StatusUpdate, opts?: { traceId?: string }): Promise<void> {
+  async handleStatus(status: StatusUpdate, opts?: HandleOptions): Promise<void> {
     const preMapping = await this.store.getOutboundHandleMapping(status.channelMessageId);
-    if (!preMapping) {
-      await this.handleStatusImpl(status, opts);
+    if (preMapping) {
+      await this.runExclusive(preMapping.conversationKey, () => this.handleStatusImpl(status, opts));
       return;
     }
-    await this.runExclusive(preMapping.conversationKey, () => this.handleStatusImpl(status, opts));
+
+    // No outbound mapping. If this is a Messenger/IG read watermark with enough
+    // ids to derive the conversation key, take the watermark path under that
+    // key's lock (acquired ONCE here; the impl is lock-free, mirroring the
+    // mapping path — no nested acquisition, no deadlock).
+    if (
+      status.status === 'read' &&
+      status.channel !== 'whatsapp' &&
+      status.channelScopedUserId !== undefined &&
+      status.channelScopedBusinessId !== undefined
+    ) {
+      const watermarkKey = conversationKeyFor({
+        channel: status.channel,
+        channelScopedBusinessId: status.channelScopedBusinessId,
+        channelScopedUserId: status.channelScopedUserId
+      });
+      await this.runExclusive(watermarkKey, () =>
+        this.handleReadWatermarkImpl(watermarkKey, status, opts)
+      );
+      return;
+    }
+
+    // Unmapped, non-watermark status: no conversation to serialize on — straight
+    // to the benign no-op path, unlocked.
+    await this.handleStatusImpl(status, opts);
   }
 
   /** Lock-free body of {@link handleStatus}. Assumes the per-key lock is held. */
-  private async handleStatusImpl(status: StatusUpdate, opts?: { traceId?: string }): Promise<void> {
+  private async handleStatusImpl(status: StatusUpdate, opts?: HandleOptions): Promise<void> {
     const traceId = opts?.traceId;
-    const logger = this.childLogger(traceId);
+    const logger = opts?.logger ?? this.childLogger(traceId);
+    // Count every status callback we observe (mapped or not), labelled by
+    // channel + status, before any advance/no-op decision.
+    this.metrics?.statusCallbackTotal.inc({ channel: status.channel, status: status.status });
     try {
       const mapping = await this.store.getOutboundHandleMapping(status.channelMessageId);
       if (!mapping) {
@@ -715,6 +876,21 @@ export class ConversationAgent {
         await this.store.setConversation(record);
       }
 
+      // Stage 6 per-message status history (WhatsApp wamid 1:1). Recorded BEFORE
+      // the advancement branch (which returns early) so the tracker captures the
+      // status whether or not it advances the queue. Fail-soft: a tracker error
+      // must not break delivery, so it's inside this method's try/catch.
+      this.statusTracker?.applyStatusUpdate({
+        channelMessageId: status.channelMessageId,
+        channel: status.channel,
+        status: status.status,
+        timestamp: status.timestamp,
+        conversationKey: mapping.conversationKey,
+        ...(status.channelScopedUserId !== undefined ? { recipientId: status.channelScopedUserId } : {}),
+        ...(status.errorCode !== undefined ? { errorCode: status.errorCode } : {}),
+        ...(status.errorTitle !== undefined ? { errorTitle: status.errorTitle } : {})
+      });
+
       // Only advance when this status both advances the queue for this channel
       // (WhatsApp sent/delivered) AND refers to the CURRENTLY in-flight item.
       if (statusAdvancesQueue(record.channel, status.status) && record.currentOutboundIndex === mapping.messageIndex) {
@@ -729,6 +905,65 @@ export class ConversationAgent {
       );
     } catch (error) {
       logger.error({ err: error, channelMessageId: status.channelMessageId }, 'handleStatus failed');
+    }
+  }
+
+  /**
+   * Messenger/Instagram read-watermark handler (Stage 6, OBSERVABILITY ONLY).
+   * Lock-free body — {@link handleStatus} runs it under the derived key's lock.
+   *
+   * WHY a watermark→messageId translation: unlike WhatsApp (a per-message `read`
+   * keyed by the real wamid), Messenger/IG emit a single READ WATERMARK meaning
+   * "everything sent at/before this timestamp has been read" — there is no id to
+   * look up. We translate by scanning the conversation's own outbound queue for
+   * items that were actually SENT (`channelMessageId` set, `sentAt` known) at or
+   * before the watermark, and hand those concrete ids to the tracker. The
+   * tracker only ADVANCES ids it already knows (it never invents records from a
+   * watermark), so an id we send but whose `sent` the tracker hasn't recorded is
+   * simply skipped there.
+   *
+   * WHY it does NOT touch the queue: Messenger/IG are advance-on-send
+   * (`statusAdvancesQueue` returns false for them), so by the time a read arrives
+   * the queue has long since advanced on each send's API response. A read is
+   * therefore PURELY informational here — it must not advance, skip, or re-open
+   * any queue item. We only update status history + the callback metric.
+   */
+  private async handleReadWatermarkImpl(
+    key: string,
+    status: StatusUpdate,
+    opts?: HandleOptions
+  ): Promise<void> {
+    const logger = opts?.logger ?? this.childLogger(opts?.traceId);
+    // Count the read callback even when there's nothing to mark (no record / no
+    // qualifying ids) — we still observed the webhook.
+    this.metrics?.statusCallbackTotal.inc({ channel: status.channel, status: 'read' });
+    try {
+      const record = await this.store.getConversation(key);
+      if (!record) {
+        logger.debug({ conversationKey: key, watermark: status.timestamp }, 'read watermark for unknown conversation');
+        return;
+      }
+
+      // Concrete outbound ids sent at/before the watermark — the translation.
+      const messageIds = record.outboundQueue
+        .filter(item => item.channelMessageId && item.sentAt !== undefined && item.sentAt <= status.timestamp)
+        .map(item => item.channelMessageId!);
+
+      if (messageIds.length === 0) {
+        logger.debug({ conversationKey: key, watermark: status.timestamp }, 'read watermark matched no sent outbound');
+        return;
+      }
+
+      // Observability only: mark those ids read in the tracker. Does NOT advance
+      // the queue (advance-on-send already moved past every sent item).
+      this.statusTracker?.applyReadWatermark({
+        messageIds,
+        channel: status.channel,
+        watermark: status.timestamp,
+        conversationKey: key
+      });
+    } catch (error) {
+      logger.error({ err: error, conversationKey: key, watermark: status.timestamp }, 'read watermark handling failed');
     }
   }
 
@@ -777,6 +1012,9 @@ export class ConversationAgent {
     // race is fully closed, but the guard stays as defense-in-depth — do not
     // remove it (it pairs with the clear-before-arm in startDeliveryTimeout).
     if (!record || record.currentOutboundIndex !== messageIndex) return;
+    // The timeout actually fired against a STILL-in-flight item (no terminal
+    // status arrived in time) — count it before advancing the fallback.
+    this.metrics?.deliveryTimeoutFired.inc();
     logger.warn({ conversationKey: key, messageIndex }, 'delivery status timeout; advancing');
     const messageId = record.currentOutboundMessageId;
     await this.advanceAndContinue(key, messageId, traceId);
@@ -819,6 +1057,55 @@ export class ConversationAgent {
   }
 
   /** A child logger carrying the request trace id when one is available. */
+  /**
+   * Mark the user's most recent inbound message read for this turn.
+   *
+   * Fires once per flush, BEFORE the chat call, gated on `READ_RECEIPTS_ENABLED`
+   * and `supports('read_receipt')` — so a silent, reaction-only, or chat-error
+   * turn still marks the message read. Deliberately decoupled from the typing
+   * indicator: WhatsApp's typing call only marks read as a side effect when a
+   * text reply is sent, and Messenger/Instagram typing never marks read at all.
+   * WhatsApp marks the most recent inbound wamid; Messenger/Instagram mark the
+   * whole thread seen (their adapters ignore the message id). Best-effort: a
+   * failure is logged and swallowed, never blocking the turn.
+   */
+  private async maybeMarkRead(
+    record: ConversationRecord,
+    adapter: ChannelAdapter,
+    logger: pino.Logger
+  ): Promise<void> {
+    if (!this.config.conversation.readReceiptsEnabled) return;
+    if (!adapter.supports('read_receipt')) return;
+    // The uniform adapter signature requires a message id (WhatsApp needs the
+    // inbound wamid). At flush there is always a buffered message that set this,
+    // so the guard is defensive; Messenger/Instagram ignore the id but the call
+    // stays uniform.
+    const messageId = record.lastInboundMessageId;
+    if (messageId === undefined) return;
+    try {
+      await adapter.markRead(record.channelScopedUserId, messageId);
+      this.metrics?.outboundSendTotal.inc({
+        channel: record.channel,
+        operation: 'mark_read',
+        result: 'success',
+        error_code: 'none'
+      });
+      logger.debug({ conversationKey: record.key, channel: record.channel }, 'marked inbound read');
+    } catch (error) {
+      const errorCode = error instanceof MetaApiError ? normalizeErrorCodeLabel(error.errorCode) : 'other';
+      this.metrics?.outboundSendTotal.inc({
+        channel: record.channel,
+        operation: 'mark_read',
+        result: 'error',
+        error_code: errorCode
+      });
+      logger.warn(
+        { err: error, conversationKey: record.key, channel: record.channel },
+        'read receipt failed (non-fatal)'
+      );
+    }
+  }
+
   private childLogger(traceId?: string): pino.Logger {
     return traceId !== undefined ? this.logger.child({ traceId }) : this.logger;
   }

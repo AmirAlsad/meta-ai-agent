@@ -100,6 +100,14 @@ export function createMetaSignatureVerifier(
         { path: req.path, signaturePresent, bodyBytes: rawBody.length, secretsCount },
         'meta webhook signature verification failed'
       );
+      // KNOWN GAP (Stage 6): a `webhook_received_total{result:'invalid_signature'}`
+      // counter is NOT incremented here. This verifier is a standalone middleware
+      // with no metrics dependency; the webhook counters are incremented in the
+      // dispatcher (POST /webhook handler), which only runs AFTER a valid
+      // signature. Wiring metrics into this factory was deliberately deferred to
+      // keep the security path dependency-free and avoid touching the existing
+      // signature tests — signature-rejection volume is still observable via this
+      // warn log. Revisit when metrics graduate to a required transport dep.
       res.status(401).json({ error: 'invalid_signature' });
       return;
     }
