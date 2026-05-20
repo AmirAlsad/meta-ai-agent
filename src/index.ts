@@ -16,7 +16,7 @@ import { InMemoryMetricsCollector } from './metrics/collector.js';
 import { createAgentMetrics } from './metrics/registry.js';
 import { InMemoryStatusTracker } from './status/tracker.js';
 import { InMemoryContactStore } from './identity/contact-store.js';
-import { HttpIdentityResolver, NoopIdentityResolver } from './identity/resolver.js';
+import { HttpIdentityResolver } from './identity/resolver.js';
 import type { IdentityResolver } from './identity/resolver.js';
 import type { ChannelAdapter } from './meta/shared/adapter.js';
 import type { Channel } from './meta/types.js';
@@ -75,19 +75,22 @@ export function buildRuntime(
   metrics.agentUp.set(undefined, 1);
   metrics.agentBuildInfo.set({ version: PACKAGE_VERSION }, 1);
 
-  // Identity enrichment (fail-open). An HTTP resolver only when USER_LOOKUP_URL
+  // Identity enrichment (fail-open). An HTTP resolver ONLY when USER_LOOKUP_URL
   // is configured, backed by an in-memory contact cache so repeat senders don't
-  // re-hit the lookup endpoint; otherwise a no-op resolver so the agent can call
-  // resolve() unconditionally.
+  // re-hit the lookup endpoint. When no URL is set we pass `undefined` (NOT a
+  // NoopIdentityResolver): the agent's "no resolver" branch is what emits
+  // `identity_lookup_total{result="disabled"}`. A Noop instance is truthy, so it
+  // would take the "resolver present" branch and report `none` on every inbound,
+  // making an enrichment-disabled deploy look like a configured-but-empty one.
   const contactStore = new InMemoryContactStore();
-  const identityResolver: IdentityResolver = config.userLookupUrl
+  const identityResolver: IdentityResolver | undefined = config.userLookupUrl
     ? new HttpIdentityResolver({
         lookupUrl: config.userLookupUrl,
         timeoutMs: config.conversation.userLookupTimeoutMs,
         logger,
         contactStore
       })
-    : new NoopIdentityResolver();
+    : undefined;
 
   // Delivery-status history sink (feeds GET /admin/status/:messageId + metrics).
   const statusTracker = new InMemoryStatusTracker();
