@@ -3,7 +3,7 @@ import path from 'node:path';
 import express from 'express';
 import pino from 'pino';
 import { loadConfig, type Config } from './config/loader.js';
-import { createApp } from './http/app.js';
+import { createApp, PACKAGE_VERSION } from './http/app.js';
 import { GraphClient } from './meta/shared/graph-client.js';
 import { WhatsAppClient } from './meta/whatsapp/client.js';
 import { MessengerClient } from './meta/messenger/client.js';
@@ -12,6 +12,12 @@ import { HttpChatClient } from './chat/client.js';
 import { InMemoryConversationStore } from './conversation/store.js';
 import { InMemoryBufferScheduler } from './conversation/scheduler.js';
 import { ConversationAgent } from './conversation/agent.js';
+import { InMemoryMetricsCollector } from './metrics/collector.js';
+import { createAgentMetrics } from './metrics/registry.js';
+import { InMemoryStatusTracker } from './status/tracker.js';
+import { InMemoryContactStore } from './identity/contact-store.js';
+import { HttpIdentityResolver } from './identity/resolver.js';
+import type { IdentityResolver } from './identity/resolver.js';
 import type { ChannelAdapter } from './meta/shared/adapter.js';
 import type { Channel } from './meta/types.js';
 
@@ -47,9 +53,12 @@ export function buildRuntime(
     adapters.instagram = new InstagramClient({ config: config.instagram, graph, logger });
   }
 
-  // WHY in-memory store + scheduler for Stage 5: state is per-process and the
-  // setTimeout-based scheduler is single-replica. The production swap to a
-  // Redis-backed store + BullMQ scheduler (selected on REDIS_URL) is Stage 10.
+  // WHY in-memory store + scheduler for Stage 5/6: state is per-process and the
+  // setTimeout-based scheduler is single-replica. Likewise the Stage 6 metrics
+  // collector, status tracker, and contact-store cache below are all in-memory.
+  // The production swap to Redis-backed implementations (store, BullMQ scheduler,
+  // status tracker with TTL eviction, shared/bounded contact cache), selected on
+  // REDIS_URL, is Stage 10.
   const store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
   const scheduler = new InMemoryBufferScheduler();
   const chatClient = new HttpChatClient({
@@ -57,9 +66,57 @@ export function buildRuntime(
     timeoutMs: config.conversation.chatEndpointTimeoutMs,
     logger
   });
-  const agent = new ConversationAgent({ store, scheduler, chatClient, adapters, config, logger });
 
-  const app = createApp({ config, logger, agent });
+  // Stage 6 observability deps. The metrics registry is built once against the
+  // collector; agent_up and agent_build_info are set immediately so a scrape
+  // right after boot already shows the process as up with its version.
+  const metricsCollector = new InMemoryMetricsCollector({ logger });
+  const metrics = createAgentMetrics(metricsCollector);
+  metrics.agentUp.set(undefined, 1);
+  metrics.agentBuildInfo.set({ version: PACKAGE_VERSION }, 1);
+
+  // Identity enrichment (fail-open). An HTTP resolver ONLY when USER_LOOKUP_URL
+  // is configured, backed by an in-memory contact cache so repeat senders don't
+  // re-hit the lookup endpoint. When no URL is set we pass `undefined` (NOT a
+  // NoopIdentityResolver): the agent's "no resolver" branch is what emits
+  // `identity_lookup_total{result="disabled"}`. A Noop instance is truthy, so it
+  // would take the "resolver present" branch and report `none` on every inbound,
+  // making an enrichment-disabled deploy look like a configured-but-empty one.
+  const contactStore = new InMemoryContactStore();
+  const identityResolver: IdentityResolver | undefined = config.userLookupUrl
+    ? new HttpIdentityResolver({
+        lookupUrl: config.userLookupUrl,
+        timeoutMs: config.conversation.userLookupTimeoutMs,
+        logger,
+        contactStore
+      })
+    : undefined;
+
+  // Delivery-status history sink (feeds GET /admin/status/:messageId + metrics).
+  const statusTracker = new InMemoryStatusTracker();
+
+  const agent = new ConversationAgent({
+    store,
+    scheduler,
+    chatClient,
+    adapters,
+    config,
+    logger,
+    metrics,
+    identityResolver,
+    statusTracker
+  });
+
+  const app = createApp({
+    config,
+    logger,
+    agent,
+    metrics,
+    metricsCollector,
+    statusTracker,
+    store,
+    scheduler
+  });
 
   return { app, agent };
 }

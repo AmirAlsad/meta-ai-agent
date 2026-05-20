@@ -82,6 +82,15 @@ export interface ConversationConfig {
   chatEndpointTimeoutMs: number;
   /** TTL for the inbound dedupe key in the store (seconds). */
   dedupeTtlSeconds: number;
+  /**
+   * Timeout for the optional identity-enrichment HTTP call to
+   * `USER_LOOKUP_URL` (ms). Lives in the conversation group alongside
+   * `chatEndpointTimeoutMs` because, like the chat call, the lookup sits inline
+   * on the inbound path. Always has a default; only consulted when
+   * {@link Config.userLookupUrl} is set. Identity resolution is fail-open, so a
+   * hit on this timeout drops enrichment rather than blocking the turn.
+   */
+  userLookupTimeoutMs: number;
 }
 
 export interface Config {
@@ -92,6 +101,16 @@ export interface Config {
   channels: Channels;
   conversation: ConversationConfig;
   chatEndpointUrl: string;
+  /**
+   * Optional. Developer-provided endpoint for identity enrichment — the
+   * resolver POSTs `{ channel, channelScopedUserId, channelScopedBusinessId }`
+   * and shapes the JSON response into a `Contact`. OPTIONAL because enrichment
+   * is a fail-open add-on: when unset the agent runs a no-op resolver and every
+   * conversation simply proceeds without contact info. When set it must parse
+   * as a URL (validated at load time, like `chatEndpointUrl`); the per-call
+   * timeout is `conversation.userLookupTimeoutMs`.
+   */
+  userLookupUrl?: string;
   redisUrl?: string;
   adminApiToken?: string;
   publicBaseUrl?: string;
@@ -295,7 +314,8 @@ const CONVERSATION_DEFAULTS: ConversationConfig = {
   readReceiptsEnabled: false,
   outboundDeliveryTimeoutMs: 30000,
   chatEndpointTimeoutMs: 30000,
-  dedupeTtlSeconds: 86400
+  dedupeTtlSeconds: 86400,
+  userLookupTimeoutMs: 5000
 };
 
 /**
@@ -331,7 +351,8 @@ function loadConversationConfig(env: ConfigEnv): ConversationConfig {
     readReceiptsEnabled: loadBoolean(env, 'READ_RECEIPTS_ENABLED', d.readReceiptsEnabled),
     outboundDeliveryTimeoutMs: loadPositiveInt(env, 'OUTBOUND_DELIVERY_TIMEOUT_MS', d.outboundDeliveryTimeoutMs),
     chatEndpointTimeoutMs: loadPositiveInt(env, 'CHAT_ENDPOINT_TIMEOUT_MS', d.chatEndpointTimeoutMs),
-    dedupeTtlSeconds: loadPositiveInt(env, 'DEDUPE_TTL_SECONDS', d.dedupeTtlSeconds)
+    dedupeTtlSeconds: loadPositiveInt(env, 'DEDUPE_TTL_SECONDS', d.dedupeTtlSeconds),
+    userLookupTimeoutMs: loadPositiveInt(env, 'USER_LOOKUP_TIMEOUT_MS', d.userLookupTimeoutMs)
   };
 }
 
@@ -345,11 +366,49 @@ function loadChatEndpointUrl(env: ConfigEnv): string {
   return raw;
 }
 
+/**
+ * Load the OPTIONAL `USER_LOOKUP_URL` for identity enrichment. Unset/blank ->
+ * `undefined` (enrichment disabled; the agent uses a no-op resolver). When
+ * present it must parse as a URL — we fail fast with the var name (same posture
+ * as `CHAT_ENDPOINT_URL`) so a typo'd lookup endpoint is caught at boot rather
+ * than silently swallowed by the resolver's fail-open path on every inbound.
+ */
+function loadUserLookupUrl(env: ConfigEnv): string | undefined {
+  const raw = trimmed(env, 'USER_LOOKUP_URL');
+  if (raw === undefined) return undefined;
+  try {
+    new URL(raw);
+  } catch {
+    throw new Error(`Invalid USER_LOOKUP_URL: ${raw}. Expected a parseable URL.`);
+  }
+  return raw;
+}
+
 function loadVerifyToken(env: ConfigEnv): string {
   const value = requireEnv(env, 'META_VERIFY_TOKEN');
   if (value.length < 16) {
     throw new Error(
       `Invalid META_VERIFY_TOKEN: must be at least 16 characters (got ${value.length}).`
+    );
+  }
+  return value;
+}
+
+/**
+ * Load the OPTIONAL `ADMIN_API_TOKEN`. Unset/blank -> `undefined` (the admin
+ * routes simply don't mount — see `createApp`). When SET it gates PII-bearing
+ * admin introspection (`/metrics`, `/admin/*`), so we enforce a 16-char floor —
+ * the same minimum as `META_VERIFY_TOKEN` — and recommend >=32. A trivially
+ * short bearer token guarding conversation PII is a foot-gun we fail fast on at
+ * boot rather than ship.
+ */
+function loadAdminApiToken(env: ConfigEnv): string | undefined {
+  const value = trimmed(env, 'ADMIN_API_TOKEN');
+  if (value === undefined) return undefined;
+  if (value.length < 16) {
+    throw new Error(
+      `Invalid ADMIN_API_TOKEN: must be at least 16 characters (got ${value.length}). ` +
+        'This token guards PII-bearing admin routes; use a high-entropy secret of >=32 characters.'
     );
   }
   return value;
@@ -435,8 +494,9 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     channels,
     conversation: loadConversationConfig(env),
     chatEndpointUrl: loadChatEndpointUrl(env),
+    userLookupUrl: loadUserLookupUrl(env),
     redisUrl: trimmed(env, 'REDIS_URL'),
-    adminApiToken: trimmed(env, 'ADMIN_API_TOKEN'),
+    adminApiToken: loadAdminApiToken(env),
     publicBaseUrl: trimmed(env, 'PUBLIC_BASE_URL'),
     ngrokDomain: loadNgrokDomain(env),
     agentAutostart: loadAgentAutostart(env),

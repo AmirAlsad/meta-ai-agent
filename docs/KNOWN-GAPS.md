@@ -2,17 +2,53 @@
 
 A running list of items surfaced during code review or implementation that were intentionally deferred to a later stage. Recording them here keeps the institutional memory from getting lost between stages — if you are working on the stage listed, treat the entry as a TODO.
 
+## Open as of Stage 6 (status tracking, identity, operational visibility)
+
+### Verification deferred to live testing
+
+- **Read-receipt agent wiring is unit-tested but not yet live-verified** — `ConversationAgent.maybeMarkRead` (gated on `READ_RECEIPTS_ENABLED`) marks the user's inbound message read at flush, *before* the chat call, so silent and reaction-only turns still mark read (decoupled from the typing indicator). This is covered by unit tests but has NOT been exercised end-to-end against the real Meta APIs. **Verify at Stage 9 (live device / examples testing):** with `READ_RECEIPTS_ENABLED=true`, confirm that both a silent turn and a reaction-only turn mark the user's message read on WhatsApp (most-recent message), Messenger, and Instagram (thread `mark_seen`).
+  - **Where**: [`src/conversation/agent.ts`](../src/conversation/agent.ts) `maybeMarkRead`. Documented in [Read receipts](./features/read-receipts.md).
+  - **When**: Stage 9 (live testing).
+
+### Operational-surface deferrals
+
+- **`/ready` Redis check is presence-only** — `buildReadinessReport` reports `redis: 'configured'` when `REDIS_URL` is set and `'not_configured'` otherwise, but it does NOT actually ping Redis, and a configured-but-unreachable Redis does not fail readiness. The real ping (and the Redis-backed store / BullMQ scheduler it would gate) lands in Stage 10.
+  - **Where**: [`src/http/app.ts`](../src/http/app.ts) `buildReadinessReport`.
+  - **When**: Stage 10 (real Redis ping once the Redis-backed store/scheduler exist).
+
+- **Per-dispatch-log PII gating is deferred** — the webhook dispatch logs (`inbound.message`) still emit the full channel-scoped user id at `info` so the wiring stays debuggable end-to-end. Stage 6 redacts only the ADMIN-route OUTPUT (`src/http/redaction.ts`), not these per-dispatch logs. Gating dispatch-log PII (e.g. on `config.nodeEnv` or a log-redaction serializer) is an accepted gap, not an unfulfilled TODO.
+  - **Where**: [`src/http/app.ts`](../src/http/app.ts) `logIncomingMessage` (see the in-code KNOWN GAP comment).
+  - **When**: Stage 10.
+
+- **`contact.tags` / `customVariables` are not redacted in admin output** — `redactContact` masks the user-id, name, and email but deliberately keeps `tags`, `customVariables`, and `unifiedContactId` intact, because they are developer-supplied operational metadata (e.g. `tier:gold`), not inherently Meta user PII. A developer who stuffs PII into `customVariables` will see it in clear on `GET /admin/conversations/:key`. `?reveal=true` is the escape hatch for the rest; these fields are kept by design.
+  - **Where**: [`src/http/redaction.ts`](../src/http/redaction.ts) `redactContact`. Documented in [Identity resolution](./features/identity-resolution.md) and [Operational visibility](./features/operational-visibility.md).
+  - **When**: No code change planned unless the contact model gains a PII-typed field; revisit if so.
+
+- **Webhook signature-rejection metric is not wired** — the signature verifier 401s an invalid signature BEFORE the dispatcher runs, so `webhook_received_total` counts only signature-valid requests. A rejected webhook surfaces only in a warn log, not in a metric. There is no `webhook_signature_rejected_total` counter yet.
+  - **Where**: [`src/http/security.ts`](../src/http/security.ts) (the verifier), [`src/http/app.ts`](../src/http/app.ts) (`POST /webhook` — counter increments after the verifier).
+  - **When**: Stage 10 (or whenever signature-rejection alerting becomes load-bearing).
+
+- **Identity-lookup metric is coarse** — `identity_lookup_total{result}` uses a `resolved | none | disabled` split only. The resolver's fail-open contract returns `undefined` indistinguishably for a cache miss, an HTTP miss, a non-2xx, a timeout, or a parse failure, so a finer `hit | cached | error` split cannot be emitted honestly from the agent.
+  - **Where**: [`src/conversation/agent.ts`](../src/conversation/agent.ts) (`handleInboundImpl`), [`src/identity/resolver.ts`](../src/identity/resolver.ts). Documented in [Identity resolution](./features/identity-resolution.md).
+  - **When**: Deferred — would require the resolver to surface a typed outcome rather than `undefined`.
+
+### Persistence and durability
+
+- **In-memory metrics / status / contact stores are unbounded until Redis** — `InMemoryMetricsCollector`, `InMemoryStatusTracker`, and `InMemoryContactStore` are all per-process plain `Map`s, lost on restart, and (apart from the metrics per-metric cardinality cap that folds overflow into `__overflow__`) unbounded with no TTL or sweeper. This is acceptable for Stage 6 because the production path is the Redis-backed implementations with TTL eviction in Stage 10. The collector/tracker/store interfaces are the contract those impls will honor.
+  - **Where**: [`src/metrics/collector.ts`](../src/metrics/collector.ts), [`src/status/tracker.ts`](../src/status/tracker.ts), [`src/identity/contact-store.ts`](../src/identity/contact-store.ts).
+  - **When**: Stage 10 (Redis-backed status tracker with TTL, shared/bounded contact cache; metrics export model TBD).
+
 ## Open as of Stage 5 (conversation agent)
 
 ### Not yet wired
 
-- **Identity resolver is a no-op** — `ChatRequest.contact` and `ConversationRecord.contact` exist in the type, and `createIdleConversation` / the flush already thread `contact` through when present, but nothing populates it — there is no `IdentityResolver` / `ContactStore`, so `contact` is always undefined and the conversation key is always the raw `(channel, channelScopedId)` tuple with no cross-channel merge.
-  - **Where**: [`src/conversation/agent.ts`](../src/conversation/agent.ts) (flush builds the request), [`src/conversation/types.ts`](../src/conversation/types.ts) (`Contact` import); planned `src/identity/{resolver,contact-store}.ts`.
-  - **When**: Stage 6 (status tracking, identity, operational visibility).
+- **Identity resolver is a no-op** — RESOLVED in Stage 6. `src/identity/{resolver,contact-store}.ts` now exist: an optional `HttpIdentityResolver` (over `USER_LOOKUP_URL`, fail-open, cache-then-fetch) populates `ConversationRecord.contact` once per conversation and the flush forwards it on the `ChatRequest`; when `USER_LOOKUP_URL` is unset a `NoopIdentityResolver` runs so `contact` is undefined. Cross-channel merge is still the developer's resolver's job (via `unifiedContactId`) — this package does not synthesize a unified id. See [Identity resolution](./features/identity-resolution.md).
+  - **Where**: [`src/identity/resolver.ts`](../src/identity/resolver.ts), [`src/identity/contact-store.ts`](../src/identity/contact-store.ts), [`src/conversation/agent.ts`](../src/conversation/agent.ts).
+  - **When**: Fixed (Stage 6). The contact-cache TTL/Redis swap remains a Stage 10 item (see the Stage 6 persistence entry above).
 
-- **Metrics are not wired** — There is no metrics collector. Notably, `InMemoryBufferScheduler`'s timer-fired-handler catch and the scheduler-handler path swallow failures silently with an explicit "Stage 6: increment a failure counter and log here" TODO.
-  - **Where**: [`src/conversation/scheduler.ts`](../src/conversation/scheduler.ts) (the swallowed `.catch`); planned `src/metrics/`.
-  - **When**: Stage 6.
+- **Metrics are not wired** — RESOLVED in Stage 6. `src/metrics/{collector,registry,prometheus}.ts` add a provider-agnostic `MetricsCollector` (`InMemoryMetricsCollector` + `NoopMetricsCollector`), `createAgentMetrics` named handles, and `renderPrometheus`; `GET /metrics` exposes the exposition (token-gated). The agent now instruments webhook/inbound/dispatch/outbound/status/identity/buffer paths. See [Operational visibility](./features/operational-visibility.md). NOTE: the scheduler-handler swallowed-`.catch` path is now covered by `buffer_flush_total{result:'error'}` at the agent level; a dedicated scheduler-internal failure counter is still not emitted from the scheduler itself.
+  - **Where**: [`src/metrics/`](../src/metrics/), [`src/conversation/agent.ts`](../src/conversation/agent.ts); [`src/conversation/scheduler.ts`](../src/conversation/scheduler.ts) (the swallowed `.catch` remains uncounted at the scheduler level).
+  - **When**: Fixed (Stage 6).
 
 - **No rate limiting on the conversation/outbound path** — The agent sends as fast as the queue drains. The only pacing anywhere is the Instagram client's coarse 100ms in-process floor (see the Stage 4 entry below). No per-channel send-rate accounting, no token bucket, no cross-replica coordination.
   - **Where**: [`src/conversation/agent.ts`](../src/conversation/agent.ts) `sendNext`; planned `src/limits/tracker.ts`.

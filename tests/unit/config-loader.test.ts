@@ -116,7 +116,8 @@ describe('loadConfig: conversation defaults', () => {
       readReceiptsEnabled: false,
       outboundDeliveryTimeoutMs: 30000,
       chatEndpointTimeoutMs: 30000,
-      dedupeTtlSeconds: 86400
+      dedupeTtlSeconds: 86400,
+      userLookupTimeoutMs: 5000
     });
   });
 });
@@ -136,7 +137,8 @@ describe('loadConfig: positive-integer conversation knobs', () => {
     { env: 'TYPING_REFRESH_MAX_MS', field: 'typingRefreshMaxMs' },
     { env: 'OUTBOUND_DELIVERY_TIMEOUT_MS', field: 'outboundDeliveryTimeoutMs' },
     { env: 'CHAT_ENDPOINT_TIMEOUT_MS', field: 'chatEndpointTimeoutMs' },
-    { env: 'DEDUPE_TTL_SECONDS', field: 'dedupeTtlSeconds' }
+    { env: 'DEDUPE_TTL_SECONDS', field: 'dedupeTtlSeconds' },
+    { env: 'USER_LOOKUP_TIMEOUT_MS', field: 'userLookupTimeoutMs' }
   ];
 
   for (const { env, field, extra } of intKnobs) {
@@ -262,6 +264,71 @@ describe('loadConfig: boolean conversation knobs', () => {
       });
     });
   }
+});
+
+describe('loadConfig: USER_LOOKUP_URL (optional identity enrichment)', () => {
+  it('is undefined when absent (enrichment disabled)', () => {
+    expect(loadConfig(baseEnv()).userLookupUrl).toBeUndefined();
+  });
+
+  it('is undefined when whitespace-only (trim-empty-as-unset)', () => {
+    expect(loadConfig(baseEnv({ USER_LOOKUP_URL: '   ' })).userLookupUrl).toBeUndefined();
+  });
+
+  it('surfaces a valid URL on Config', () => {
+    const config = loadConfig(baseEnv({ USER_LOOKUP_URL: 'https://lookup.example.com/identity' }));
+    expect(config.userLookupUrl).toBe('https://lookup.example.com/identity');
+  });
+
+  it('throws (naming the var) on a malformed URL', () => {
+    expect(() => loadConfig(baseEnv({ USER_LOOKUP_URL: 'not a url' }))).toThrow(
+      /Invalid USER_LOOKUP_URL/
+    );
+  });
+});
+
+describe('loadConfig: USER_LOOKUP_TIMEOUT_MS', () => {
+  it('defaults to 5000 when unset', () => {
+    expect(loadConfig(baseEnv()).conversation.userLookupTimeoutMs).toBe(5000);
+  });
+
+  it('honors a valid override', () => {
+    expect(
+      loadConfig(baseEnv({ USER_LOOKUP_TIMEOUT_MS: '2500' })).conversation.userLookupTimeoutMs
+    ).toBe(2500);
+  });
+
+  it('throws (naming the var) on a malformed value', () => {
+    expect(() => loadConfig(baseEnv({ USER_LOOKUP_TIMEOUT_MS: 'soon' }))).toThrow(
+      /Invalid USER_LOOKUP_TIMEOUT_MS/
+    );
+  });
+});
+
+describe('loadConfig: ADMIN_API_TOKEN (PII-guarding bearer token)', () => {
+  it('is undefined when unset — admin routes simply do not mount', () => {
+    expect(loadConfig(baseEnv()).adminApiToken).toBeUndefined();
+  });
+
+  it('is undefined when whitespace-only (trim-empty-as-unset)', () => {
+    expect(loadConfig(baseEnv({ ADMIN_API_TOKEN: '   ' })).adminApiToken).toBeUndefined();
+  });
+
+  it('throws (naming the var) when set but shorter than 16 chars', () => {
+    expect(() => loadConfig(baseEnv({ ADMIN_API_TOKEN: 'short-token' }))).toThrow(
+      /Invalid ADMIN_API_TOKEN.*at least 16 characters/
+    );
+  });
+
+  it('surfaces a >=16-char token on Config', () => {
+    const token = 'admin-token-1234567890';
+    expect(loadConfig(baseEnv({ ADMIN_API_TOKEN: token })).adminApiToken).toBe(token);
+  });
+
+  it('accepts exactly 16 chars (the floor)', () => {
+    const token = '0123456789abcdef'; // 16
+    expect(loadConfig(baseEnv({ ADMIN_API_TOKEN: token })).adminApiToken).toBe(token);
+  });
 });
 
 describe('loadConfig: AGENT_AUTOSTART (unchanged after loadBoolean refactor)', () => {

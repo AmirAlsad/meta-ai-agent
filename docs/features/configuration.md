@@ -2,7 +2,7 @@
 
 ## What it does
 
-Documents runtime configuration for `meta-ai-agent` as of Stages 1–2: Meta App credentials, per-channel credentials, the developer's chat endpoint URL, and process-level controls (port, autostart gate, public base URL for webhook registration). Stage 2 did not introduce new env vars — the parser is fully configuration-free. Future stages will add tunables for buffering, typing indicators, read receipts, identity resolution, persistence, rate limiting, and operational visibility.
+Documents runtime configuration for `meta-ai-agent`: Meta App credentials, per-channel credentials, the developer's chat endpoint URL, and process-level controls (port, autostart gate, public base URL for webhook registration). Stage 5 added the nested `conversation` tuning section (buffer timing, typing, read receipts, delivery timeout, dedupe TTL, chat timeout) — see [`src/config/loader.ts`](../../src/config/loader.ts). Stage 6 added identity-enrichment knobs (`USER_LOOKUP_URL`, `USER_LOOKUP_TIMEOUT_MS`) and made `ADMIN_API_TOKEN` an active gate for the operational routes (with a ≥16-char floor). Persistence and full rate limiting (Stage 10) will add further tunables.
 
 ## How it works
 
@@ -84,8 +84,10 @@ The Messenger OAuth script also reads `META_APP_ID` and `META_APP_SECRET` — un
 | `META_APP_ID` | unset | Optional; reserved for outbound clients (Stage 4) that may need the App ID for some Graph API admin calls. Not used in Stage 1. **Not used by `setup:oauth:instagram`** — Instagram OAuth uses the Instagram product's own `client_id` (parsed from `INSTAGRAM_AUTHORIZE_URL`) and `INSTAGRAM_APP_SECRET`, which are sibling-but-distinct credentials inside the same Meta App. |
 | `META_GRAPH_API_VERSION` | `v25.0` | Pinned Graph API version. Validated against `^v\d+\.\d+$`. Used by outbound clients in Stage 4. |
 | `PORT` | `3000` | Express listen port. Must be an integer between 1 and 65535. |
-| `REDIS_URL` | unset | Reserved for Stage 10 (Redis-backed conversation store, dedupe, BullMQ buffer timers). Not consumed by Stage 1. |
-| `ADMIN_API_TOKEN` | unset | Reserved for Stage 6 (`GET /metrics`, `/admin/*` introspection). Not consumed by Stage 1. |
+| `USER_LOOKUP_URL` | unset | Optional Stage 6 identity-enrichment endpoint. The resolver POSTs `{ channel, channelScopedUserId, channelScopedBusinessId }` and shapes the JSON response into a `Contact` that rides on the `ChatRequest`. When unset, a no-op resolver runs and conversations proceed without enrichment. When set it must parse as a URL (validated at load, like `CHAT_ENDPOINT_URL`). Enrichment is fail-open. See [Identity resolution](./identity-resolution.md). |
+| `USER_LOOKUP_TIMEOUT_MS` | `5000` | Per-call timeout for the `USER_LOOKUP_URL` request (positive integer). A timeout drops enrichment rather than blocking the turn (fail-open). Loaded onto `config.conversation.userLookupTimeoutMs`, alongside `CHAT_ENDPOINT_TIMEOUT_MS`. Only consulted when `USER_LOOKUP_URL` is set. |
+| `REDIS_URL` | unset | Reserved for Stage 10 (Redis-backed conversation store, dedupe, BullMQ buffer timers). As of Stage 6 it is surfaced in `GET /ready` as `configured` vs `not_configured` (presence-only — the real ping lands in Stage 10). |
+| `ADMIN_API_TOKEN` | unset | Stage 6: gates the PII-bearing operational routes `GET /metrics`, `GET /admin/conversations/:key`, and `GET /admin/status/:messageId` (constant-time `Authorization: Bearer` / `x-admin-api-token` check). When **unset**, those routes are not mounted at all (a request 404s, not 401s — never advertise an admin surface a deploy hasn't configured a token for). When **set**, it must be at least **16 characters** (a high-entropy secret of **≥32** is recommended) — `loadConfig` throws otherwise. `/health` and `/ready` are unaffected (always on, unauthenticated). See [Operational visibility](./operational-visibility.md). |
 | `PUBLIC_BASE_URL` | unset | Used by Stage 3 webhook-registration and capture scripts to compute the callback URL. Not consumed by the running app. |
 | `AGENT_AUTOSTART` | `1` | `0` / `false` to prevent `src/index.ts` from auto-binding a port. Useful when embedding `createApp` in a custom entry point. |
 | `NODE_ENV` | `development` | When `test`, `src/index.ts` skips autostart so test imports do not bind a port. |
@@ -110,6 +112,8 @@ None of these are consumed by the running agent in Stage 1; they are read by the
 - `META_VERIFY_TOKEN` missing/empty or fewer than 16 characters.
 - `CHAT_ENDPOINT_URL` missing/empty or not a parseable URL.
 - `META_GRAPH_API_VERSION` set to a value not matching `^v\d+\.\d+$`.
+- `USER_LOOKUP_URL` set but not a parseable URL.
+- `ADMIN_API_TOKEN` set but fewer than 16 characters.
 - `NGROK_DOMAIN` missing/empty, set with an `http://` / `https://` scheme, set with a path or query, or missing a `.` (not a hostname).
 - Exactly one of a channel pair set (partial config).
 - All three channels unset.
