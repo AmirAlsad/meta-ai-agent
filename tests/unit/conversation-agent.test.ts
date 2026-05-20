@@ -1092,6 +1092,28 @@ describe('ConversationAgent', () => {
     await h.agent.close();
   });
 
+  it('status tracker: WhatsApp delivered + read are recorded after sent deletes the mapping', async () => {
+    const h = makeHarness({ responses: [textResponse('hi')], withStatusTracker: true });
+    await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.tr2' }));
+    await flushBuffer();
+    const sentId = (await (h.adapters.whatsapp!.sendText.mock.results[0]!.value as Promise<SendResult>)).messageId;
+
+    // 'sent' advances the WhatsApp queue and deletes the outbound-handle mapping.
+    await h.agent.handleStatus(status(sentId, 'sent'));
+    // delivered + read arrive AFTER the mapping is gone. Regression guard: they
+    // were previously dropped at the unmapped early-return, freezing history at
+    // the first status. They must now still be recorded.
+    await h.agent.handleStatus(status(sentId, 'delivered'));
+    await h.agent.handleStatus(status(sentId, 'read'));
+
+    const tracked = h.statusTracker!.getStatus(sentId);
+    expect(tracked).toBeDefined();
+    expect(tracked!.current).toBe('read');
+    expect(tracked!.history.map(e => e.status)).toEqual(['sent', 'delivered', 'read']);
+
+    await h.agent.close();
+  });
+
   it('watermark read (Messenger): both sent ids marked read; queue unaffected', async () => {
     // Messenger is on_send: two messages both send and the queue reaches idle.
     const h = makeHarness({
@@ -1172,6 +1194,9 @@ function status(channelMessageId: string, value: StatusUpdate['status']): Status
   return {
     channel: 'whatsapp',
     channelMessageId,
+    // Real WhatsApp statuses carry recipient_id; the agent derives the
+    // conversation key from it (+ business id) to record status history.
+    channelScopedUserId: 'user-1',
     channelScopedBusinessId: 'biz-1',
     status: value,
     timestamp: FIXED_NOW,

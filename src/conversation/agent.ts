@@ -832,6 +832,44 @@ export class ConversationAgent {
    * NOT such a read still runs unlocked straight to the benign no-op.
    */
   async handleStatus(status: StatusUpdate, opts?: HandleOptions): Promise<void> {
+    // Record per-message status history FIRST, decoupled from the outbound-handle
+    // mapping and the per-key lock. WhatsApp emits sent → delivered → read for one
+    // message, but the first advancing status (`sent`) deletes the mapping in
+    // advanceAndContinue — so a delivered/read callback arriving afterward would
+    // hit the "unmapped" early-return and be dropped from the tracker, leaving the
+    // history stuck at the first status. The status tracker is its own store (a
+    // synchronous map, separate from the ConversationStore), so recording here
+    // needs no lock. Watermark reads (Messenger/IG `read`) carry a watermark, not a
+    // real message id, and are recorded via applyReadWatermark instead — skip them.
+    const isWatermarkRead = status.status === 'read' && status.channel !== 'whatsapp';
+    if (this.statusTracker && !isWatermarkRead) {
+      try {
+        const conversationKey =
+          status.channelScopedUserId !== undefined && status.channelScopedBusinessId !== undefined
+            ? conversationKeyFor({
+                channel: status.channel,
+                channelScopedBusinessId: status.channelScopedBusinessId,
+                channelScopedUserId: status.channelScopedUserId
+              })
+            : undefined;
+        this.statusTracker.applyStatusUpdate({
+          channelMessageId: status.channelMessageId,
+          channel: status.channel,
+          status: status.status,
+          timestamp: status.timestamp,
+          ...(conversationKey !== undefined ? { conversationKey } : {}),
+          ...(status.channelScopedUserId !== undefined ? { recipientId: status.channelScopedUserId } : {}),
+          ...(status.errorCode !== undefined ? { errorCode: status.errorCode } : {}),
+          ...(status.errorTitle !== undefined ? { errorTitle: status.errorTitle } : {})
+        });
+      } catch (error) {
+        (opts?.logger ?? this.logger).warn(
+          { err: error, channelMessageId: status.channelMessageId },
+          'status tracker record failed (non-fatal)'
+        );
+      }
+    }
+
     const preMapping = await this.store.getOutboundHandleMapping(status.channelMessageId);
     if (preMapping) {
       await this.runExclusive(preMapping.conversationKey, () => this.handleStatusImpl(status, opts));
@@ -894,20 +932,9 @@ export class ConversationAgent {
         await this.store.setConversation(record);
       }
 
-      // Stage 6 per-message status history (WhatsApp wamid 1:1). Recorded BEFORE
-      // the advancement branch (which returns early) so the tracker captures the
-      // status whether or not it advances the queue. Fail-soft: a tracker error
-      // must not break delivery, so it's inside this method's try/catch.
-      this.statusTracker?.applyStatusUpdate({
-        channelMessageId: status.channelMessageId,
-        channel: status.channel,
-        status: status.status,
-        timestamp: status.timestamp,
-        conversationKey: mapping.conversationKey,
-        ...(status.channelScopedUserId !== undefined ? { recipientId: status.channelScopedUserId } : {}),
-        ...(status.errorCode !== undefined ? { errorCode: status.errorCode } : {}),
-        ...(status.errorTitle !== undefined ? { errorTitle: status.errorTitle } : {})
-      });
+      // (Per-message status history is recorded up-front in handleStatus, before
+      // the mapping lookup, so delivered/read aren't lost once `sent` deletes the
+      // mapping. Here we only handle queue advancement.)
 
       // Only advance when this status both advances the queue for this channel
       // (WhatsApp sent/delivered) AND refers to the CURRENTLY in-flight item.
