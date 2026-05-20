@@ -12,6 +12,7 @@ import {
   type CapturedWebhook
 } from '../../scripts/lib/capture-server.js';
 import type { Config } from '../../src/config/loader.js';
+import { defaultConversationConfig } from '../../src/config/loader.js';
 
 const APP_SECRET = 'test-app-secret-1234567890';
 const VERIFY_TOKEN = 'test-verify-token-1234567890';
@@ -69,6 +70,7 @@ function makeConfig(): Config {
       accessToken: 'wa-token'
     },
     channels: { whatsapp: true, messenger: false, instagram: false },
+    conversation: defaultConversationConfig(),
     chatEndpointUrl: 'http://localhost:9999/chat',
     ngrokDomain: 'test.ngrok-free.dev',
     agentAutostart: false,

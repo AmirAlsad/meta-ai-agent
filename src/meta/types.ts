@@ -370,6 +370,17 @@ export interface InstagramReaction {
 /** The three channels this package handles under a single Meta App. */
 export type Channel = 'whatsapp' | 'messenger' | 'instagram';
 
+// Re-export the outbound adapter contract for discoverability — the Stage 4
+// send adapters and the conversation agent can import these alongside the
+// inbound types from a single module. The definitions live in
+// `./shared/adapter.ts` (transport-adjacent), here we just surface them.
+export type {
+  SendResult,
+  SendOptions,
+  ChannelFeature,
+  ChannelAdapter
+} from './shared/adapter.js';
+
 /**
  * Discriminator for normalized inbound message types.
  *

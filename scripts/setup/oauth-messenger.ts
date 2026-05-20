@@ -81,8 +81,7 @@ import type { Server } from 'node:http';
 import {
   buildGraphUrl,
   graphFetch,
-  MetaApiError,
-  type GraphConfig
+  MetaApiError
 } from '../lib/graph-api.js';
 import {
   info,
