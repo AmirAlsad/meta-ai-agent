@@ -176,6 +176,23 @@ describe('InMemoryMetricsCollector', () => {
       expect((overflow as { value: number }).value).toBe(2);
     });
 
+    it('keeps incrementing a pre-existing series after the cap is reached (not frozen into overflow)', () => {
+      const c = new InMemoryMetricsCollector({ cardinalityLimit: 2 });
+      const counter = c.counter('bar_total', { labels: ['key'] });
+      counter.inc({ key: 'a' }); // size 1
+      counter.inc({ key: 'b' }); // size 2 → cap reached
+      counter.inc({ key: 'c' }); // NEW past the cap → folds into overflow
+      counter.inc({ key: 'a' }); // ALREADY registered → must hit 'a', NOT overflow
+
+      const snap = c.snapshot().metrics[0];
+      const a = snap.series.find(s => s.labels.key === 'a');
+      const overflow = snap.series.find(s => s.labels.key === OVERFLOW_LABEL_VALUE);
+      // Regression guard: with the pre-fix code, the post-cap `a` increment was
+      // misrouted to __overflow__ (a would stay 1, overflow would be 2).
+      expect((a as { value: number }).value).toBe(2);
+      expect((overflow as { value: number }).value).toBe(1);
+    });
+
     it('does not grow the series map past the cap under a runaway label stream', () => {
       const limit = 8;
       const c = new InMemoryMetricsCollector({ cardinalityLimit: limit });

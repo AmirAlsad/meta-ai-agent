@@ -189,12 +189,23 @@ abstract class InMemoryMetricBase {
    */
   protected resolve(
     labels: LabelValues | undefined,
-    seriesSize: number
+    seriesSize: number,
+    hasKey: (key: string) => boolean
   ): { key: string; values: LabelValues; overflow: boolean } {
     const values: LabelValues = {};
     for (const k of this.labelKeys) {
       const v = labels?.[k];
       values[k] = typeof v === 'string' ? v : '';
+    }
+    const canonical = this.canonicalKey(values);
+    // An ALREADY-registered series always resolves to itself — the cardinality
+    // cap blocks only NEW label combinations. Without this short-circuit, once
+    // the map reaches the cap EVERY subsequent call (including healthy,
+    // pre-existing series) would fold into __overflow__, silently freezing those
+    // metrics and making a cardinality explosion indistinguishable from a metric
+    // simply going quiet.
+    if (hasKey(canonical)) {
+      return { key: canonical, values, overflow: false };
     }
     if (seriesSize >= this.cardinalityLimit) {
       const overflowValues: LabelValues = {};
@@ -203,12 +214,12 @@ abstract class InMemoryMetricBase {
         this.overflowWarned = true;
         this.logger?.warn(
           { metric: this.name, cardinalityLimit: this.cardinalityLimit },
-          'metric label cardinality cap reached; subsequent series fold into __overflow__'
+          'metric label cardinality cap reached; subsequent NEW series fold into __overflow__'
         );
       }
       return { key: this.canonicalKey(overflowValues), values: overflowValues, overflow: true };
     }
-    return { key: this.canonicalKey(values), values, overflow: false };
+    return { key: canonical, values, overflow: false };
   }
 
   protected canonicalKey(values: LabelValues): string {
@@ -226,7 +237,7 @@ class InMemoryCounter extends InMemoryMetricBase implements Counter {
 
   inc(labels?: LabelValues, value: number = 1): void {
     if (!Number.isFinite(value) || value < 0) return;
-    const { key, values } = this.resolve(labels, this.series.size);
+    const { key, values } = this.resolve(labels, this.series.size, k => this.series.has(k));
     const entry = this.series.get(key);
     if (entry) {
       entry.value += value;
@@ -256,7 +267,7 @@ class InMemoryGauge extends InMemoryMetricBase implements Gauge {
 
   set(labels: LabelValues | undefined, value: number): void {
     if (!Number.isFinite(value)) return;
-    const { key, values } = this.resolve(labels, this.series.size);
+    const { key, values } = this.resolve(labels, this.series.size, k => this.series.has(k));
     const entry = this.series.get(key);
     if (entry) entry.value = value;
     else this.series.set(key, { labels: values, value });
@@ -264,7 +275,7 @@ class InMemoryGauge extends InMemoryMetricBase implements Gauge {
 
   inc(labels?: LabelValues, value: number = 1): void {
     if (!Number.isFinite(value)) return;
-    const { key, values } = this.resolve(labels, this.series.size);
+    const { key, values } = this.resolve(labels, this.series.size, k => this.series.has(k));
     const entry = this.series.get(key);
     if (entry) entry.value += value;
     else this.series.set(key, { labels: values, value });
@@ -305,7 +316,7 @@ class InMemoryHistogram extends InMemoryMetricBase implements Histogram {
 
   observe(labels: LabelValues | undefined, value: number): void {
     if (!Number.isFinite(value)) return;
-    const { key, values } = this.resolve(labels, this.series.size);
+    const { key, values } = this.resolve(labels, this.series.size, k => this.series.has(k));
     let entry = this.series.get(key);
     if (!entry) {
       entry = {
