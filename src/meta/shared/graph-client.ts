@@ -269,7 +269,10 @@ export class GraphClient {
   /**
    * `Retry-After` (when present and parseable) takes precedence — capped at
    * `maxBackoffMs`. Otherwise exponential backoff with full jitter:
-   * `min(maxBackoffMs, baseBackoffMs * 2^attempt) + random(0, baseBackoffMs)`.
+   * `min(maxBackoffMs, min(maxBackoffMs, baseBackoffMs * 2^attempt) + random(0, baseBackoffMs))`.
+   * The final `Math.min` caps the post-jitter value so the returned delay never
+   * exceeds `maxBackoffMs` (without it, jitter added after the exponential cap
+   * could overshoot the cap by up to `baseBackoffMs`).
    */
   private computeDelay(attempt: number, retryAfter: number | undefined): number {
     if (retryAfter !== undefined) {
@@ -277,7 +280,7 @@ export class GraphClient {
     }
     const exponential = Math.min(this.maxBackoffMs, this.baseBackoffMs * 2 ** attempt);
     const jitter = Math.random() * this.baseBackoffMs;
-    return exponential + jitter;
+    return Math.min(this.maxBackoffMs, exponential + jitter);
   }
 }
 

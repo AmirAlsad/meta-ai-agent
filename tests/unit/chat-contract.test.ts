@@ -106,6 +106,13 @@ describe('normalizeChatResponse — rich actions passthrough', () => {
     expect(normalizeChatResponse({ actions: [action] })).toEqual({ actions: [action] });
   });
 
+  it('passes an unreact (empty-emoji) reaction through (not dropped)', () => {
+    // Empty emoji is the documented unreact signal; the contract must let it
+    // reach the adapter rather than dropping it as invalid.
+    const action: ChatAction = { type: 'reaction', emoji: '', targetMessageId: 'wamid.2' };
+    expect(normalizeChatResponse({ actions: [action] })).toEqual({ actions: [action] });
+  });
+
   it('passes a media action through, keeping optional caption/mimeType', () => {
     const action: ChatAction = {
       type: 'media',

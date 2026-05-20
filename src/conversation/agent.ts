@@ -82,6 +82,14 @@ const ALL_CHANNEL_FEATURES: readonly ChannelFeature[] = [
 const DEFAULT_TYPING_DELAY_MS = 800;
 /** Cap on the derived typing delay so a long refresh interval can't stall sends. */
 const MAX_TYPING_DELAY_MS = 1500;
+/**
+ * Hard ceiling for an EXPLICIT `{ type: 'typing', durationMs }` chat action.
+ * The duration is honored (the bubble is held before the queue advances) but
+ * bounded — `sendNext` holds the per-key lock while it waits, so an unbounded
+ * duration from the chat endpoint would stall every other inbound for that
+ * conversation. 10s is generous for a deliberate "show typing" beat.
+ */
+const MAX_EXPLICIT_TYPING_DURATION_MS = 10_000;
 
 export interface ConversationAgentDeps {
   store: ConversationStore;
@@ -516,6 +524,13 @@ export class ConversationAgent {
           break;
         case 'typing':
           await adapter.sendTypingIndicator(userId, record.lastInboundMessageId);
+          // Honor an explicit typing action's requested duration: hold the
+          // typing bubble for that long before advancing to the next item.
+          // Bounded by MAX_EXPLICIT_TYPING_DURATION_MS (the wait happens under
+          // the per-key lock). The injectable `sleep` makes this a no-op in tests.
+          if (item.durationMs !== undefined && item.durationMs > 0) {
+            await this.sleep(Math.min(item.durationMs, MAX_EXPLICIT_TYPING_DURATION_MS));
+          }
           break;
         case 'template': {
           // Templates are WhatsApp-only (the only channel whose adapter exposes

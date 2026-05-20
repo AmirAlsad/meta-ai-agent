@@ -291,6 +291,27 @@ describe('GraphClient.request — retry: 429', () => {
     await client.request({ method: 'GET', path: 'x', accessToken: 'tok', operation: 'op' });
     expect(sleep.calls).toEqual([8000]);
   });
+
+  it('never returns a backoff delay exceeding maxBackoffMs, even at max jitter', async () => {
+    // Pin jitter to its maximum (~baseBackoffMs). With base=500 and max=600 the
+    // exponential saturates the cap immediately, so without the post-jitter cap
+    // the delay would overshoot to ~1100ms. Every sleep must stay <= maxBackoffMs.
+    vi.spyOn(Math, 'random').mockReturnValue(0.999999);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(429, { error: { message: 'slow' } }))
+      .mockResolvedValueOnce(jsonResponse(429, { error: { message: 'slow' } }))
+      .mockResolvedValueOnce(jsonResponse(429, { error: { message: 'slow' } }))
+      .mockResolvedValueOnce(jsonResponse(200, {}));
+    const { client, sleep } = makeClient(fetchImpl, {
+      maxRetries: 5,
+      baseBackoffMs: 500,
+      maxBackoffMs: 600
+    });
+    await client.request({ method: 'POST', path: '1/messages', accessToken: 'tok', operation: 'op' });
+    expect(sleep.calls.length).toBeGreaterThan(0);
+    for (const ms of sleep.calls) expect(ms).toBeLessThanOrEqual(600);
+  });
 });
 
 describe('GraphClient.request — retry: 5xx and idempotency (double-send safety)', () => {

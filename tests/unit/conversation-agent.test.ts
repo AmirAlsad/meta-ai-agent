@@ -390,6 +390,63 @@ describe('ConversationAgent', () => {
     expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledTimes(1);
   });
 
+  it('honors an explicit typing action durationMs before advancing', async () => {
+    // Built directly (not via makeHarness) so we can inject a RECORDING sleep
+    // and assert the requested duration is actually waited.
+    const sleeps: number[] = [];
+    const store = new InMemoryConversationStore({ dedupeTtlSeconds: 86_400 });
+    const scheduler = new InMemoryBufferScheduler();
+    const chat = makeChatClient([{ actions: [{ type: 'typing', durationMs: 3000 }] }]);
+    const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+    const agent = new ConversationAgent({
+      store,
+      scheduler,
+      chatClient: chat,
+      adapters: { whatsapp: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+      config: makeConfig(),
+      logger: silentLogger,
+      random: () => 0.5,
+      now: () => FIXED_NOW,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+      }
+    });
+
+    await agent.handleInbound(inbound({ channelMessageId: 'wamid.td1' }));
+    await flushBuffer();
+
+    expect(adapter.sendTypingIndicator).toHaveBeenCalledTimes(1);
+    expect(sleeps).toContain(3000); // honored (under the 10s ceiling)
+  });
+
+  it('caps an oversized explicit typing duration at the hard ceiling', async () => {
+    const sleeps: number[] = [];
+    const store = new InMemoryConversationStore({ dedupeTtlSeconds: 86_400 });
+    const scheduler = new InMemoryBufferScheduler();
+    const chat = makeChatClient([{ actions: [{ type: 'typing', durationMs: 999_999 }] }]);
+    const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+    const agent = new ConversationAgent({
+      store,
+      scheduler,
+      chatClient: chat,
+      adapters: { whatsapp: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+      config: makeConfig(),
+      logger: silentLogger,
+      random: () => 0.5,
+      now: () => FIXED_NOW,
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+      }
+    });
+
+    await agent.handleInbound(inbound({ channelMessageId: 'wamid.td2' }));
+    await flushBuffer();
+
+    // Clamped to MAX_EXPLICIT_TYPING_DURATION_MS (10_000); never the raw value.
+    expect(Math.max(...sleeps)).toBeLessThanOrEqual(10_000);
+    expect(sleeps).toContain(10_000);
+  });
+
   it('handleStatus for an unmapped id does not throw and advances nothing', async () => {
     const h = makeHarness({ responses: [textResponse('hi')] });
     await expect(h.agent.handleStatus(status('wamid.never-sent', 'delivered'))).resolves.toBeUndefined();

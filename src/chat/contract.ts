@@ -160,9 +160,17 @@ function validateAction(value: unknown, path: string): ValidationResult {
       return { action: { type: 'reply', text, targetMessageId } };
     }
     case 'reaction': {
-      const emoji = readNonEmptyString(value.emoji);
+      // An empty-string emoji is the documented "unreact" signal — the WhatsApp
+      // and Messenger sendReaction paths both treat emoji === '' as
+      // remove-reaction, and ChatAction.reaction types emoji as `string` (which
+      // permits ''). Accept any string here; only a missing/non-string emoji is
+      // invalid. readNonEmptyString would silently drop unreact before it ever
+      // reached the adapter.
+      const emoji = typeof value.emoji === 'string' ? value.emoji : undefined;
       const targetMessageId = readNonEmptyString(value.targetMessageId);
-      if (emoji === undefined) return invalid(path, 'reaction action requires a non-empty "emoji"');
+      if (emoji === undefined) {
+        return invalid(path, 'reaction action requires a string "emoji" (use "" to remove a reaction)');
+      }
       if (targetMessageId === undefined) {
         return invalid(path, 'reaction action requires a non-empty "targetMessageId"');
       }
