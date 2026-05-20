@@ -408,6 +408,18 @@ describe('Stage 6 observability routes', () => {
       expect(res.body).toEqual({ error: 'not_found' });
     });
 
+    it('returns 500 (does not hang) when the store rejects', async () => {
+      // Guards the .catch() on the floating getConversation promise: a store
+      // rejection must answer the request, not leave the client hanging.
+      const { app, store } = buildApp();
+      vi.spyOn(store, 'getConversation').mockRejectedValue(new Error('store boom'));
+      const res = await request(app)
+        .get(`/admin/conversations/${SEEDED_KEY}`)
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ error: 'internal_error' });
+    });
+
     it('is NOT mounted (404) when adminApiToken is unset', async () => {
       const { app, store } = buildApp({ adminApiToken: undefined });
       await seedConversation(store);

@@ -339,11 +339,19 @@ export function createApp(deps: AppDeps): express.Express {
   // each dependency check defensively (a thrown check fails that check rather
   // than 500ing the route) and returns 503 if ANY check fails, 200 otherwise.
   app.get('/ready', (_req: Request, res: Response) => {
-    void buildReadinessReport({ scheduler, config }).then(({ ready, checks }) => {
-      res
-        .status(ready ? 200 : 503)
-        .json({ status: ready ? 'ready' : 'not_ready', checks });
-    });
+    void buildReadinessReport({ scheduler, config })
+      .then(({ ready, checks }) => {
+        res
+          .status(ready ? 200 : 503)
+          .json({ status: ready ? 'ready' : 'not_ready', checks });
+      })
+      .catch((err: unknown) => {
+        // buildReadinessReport is documented never-throwing (each check is
+        // wrapped), so this is defensive insurance against a future change —
+        // a rejection here must still answer the probe rather than hang it.
+        logger.error({ err }, 'ready check failed unexpectedly');
+        if (!res.headersSent) res.status(503).json({ status: 'not_ready', checks: {} });
+      });
   });
 
   // GET /metrics — Prometheus exposition, token-gated. GUARDED AT REGISTRATION:
@@ -456,13 +464,23 @@ export function createApp(deps: AppDeps): express.Express {
       // `:key` is a single named segment, so it's a string at runtime; the
       // Express 5 types widen it to `string | string[]`, so coerce defensively.
       const key = String(req.params.key);
-      void conversationStore.getConversation(key).then(record => {
-        if (record === undefined) {
-          res.status(404).json({ error: 'not_found' });
-          return;
-        }
-        res.json(redactConversationRecord(record, { reveal: req.query.reveal === 'true' }));
-      });
+      // The floating promise needs its own .catch(): a rejection (e.g. a
+      // throw from the Stage 10 Redis store) would otherwise be swallowed by
+      // `void`, never reach the Express error handler, and leave the client
+      // hanging with no response.
+      void conversationStore
+        .getConversation(key)
+        .then(record => {
+          if (record === undefined) {
+            res.status(404).json({ error: 'not_found' });
+            return;
+          }
+          res.json(redactConversationRecord(record, { reveal: req.query.reveal === 'true' }));
+        })
+        .catch((err: unknown) => {
+          logger.error({ err, method: req.method, path: req.path }, 'admin conversations route error');
+          if (!res.headersSent) res.status(500).json({ error: 'internal_error' });
+        });
     });
   }
 

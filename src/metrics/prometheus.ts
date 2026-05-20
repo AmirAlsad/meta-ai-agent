@@ -101,6 +101,7 @@ function formatValue(v: number): string {
     if (v === Number.NEGATIVE_INFINITY) return '-Inf';
     return 'NaN';
   }
-  if (Number.isInteger(v)) return v.toString();
+  // Prometheus accepts plain integer and decimal forms equally, so a single
+  // toString() covers both (no separate integer branch needed).
   return v.toString();
 }
