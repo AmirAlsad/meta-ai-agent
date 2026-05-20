@@ -1,7 +1,68 @@
 import 'dotenv/config';
+import path from 'node:path';
+import express from 'express';
 import pino from 'pino';
-import { loadConfig } from './config/loader.js';
+import { loadConfig, type Config } from './config/loader.js';
 import { createApp } from './http/app.js';
+import { GraphClient } from './meta/shared/graph-client.js';
+import { WhatsAppClient } from './meta/whatsapp/client.js';
+import { MessengerClient } from './meta/messenger/client.js';
+import { InstagramClient } from './meta/instagram/client.js';
+import { HttpChatClient } from './chat/client.js';
+import { InMemoryConversationStore } from './conversation/store.js';
+import { InMemoryBufferScheduler } from './conversation/scheduler.js';
+import { ConversationAgent } from './conversation/agent.js';
+import type { ChannelAdapter } from './meta/shared/adapter.js';
+import type { Channel } from './meta/types.js';
+
+/**
+ * Build the full Stage 5 dependency graph and return the wired Express app plus
+ * the conversation agent — WITHOUT starting a listener. Extracted from `main()`
+ * so dev tooling (e.g. `scripts/dev/loop.ts`) can boot the exact same runtime
+ * (real adapters, store, scheduler, chat client, agent) against an alternate
+ * chat endpoint and tunnel, instead of reimplementing the construction.
+ *
+ * Construction order: shared Graph transport → per-channel adapters (only the
+ * configured channels) → in-memory store + scheduler → HTTP chat client → agent
+ * → createApp.
+ */
+export function buildRuntime(
+  config: Config,
+  logger: pino.Logger
+): { app: express.Express; agent: ConversationAgent } {
+  // The shared Graph transport is constructed once; each configured channel
+  // gets its own adapter.
+  const graph = new GraphClient({ apiVersion: config.meta.graphApiVersion, logger });
+
+  // Wire ONLY the channels that have credentials — an unconfigured channel has
+  // no adapter, and the agent drops a turn for a channel it can't send on.
+  const adapters: Partial<Record<Channel, ChannelAdapter>> = {};
+  if (config.whatsapp) {
+    adapters.whatsapp = new WhatsAppClient({ config: config.whatsapp, graph, logger });
+  }
+  if (config.messenger) {
+    adapters.messenger = new MessengerClient({ config: config.messenger, graph, logger });
+  }
+  if (config.instagram) {
+    adapters.instagram = new InstagramClient({ config: config.instagram, graph, logger });
+  }
+
+  // WHY in-memory store + scheduler for Stage 5: state is per-process and the
+  // setTimeout-based scheduler is single-replica. The production swap to a
+  // Redis-backed store + BullMQ scheduler (selected on REDIS_URL) is Stage 10.
+  const store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
+  const scheduler = new InMemoryBufferScheduler();
+  const chatClient = new HttpChatClient({
+    chatEndpointUrl: config.chatEndpointUrl,
+    timeoutMs: config.conversation.chatEndpointTimeoutMs,
+    logger
+  });
+  const agent = new ConversationAgent({ store, scheduler, chatClient, adapters, config, logger });
+
+  const app = createApp({ config, logger, agent });
+
+  return { app, agent };
+}
 
 function main(): void {
   const config = loadConfig();
@@ -16,7 +77,7 @@ function main(): void {
           }
   });
 
-  const app = createApp({ config, logger });
+  const { app, agent } = buildRuntime(config, logger);
 
   const shouldStart = config.agentAutostart && config.nodeEnv !== 'test';
   if (!shouldStart) {
@@ -40,11 +101,41 @@ function main(): void {
 
   const shutdown = (signal: string): void => {
     logger.info({ signal }, 'shutting down');
-    server.close(() => process.exit(0));
+    // Force-exit fallback first so a hung close (agent or server) can't wedge
+    // the process — `unref` so this timer itself never keeps the loop alive.
     setTimeout(() => process.exit(1), 10_000).unref();
+    // Close the agent BEFORE the server: clearing the buffer scheduler +
+    // delivery-timeout timers lets the event loop drain so the process can
+    // exit. agent.close() is best-effort — log and proceed to close the server
+    // regardless so a close failure can't block shutdown.
+    void agent
+      .close()
+      .catch(err => logger.error({ err, signal }, 'agent close failed during shutdown'))
+      .finally(() => server.close(() => process.exit(0)));
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
-main();
+/**
+ * Run `main()` ONLY when this file is the process entry point. WHY the guard:
+ * `scripts/dev/loop.ts` imports `buildRuntime` from this module to boot the
+ * runtime itself; without this check that import would also fire `main()` and
+ * autostart a second listener. Resolve both `argv[1]` and `import.meta.url` to
+ * absolute paths so the match holds regardless of relative-path quirks — same
+ * convention as the `scripts/` entry points.
+ */
+const invokedAsScript = (() => {
+  try {
+    const entry = process.argv[1];
+    if (!entry) return false;
+    const thisFile = new URL(import.meta.url).pathname;
+    return path.resolve(entry) === path.resolve(thisFile);
+  } catch {
+    return false;
+  }
+})();
+
+if (invokedAsScript) {
+  main();
+}

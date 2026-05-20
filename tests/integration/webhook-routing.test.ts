@@ -7,6 +7,7 @@ import request from 'supertest';
 import type pino from 'pino';
 import { createApp } from '../../src/http/app.js';
 import type { Config } from '../../src/config/loader.js';
+import { defaultConversationConfig } from '../../src/config/loader.js';
 import * as parserModule from '../../src/meta/parser.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -47,6 +48,7 @@ function makeTestConfig(overrides?: Partial<Config>): Config {
       accessToken: 'fake-instagram-access-token'
     },
     channels: { whatsapp: true, messenger: true, instagram: true },
+    conversation: defaultConversationConfig(),
     chatEndpointUrl: 'http://localhost:9999/chat',
     ngrokDomain: 'test.ngrok-free.dev',
     agentAutostart: false,

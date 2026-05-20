@@ -12,6 +12,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "dev": "node --import tsx src/index.ts",
+    "dev:chat": "node --import tsx scripts/dev/test-chat-endpoint.ts",
+    "dev:loop": "node --import tsx scripts/dev/loop.ts",
     "start": "node dist/index.js",
     "test": "npm run test:unit && npm run test:integration",
     "test:unit": "vitest run --config vitest.config.ts tests/unit",
@@ -24,6 +26,7 @@
     "setup:oauth:instagram": "node --import tsx scripts/setup/oauth-instagram.ts",
     "setup:oauth:messenger": "node --import tsx scripts/setup/oauth-messenger.ts",
     "meta:webhooks": "node --import tsx scripts/setup/register-webhooks.ts",
+    "probe:outbound": "node --import tsx scripts/setup/probe-outbound.ts",
     "capture:fixtures": "node --import tsx scripts/capture/fixture-capture.ts",
     "capture:guided": "node --import tsx scripts/capture/guided-capture.ts"
   },

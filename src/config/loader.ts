@@ -51,12 +51,46 @@ export interface InstagramConfig {
   appSecret?: string;
 }
 
+/**
+ * Stage 5 tuning for inbound buffering, outbound typing indicators, read
+ * receipts, and ordered delivery. Every field has a default; the loader
+ * validates ranges and throws with the offending env var name on a malformed
+ * value (fail-fast, no logging). Grouped into a nested section so downstream
+ * code reads `config.conversation.bufferBaseTimeoutMs` etc. rather than a flat
+ * soup of top-level knobs.
+ */
+export interface ConversationConfig {
+  /** Initial buffer flush delay after the first inbound (ms). */
+  bufferBaseTimeoutMs: number;
+  /** Multiplier applied to the timeout on each rapid follow-up inbound (>= 1). */
+  bufferGrowthFactor: number;
+  /** Hard ceiling for the buffer flush delay (ms); always >= base. */
+  bufferMaxTimeoutMs: number;
+  /** Max fractional jitter (0..1) applied to the flush delay to avoid sync. */
+  bufferNoiseMaxDeviation: number;
+  /** Whether to emit outbound typing indicators before sending. */
+  outboundTypingIndicatorsEnabled: boolean;
+  /** How often a long-lived typing indicator is refreshed (ms). */
+  typingRefreshIntervalMs: number;
+  /** Absolute cap on how long typing is refreshed for one turn (ms). */
+  typingRefreshMaxMs: number;
+  /** Whether to mark inbound messages read (best-effort, channel-gated). */
+  readReceiptsEnabled: boolean;
+  /** How long to wait for a delivery/send confirmation before moving on (ms). */
+  outboundDeliveryTimeoutMs: number;
+  /** Timeout for the HTTP call to the developer's chat endpoint (ms). */
+  chatEndpointTimeoutMs: number;
+  /** TTL for the inbound dedupe key in the store (seconds). */
+  dedupeTtlSeconds: number;
+}
+
 export interface Config {
   meta: MetaConfig;
   whatsapp?: WhatsAppConfig;
   messenger?: MessengerConfig;
   instagram?: InstagramConfig;
   channels: Channels;
+  conversation: ConversationConfig;
   chatEndpointUrl: string;
   redisUrl?: string;
   adminApiToken?: string;
@@ -189,15 +223,116 @@ function loadPort(env: ConfigEnv): number {
   return parsed;
 }
 
-function loadAgentAutostart(env: ConfigEnv): boolean {
-  const raw = trimmed(env, 'AGENT_AUTOSTART');
-  if (raw === undefined) return true;
+/**
+ * Parse a boolean env var accepting `1`/`0`/`true`/`false` (case-insensitive).
+ * Returns `fallback` when unset/empty; throws with the var name otherwise.
+ * Factored out so every boolean knob parses identically.
+ */
+function loadBoolean(env: ConfigEnv, name: string, fallback: boolean): boolean {
+  const raw = trimmed(env, name);
+  if (raw === undefined) return fallback;
   const normalized = raw.toLowerCase();
   if (normalized === '1' || normalized === 'true') return true;
   if (normalized === '0' || normalized === 'false') return false;
-  throw new Error(
-    `Invalid AGENT_AUTOSTART: ${raw}. Expected one of "1", "0", "true", "false".`
-  );
+  throw new Error(`Invalid ${name}: ${raw}. Expected one of "1", "0", "true", "false".`);
+}
+
+function loadAgentAutostart(env: ConfigEnv): boolean {
+  // Delegates to the shared boolean parser; behavior + accepted tokens are
+  // unchanged (the error message still names AGENT_AUTOSTART).
+  return loadBoolean(env, 'AGENT_AUTOSTART', true);
+}
+
+/**
+ * Parse a strictly-positive integer env var (value >= 1). Returns `fallback`
+ * when unset/empty; throws with the var name on a non-integer or value < 1.
+ */
+function loadPositiveInt(env: ConfigEnv, name: string, fallback: number): number {
+  const raw = trimmed(env, name);
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || String(parsed) !== raw || parsed < 1) {
+    throw new Error(`Invalid ${name}: ${raw}. Expected a positive integer (>= 1).`);
+  }
+  return parsed;
+}
+
+/**
+ * Parse a float env var constrained to `[min, max]` (inclusive). Returns
+ * `fallback` when unset/empty; throws with the var name on a non-finite value
+ * or one outside the range.
+ */
+function loadFloatInRange(
+  env: ConfigEnv,
+  name: string,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  const raw = trimmed(env, name);
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+    throw new Error(`Invalid ${name}: ${raw}. Expected a number between ${min} and ${max}.`);
+  }
+  return parsed;
+}
+
+/**
+ * Documented defaults for {@link ConversationConfig}. Kept as a single source
+ * of truth so the loader fallbacks and {@link defaultConversationConfig} can
+ * never drift, and so the values match `.env.example` and the plan (lines
+ * 835-838 of the implementation plan).
+ */
+const CONVERSATION_DEFAULTS: ConversationConfig = {
+  bufferBaseTimeoutMs: 2000,
+  bufferGrowthFactor: 1.25,
+  bufferMaxTimeoutMs: 8000,
+  bufferNoiseMaxDeviation: 0.3,
+  outboundTypingIndicatorsEnabled: true,
+  typingRefreshIntervalMs: 5000,
+  typingRefreshMaxMs: 120000,
+  readReceiptsEnabled: false,
+  outboundDeliveryTimeoutMs: 30000,
+  chatEndpointTimeoutMs: 30000,
+  dedupeTtlSeconds: 86400
+};
+
+/**
+ * The {@link ConversationConfig} defaults as a fresh object — handy for tests
+ * and for callers assembling a `Config` without a full env. Returns a copy so
+ * mutation cannot corrupt the shared constant.
+ */
+export function defaultConversationConfig(): ConversationConfig {
+  return { ...CONVERSATION_DEFAULTS };
+}
+
+function loadConversationConfig(env: ConfigEnv): ConversationConfig {
+  const d = CONVERSATION_DEFAULTS;
+  const bufferBaseTimeoutMs = loadPositiveInt(env, 'BUFFER_BASE_TIMEOUT_MS', d.bufferBaseTimeoutMs);
+  const bufferMaxTimeoutMs = loadPositiveInt(env, 'BUFFER_MAX_TIMEOUT_MS', d.bufferMaxTimeoutMs);
+  // Cross-field check, matching the existing fail-fast philosophy: a max below
+  // the base would let the growth math produce a window shorter than the first
+  // flush, which is always a misconfiguration.
+  if (bufferMaxTimeoutMs < bufferBaseTimeoutMs) {
+    throw new Error(
+      `Invalid BUFFER_MAX_TIMEOUT_MS: ${bufferMaxTimeoutMs} is less than BUFFER_BASE_TIMEOUT_MS (${bufferBaseTimeoutMs}). The max must be >= the base.`
+    );
+  }
+
+  return {
+    bufferBaseTimeoutMs,
+    bufferGrowthFactor: loadFloatInRange(env, 'BUFFER_GROWTH_FACTOR', d.bufferGrowthFactor, 1, Number.MAX_VALUE),
+    bufferMaxTimeoutMs,
+    bufferNoiseMaxDeviation: loadFloatInRange(env, 'BUFFER_NOISE_MAX_DEVIATION', d.bufferNoiseMaxDeviation, 0, 1),
+    outboundTypingIndicatorsEnabled: loadBoolean(env, 'OUTBOUND_TYPING_INDICATORS_ENABLED', d.outboundTypingIndicatorsEnabled),
+    typingRefreshIntervalMs: loadPositiveInt(env, 'TYPING_REFRESH_INTERVAL_MS', d.typingRefreshIntervalMs),
+    typingRefreshMaxMs: loadPositiveInt(env, 'TYPING_REFRESH_MAX_MS', d.typingRefreshMaxMs),
+    readReceiptsEnabled: loadBoolean(env, 'READ_RECEIPTS_ENABLED', d.readReceiptsEnabled),
+    outboundDeliveryTimeoutMs: loadPositiveInt(env, 'OUTBOUND_DELIVERY_TIMEOUT_MS', d.outboundDeliveryTimeoutMs),
+    chatEndpointTimeoutMs: loadPositiveInt(env, 'CHAT_ENDPOINT_TIMEOUT_MS', d.chatEndpointTimeoutMs),
+    dedupeTtlSeconds: loadPositiveInt(env, 'DEDUPE_TTL_SECONDS', d.dedupeTtlSeconds)
+  };
 }
 
 function loadChatEndpointUrl(env: ConfigEnv): string {
@@ -298,6 +433,7 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     messenger,
     instagram,
     channels,
+    conversation: loadConversationConfig(env),
     chatEndpointUrl: loadChatEndpointUrl(env),
     redisUrl: trimmed(env, 'REDIS_URL'),
     adminApiToken: trimmed(env, 'ADMIN_API_TOKEN'),

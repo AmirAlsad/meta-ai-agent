@@ -2,13 +2,95 @@
 
 A running list of items surfaced during code review or implementation that were intentionally deferred to a later stage. Recording them here keeps the institutional memory from getting lost between stages — if you are working on the stage listed, treat the entry as a TODO.
 
+## Open as of Stage 5 (conversation agent)
+
+### Not yet wired
+
+- **Identity resolver is a no-op** — `ChatRequest.contact` and `ConversationRecord.contact` exist in the type, and `createIdleConversation` / the flush already thread `contact` through when present, but nothing populates it — there is no `IdentityResolver` / `ContactStore`, so `contact` is always undefined and the conversation key is always the raw `(channel, channelScopedId)` tuple with no cross-channel merge.
+  - **Where**: [`src/conversation/agent.ts`](../src/conversation/agent.ts) (flush builds the request), [`src/conversation/types.ts`](../src/conversation/types.ts) (`Contact` import); planned `src/identity/{resolver,contact-store}.ts`.
+  - **When**: Stage 6 (status tracking, identity, operational visibility).
+
+- **Metrics are not wired** — There is no metrics collector. Notably, `InMemoryBufferScheduler`'s timer-fired-handler catch and the scheduler-handler path swallow failures silently with an explicit "Stage 6: increment a failure counter and log here" TODO.
+  - **Where**: [`src/conversation/scheduler.ts`](../src/conversation/scheduler.ts) (the swallowed `.catch`); planned `src/metrics/`.
+  - **When**: Stage 6.
+
+- **No rate limiting on the conversation/outbound path** — The agent sends as fast as the queue drains. The only pacing anywhere is the Instagram client's coarse 100ms in-process floor (see the Stage 4 entry below). No per-channel send-rate accounting, no token bucket, no cross-replica coordination.
+  - **Where**: [`src/conversation/agent.ts`](../src/conversation/agent.ts) `sendNext`; planned `src/limits/tracker.ts`.
+  - **When**: Stage 10 (`LimitTracker`).
+
+### Persistence and durability
+
+- **In-memory store + scheduler only; Redis + BullMQ deferred** — Conversation state, the dedupe set, and the outbound-handle map live in `InMemoryConversationStore`'s plain `Map`s; the buffer scheduler is `InMemoryBufferScheduler` (setTimeout). All of it is per-process and lost on restart, and the per-replica view diverges in a multi-replica deploy. The `ConversationStore` / `BufferScheduler` interfaces are the contract the production impls will honor.
+  - **Where**: [`src/conversation/store.ts`](../src/conversation/store.ts), [`src/conversation/scheduler.ts`](../src/conversation/scheduler.ts); planned `src/conversation/redis-store.ts` + a `'bullmq'` scheduler, selected on `REDIS_URL`.
+  - **When**: Stage 10 (Redis persistence: conversation state, dedupe via `SET NX`, `SCAN` for `listConversationKeys`, BullMQ for delayed buffer flushes, boot-time `recoverPendingRetries`).
+
+- **In-memory dedupe map is never swept** — `InMemoryConversationStore.inboundHandles` stores `channelMessageId -> expiry` and checks expiry on read (`claimInboundHandle` / `peekInboundHandle`), but expired entries are never deleted, so the map grows unbounded for a long-lived process. This is acceptable only because the in-memory store is for tests/local runs; the production Redis store relies on a native key TTL (`SET NX` with expiry) so there is nothing to sweep.
+  - **Where**: [`src/conversation/store.ts`](../src/conversation/store.ts) `inboundHandles`.
+  - **When**: Stage 10 (resolved by the Redis store's native TTL; no sweep needed for the in-memory impl).
+
+### Load-bearing invariants to preserve
+
+- **Buffer timeout must stay strictly positive (no inline scheduler fire under the lock)** — `InMemoryBufferScheduler.schedule` fires the flush handler INLINE (synchronously) when `delayMs <= 0`. `handleInboundImpl` calls `schedule` while HOLDING the per-key serialization lock, and the flush handler re-acquires that same key's lock — so an inline fire self-deadlocks the conversation. `calculateBufferTimeout` never returns `<= 0` for a valid config (`bufferBaseTimeoutMs` is a positive int; jitter is clamped to `>= base*0.5`), so `schedule` always takes the `setTimeout` branch. This is not a bug today; it is an invariant a future change to the buffer math could break.
+  - **Where**: [`src/conversation/buffering.ts`](../src/conversation/buffering.ts) (the clamp), [`src/conversation/agent.ts`](../src/conversation/agent.ts) (the `LOCK SAFETY` comment in `handleInboundImpl`), [`src/conversation/scheduler.ts`](../src/conversation/scheduler.ts) (`delayMs <= 0`). Documented in [Message buffering](./features/message-buffering.md) and [Conversation state](./features/conversation-state.md).
+  - **When**: No action needed; keep the clamp positive if the buffer math is revised.
+
+### Feature scope
+
+- **Media chat actions are skipped** — `buildOutboundItems` drops a `{type:'media'}` action with a `media_send unsupported (Stage 7)` skip note because `supports('media_send')` is `false` on all three adapters. The chat endpoint can return media actions, but nothing sends them yet (this is the conversation-layer view of the Stage 4 / Stage 7 media-send gap below).
+  - **Where**: [`src/delivery/queue.ts`](../src/delivery/queue.ts) `buildOutboundItems` media branch.
+  - **When**: Stage 7 (flip `media_send` to `true` once the adapter send methods exist).
+
+- **24h messaging window is tracked but not enforced** — The agent stamps `windowExpiresAt = lastInboundAt + 24h` on each inbound and surfaces `context.windowOpen` to the chat endpoint, but it does NOT block an out-of-window send or force a WhatsApp template fallback. A reply attempted after the window closes will simply fail at the Meta API and be skipped (fail-soft), with no proactive template substitution.
+  - **Where**: [`src/conversation/types.ts`](../src/conversation/types.ts) (`MESSAGING_WINDOW_MS` / `isWindowOpen`), [`src/conversation/agent.ts`](../src/conversation/agent.ts) (window stamped on inbound, surfaced on the request).
+  - **When**: Stage 10 (rate limiting + WhatsApp messaging-window awareness — full enforcement and template fallback).
+
+## Open as of Stage 4 (outbound clients)
+
+### Outbound-adapter scope
+
+- **Media send is not implemented** — The `ChannelAdapter` covers text, typing, read receipts, reactions, and (WhatsApp) templates only. There is no `sendImage` / `sendAudio` / `sendVideo` / `sendDocument`, and `supports('media_send')` returns `false` on all three channels. Inbound media is already parsed; outbound media (upload + send) is the gap.
+  - **Where**: [`src/meta/shared/adapter.ts`](../src/meta/shared/adapter.ts) (`ChannelFeature`), the three [`src/meta/{whatsapp,messenger,instagram}/client.ts`](../src/meta/) clients; planned `src/meta/shared/media.ts`.
+  - **When**: Stage 7 (rich features — media upload/download). Flip the `media_send` capability to `true` once the send methods exist.
+
+- **Templates exist only for WhatsApp** — `WhatsAppClient.sendTemplate` is the only template path. Messenger's own message templates and any Instagram rich-message surfaces are unimplemented; `supports('template')` is `false` for Messenger and Instagram (it is the WhatsApp template concept).
+  - **Where**: [`src/meta/whatsapp/client.ts`](../src/meta/whatsapp/client.ts); planned `src/meta/whatsapp/templates.ts` for richer helpers.
+  - **When**: Stage 7.
+
+- **Profile surfaces are not wired** — Persistent menu, Get Started, and ice breakers all report `supports(...) === false`. These are Messenger/Instagram profile-API features.
+  - **Where**: the three client `supports` matrices.
+  - **When**: Stage 8 (platform-specific surfaces).
+
+- **Instagram outbound quoted replies: NOT supported on the Instagram-Login Send API (`graph.instagram.com`)** — Exhaustively live-verified 2026-05-20 (every `reply_to` shape and target, including a bot's own just-returned valid message id, returns `code 100 / subcode 2534002` or is silently ignored: top-level `reply_to:{mid}` → 100/2534002 "Invalid Message ID"; `reply_to_message_id` (flat) → accepted but rendered as a PLAIN message; nested `message.reply_to` / `reply_to:{message_id}` → "invalid keys"; `reply_to:"string"` → "must be object"). So `InstagramClient.supports('reply_to')` is `false` and `sendText` builds no reply field. The conversation agent downgrades a `reply` action to a plain `message`, so the user still receives the text — only the threading link is lost. The Facebook-Login "Messenger API for Instagram" flavor supports `reply_to`, so native IG quotes would require a different IG integration path (out of scope here, which targets Instagram-Login by design).
+  - **Where**: [`src/meta/instagram/client.ts`](../src/meta/instagram/client.ts) `sendText` / `supports`; downgrade in [`src/delivery/queue.ts`](../src/delivery/queue.ts) `buildOutboundItems`. Documented in [Outbound clients](./features/outbound-clients.md) ("Quoted replies (per-channel)").
+  - **When**: No code change planned — the field is non-functional on this API flavor. Revisit only if Meta enables `reply_to` on `graph.instagram.com` or if a Facebook-Login IG integration path is added.
+
+- **Outbound clients are not wired into a conversation flow** — RESOLVED in Stage 5. `dispatchWebhook` now routes each parsed message into `ConversationAgent.handleInbound` and each status into `handleStatus`; the agent buffers, calls the chat endpoint, and drives the `ChannelAdapter`s through the ordered delivery queue (typing → delay → text, channel-aware advancement, cross-payload dedupe). The parsed `ParseResult` is no longer discarded when an agent is wired.
+  - **Where**: [`src/http/app.ts`](../src/http/app.ts) `dispatchWebhook`, [`src/conversation/agent.ts`](../src/conversation/agent.ts), [`src/delivery/queue.ts`](../src/delivery/queue.ts). See [Conversation state](./features/conversation-state.md) and [Ordered delivery](./features/ordered-delivery.md).
+  - **When**: Fixed (Stage 5). No further action.
+
+### Rate limiting
+
+- **Full per-channel rate limiting is deferred; the Instagram 100ms pacer is an interim floor** — The Instagram client has a minimal in-process pacer that enforces a default 100ms minimum spacing between Graph calls for one account (`minIntervalMs`-overridable). It is a coarse per-process floor chosen to honor the strictest per-second sub-limit (the ~10/sec media ceiling → 1000ms/10 = 100ms) without throttling legitimate text bursts. It does NOT model the real per-second ceilings (~300/sec text/links/reactions/stickers, ~10/sec media), does NOT model the hourly throughput cap (`200 × number-of-messageable-users`), and does NOT coordinate across replicas. WhatsApp and Messenger have no pacer at all today.
+  - **Where**: [`src/meta/instagram/client.ts`](../src/meta/instagram/client.ts) `pace` / `DEFAULT_MIN_CALL_SPACING_MS`; planned `src/limits/tracker.ts`.
+  - **When**: Stage 10 (`LimitTracker` — shared, Redis-backed, multi-replica-aware, token-bucket accounting + metrics, modeling both the per-second and hourly Instagram limits and per-channel limits generally).
+
+- **WhatsApp messaging-window / pricing tracking still deferred** — Two Stage-2 entries below (`statuses[].conversation` / `pricing`, and the PMP `pricing` block) were tentatively tagged "Stage 4". Stage 4 added the send clients but NOT messaging-window or billing tracking; that work moves with the rest of the limits/observability surface. The clients are window-agnostic today (WhatsApp `sendTemplate` exists for out-of-window sends, but nothing tracks whether the 24-hour window is open).
+  - **Where**: `parseWhatsAppStatus` in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 10 (rate limiting + WhatsApp messaging-window awareness), with cost observability in Stage 6.
+
+### Implementation-plan fidelity
+
+- **The implementation plan's WhatsApp typing-indicator description is outdated** — `meta-ai-agent-implementation-plan.md` describes the WhatsApp typing indicator as a standalone `type: 'typing_indicator'` message. That is INCORRECT against current Meta docs (verified during Stage 4). WhatsApp has no standalone "typing on": the real mechanism is a COMBINED call that marks a specific inbound message read AND attaches the typing bubble — `POST {phoneNumberId}/messages` with `{ messaging_product: 'whatsapp', status: 'read', message_id: <inbound wamid>, typing_indicator: { type: 'text' } }`. The code (`WhatsAppClient.sendTypingIndicator`) implements the correct combined call and requires the inbound `message_id`. The plan file was deliberately NOT edited; this note records the discrepancy so a future reader does not "fix" the code to match the stale plan.
+  - **Where**: [`src/meta/whatsapp/client.ts`](../src/meta/whatsapp/client.ts) `sendTypingIndicator`; described accurately in [Outbound clients](./features/outbound-clients.md) and [CLAUDE.md](../CLAUDE.md) load-bearing constraints.
+  - **When**: No code change needed — the code is correct. Update the plan file's prose if/when it is next revised.
+
 ## Open as of Stage 2
 
 ### Parser-adjacent
 
 - **WhatsApp `statuses[].conversation` and `pricing` blocks** — Preserved on `raw` but not extracted into the normalized `StatusUpdate`. The conversation expiration timestamp (24-hour Customer Service Window) and pricing category (`marketing` / `utility` / `service`) matter for messaging-window awareness and billing observability.
   - **Where**: `parseWhatsAppStatus` in [`src/meta/parser.ts`](../src/meta/parser.ts).
-  - **When**: Stage 4 (outbound clients introduce messaging-window tracking).
+  - **When**: Stage 10 (messaging-window awareness; Stage 4 added the send clients but not window tracking — see the Stage 4 rate-limiting entry above), with billing observability in Stage 6.
 
 - **Order / contact-card / reel / template-fallback attachments** — Surfaced as `MessageType: 'unknown'`. The Messenger attachment-type mapper (`mapFbAttachmentType`) returns `undefined` for `fallback`, `template`, and any future variant, and the message falls back to `'unknown'` rather than dropping. Real-payload captures may surface `reel`, `payment`, or other un-modeled types we'll want first-class normalization for.
   - **Where**: `mapFbAttachmentType` and the attachment branch in `parseFbStyleMessage` in [`src/meta/parser.ts`](../src/meta/parser.ts).
@@ -48,9 +130,9 @@ A running list of items surfaced during code review or implementation that were 
 
 These fields appear in real Meta WhatsApp payloads but aren't extracted into the normalized types yet. All are preserved on `raw`, so downstream consumers can read them, but pulling them onto first-class fields is deferred.
 
-- **`statuses[].pricing` (PMP block)** — `{ billable, pricing_model: "PMP", category, type }`. The Per-Message Pricing model replaced conversation-pricing in July 2025. `category` (`utility` / `marketing` / `authentication` / `service`) is load-bearing for Stage 4 messaging-window tracking and Stage 6 cost observability.
+- **`statuses[].pricing` (PMP block)** — `{ billable, pricing_model: "PMP", category, type }`. The Per-Message Pricing model replaced conversation-pricing in July 2025. `category` (`utility` / `marketing` / `authentication` / `service`) is load-bearing for messaging-window tracking and cost observability.
   - **Where**: `parseWhatsAppStatus` in [`src/meta/parser.ts`](../src/meta/parser.ts).
-  - **When**: Stage 4.
+  - **When**: Stage 10 (messaging-window awareness), with cost observability in Stage 6.
 
 - **`contacts[].user_id` / `messages[].from_user_id` / `statuses[].recipient_user_id` (US.\*-prefixed identifiers)** — A Meta-internal user identifier (e.g. `US.0000000000000001`) that persists across phone-number changes, distinct from `wa_id` (E.164 phone). Likely useful for Stage 5 contact tracking when a user changes phone number mid-conversation. Not yet surfaced on `IncomingMessage` / `StatusUpdate`.
   - **Where**: `parseWhatsAppMessage` and `parseWhatsAppStatus` in [`src/meta/parser.ts`](../src/meta/parser.ts).
