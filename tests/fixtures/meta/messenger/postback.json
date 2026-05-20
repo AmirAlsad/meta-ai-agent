@@ -1,0 +1,21 @@
+{
+  "object": "page",
+  "entry": [
+    {
+      "id": "500000000000005",
+      "time": 1716000110000,
+      "messaging": [
+        {
+          "sender": { "id": "6000000000000061" },
+          "recipient": { "id": "500000000000005" },
+          "timestamp": 1716000110000,
+          "postback": {
+            "mid": "m_PostbackXyZ0123456789AbCdEfGhIjKlMnOpQrStUv",
+            "title": "Get Started",
+            "payload": "GET_STARTED_PAYLOAD"
+          }
+        }
+      ]
+    }
+  ]
+}

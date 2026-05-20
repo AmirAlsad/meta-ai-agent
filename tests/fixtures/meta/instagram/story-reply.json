@@ -1,0 +1,26 @@
+{
+  "object": "instagram",
+  "entry": [
+    {
+      "id": "17841400000000007",
+      "time": 1716000210000,
+      "messaging": [
+        {
+          "sender": { "id": "1780000000000008" },
+          "recipient": { "id": "17841400000000007" },
+          "timestamp": 1716000210000,
+          "message": {
+            "mid": "aWdfZG06MTpJRzpTdG9yeVJlcGx5TWVzc2FnZUlkMDEyMzQ1",
+            "text": "Loved this story!",
+            "reply_to": {
+              "story": {
+                "id": "1800000000000009",
+                "url": "https://cdn.example.test/stories/1800000000000009.jpg"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

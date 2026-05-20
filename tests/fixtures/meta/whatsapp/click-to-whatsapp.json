@@ -1,0 +1,48 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "100000000000001",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15551234567",
+              "phone_number_id": "200000000000002"
+            },
+            "contacts": [
+              {
+                "profile": { "name": "Test User" },
+                "wa_id": "15557654321"
+              }
+            ],
+            "messages": [
+              {
+                "from": "15557654321",
+                "id": "wamid.HBgLMTU1NTc2NTQzMjEVAgASGBQzQTAwMDAwMDAwMDAwMDAwMDAyMQA=",
+                "timestamp": "1716000100",
+                "type": "text",
+                "text": {
+                  "body": "Hi, saw your ad!"
+                },
+                "referral": {
+                  "source_url": "https://fb.me/example-ad",
+                  "source_type": "ad",
+                  "source_id": "230000000000023",
+                  "headline": "Try our new product",
+                  "body": "Tap to chat with us on WhatsApp",
+                  "media_type": "image",
+                  "image_url": "https://scontent.example.test/ad-preview-001.jpg",
+                  "thumbnail_url": "https://scontent.example.test/ad-thumb-001.jpg",
+                  "ctwa_clid": "ctwa_clid_abc123def456ghi789"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

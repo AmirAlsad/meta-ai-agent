@@ -1,0 +1,23 @@
+{
+  "object": "page",
+  "entry": [
+    {
+      "id": "500000000000005",
+      "time": 1716000300000,
+      "messaging": [
+        {
+          "sender": { "id": "500000000000005" },
+          "recipient": { "id": "6000000000000061" },
+          "timestamp": 1716000300000,
+          "message": {
+            "mid": "m_EchoAbCdEfGhIjKlMnOpQrStUvWxYz012345EchoMid",
+            "text": "Echoed business reply",
+            "is_echo": true,
+            "app_id": 123456789012345,
+            "metadata": "agent-trace-001"
+          }
+        }
+      ]
+    }
+  ]
+}

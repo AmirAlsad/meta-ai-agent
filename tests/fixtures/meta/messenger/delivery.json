@@ -1,0 +1,23 @@
+{
+  "object": "page",
+  "entry": [
+    {
+      "id": "500000000000005",
+      "time": 1716000310000,
+      "messaging": [
+        {
+          "sender": { "id": "6000000000000061" },
+          "recipient": { "id": "500000000000005" },
+          "timestamp": 1716000310000,
+          "delivery": {
+            "mids": [
+              "m_DeliveredA0123456789AbCdEfGhIjKlMnOpQrStUv",
+              "m_DeliveredB0123456789AbCdEfGhIjKlMnOpQrStUv"
+            ],
+            "watermark": 1716000309000
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "object": "page",
+  "entry": [
+    {
+      "id": "500000000000005",
+      "time": 1716000320000,
+      "messaging": [
+        {
+          "sender": { "id": "6000000000000061" },
+          "recipient": { "id": "500000000000005" },
+          "timestamp": 1716000320000,
+          "message": {
+            "mid": "m_ImageAttachAbCdEfGhIjKlMnOpQrStUv0123456789Im",
+            "attachments": [
+              {
+                "type": "image",
+                "payload": {
+                  "url": "https://scontent.example.test/messenger/image-001.jpg"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

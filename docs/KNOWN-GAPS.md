@@ -1,0 +1,106 @@
+# Known Gaps and Deferrals
+
+A running list of items surfaced during code review or implementation that were intentionally deferred to a later stage. Recording them here keeps the institutional memory from getting lost between stages — if you are working on the stage listed, treat the entry as a TODO.
+
+## Open as of Stage 2
+
+### Parser-adjacent
+
+- **WhatsApp `statuses[].conversation` and `pricing` blocks** — Preserved on `raw` but not extracted into the normalized `StatusUpdate`. The conversation expiration timestamp (24-hour Customer Service Window) and pricing category (`marketing` / `utility` / `service`) matter for messaging-window awareness and billing observability.
+  - **Where**: `parseWhatsAppStatus` in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 4 (outbound clients introduce messaging-window tracking).
+
+- **Order / contact-card / reel / template-fallback attachments** — Surfaced as `MessageType: 'unknown'`. The Messenger attachment-type mapper (`mapFbAttachmentType`) returns `undefined` for `fallback`, `template`, and any future variant, and the message falls back to `'unknown'` rather than dropping. Real-payload captures may surface `reel`, `payment`, or other un-modeled types we'll want first-class normalization for.
+  - **Where**: `mapFbAttachmentType` and the attachment branch in `parseFbStyleMessage` in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 7 (rich features — adds dedicated `sendImage` / `sendAudio` / `sendVideo` / `sendDocument` adapters; normalized inbound variants for these surfaces follow).
+
+- **Page-linked Instagram routing detection** — This package targets the Instagram Business Login path (`object: 'instagram'`) only. The legacy Page-linked Instagram flow surfaces under `object: 'page'` and is currently misrouted to the Messenger parser. We do not intend to support the Page-linked flow, but a defensive check + clear log message would be better than silent misrouting.
+  - **Where**: `parseMetaWebhook` dispatch in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 8 (platform-specific surfaces — the right place to introduce IG-Business-Login-specific detection).
+
+- **IG `story_mention.id` semantic refactor** — The Instagram story-mention `StoryReplyInfo.id` is set to the message `mid` rather than the story id (Meta does not surface a separate story id for mentions). This is correct given the data but reads strangely against `storyReply.id`, which IS the story id. Cosmetic; renaming the field shape would churn fixtures.
+  - **Where**: `parseFbStyleMessage` story_mention branch in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 7 (alongside the rich-features pass for stories / reels).
+
+- **WhatsApp `context.id` for template-button replies** — Template button replies (`messages[i].type === 'button'`) include a `context.id` referencing the outbound template message. The parser surfaces the button payload but does not populate `replyTo` from `context.id`. The conversation agent will need this linkage to associate template replies with the template send.
+  - **Where**: `parseWhatsAppMessage` button branch in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 5+ (conversation agent — when template-reply correlation becomes load-bearing).
+
+- **Parser support for `message_edits` webhook field** — Meta added the `message_edits` subscription field in 2025 (WhatsApp + Messenger). It fires when a user edits a previously-sent message and is exposed as a subscribable option in the App Dashboard webhook configuration. This package does not subscribe to it and the parser does not normalize the payload. The natural shape would be either a new `MessageType: 'edit'` discriminator or an `editTarget?: { messageId: string }` field on `IncomingMessage`. We need real captured payloads before committing to a shape.
+  - **Where**: subscription list in [`scripts/setup/register-webhooks.ts`](../scripts/setup/register-webhooks.ts) (`SUBSCRIBED_FIELDS`); parser dispatch in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 7 (rich features) or later.
+
+- **Parser support for `message_context` webhook field** — Meta added the `message_context` subscription field in 2025. It carries additional structured context around messages (the documented shape varies by product surface). This package does not subscribe and does not parse it. Pending captured real-payload examples to commit to a normalization.
+  - **Where**: subscription list in [`scripts/setup/register-webhooks.ts`](../scripts/setup/register-webhooks.ts); parser dispatch in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 7 or later (after `npm run capture:guided` surfaces real `message_context` payloads).
+
+- **Postback / referral synthetic-id retry-dedupe** — Synthetic ids for postback (`${recipientId}-${timestamp}-postback`) and referral (`${recipientId}-${timestamp}-referral`) events include the timestamp, so identical events redelivered on Meta retry produce different ids. This is an acceptable trade-off in Stage 2 because cross-payload dedupe is the conversation agent's job and these events have meaningful single-payload uniqueness already. Reactions deliberately omit the timestamp from their synthetic id (see [Message parsing](./features/message-parsing.md)) — re-evaluate whether postbacks / referrals should follow the same rule once the conversation agent lands.
+  - **Where**: `parseFbStylePostback` and `parseFbStyleReferral` in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 5 (revisit once the conversation agent's cross-payload dedupe is wired up).
+
+### Fixture / capture-related
+
+- **Real captures via `npm run capture:guided`** — Most fixtures remain documentation-derived. Promoted so far (exercised by `tests/unit/parser-captured.test.ts`): three WhatsApp shapes (`tests/fixtures/meta/whatsapp/captured/`: outbound status, inbound text, inbound reaction) and two Messenger shapes (`tests/fixtures/meta/messenger/captured/`: inbound text, inbound reaction) from 2026-05-19 `setup:whatsapp` + `setup:messenger` sessions; and two Instagram shapes (`tests/fixtures/meta/instagram/captured/`: inbound text DM, inbound reaction) from the 2026-05-20 `setup:instagram` live test. Still missing real Instagram captures: story reply, story mention, image/media DM, echo, postback, referral, and read/seen — none captured yet. The remaining WhatsApp/Messenger shapes also still need real captures. See [META-PAYLOAD-STRUCTURES.md](./META-PAYLOAD-STRUCTURES.md) for the running checklist.
+  - **Where**: [`tests/fixtures/meta/`](../tests/fixtures/meta/).
+  - **When**: Stage 3 (capture tooling), then iteratively as fixtures get promoted from `.captures/meta/` into `tests/fixtures/meta/{channel}/captured/`.
+
+### Real-capture findings (Stage 3 live-test 2026-05-19, WhatsApp)
+
+These fields appear in real Meta WhatsApp payloads but aren't extracted into the normalized types yet. All are preserved on `raw`, so downstream consumers can read them, but pulling them onto first-class fields is deferred.
+
+- **`statuses[].pricing` (PMP block)** — `{ billable, pricing_model: "PMP", category, type }`. The Per-Message Pricing model replaced conversation-pricing in July 2025. `category` (`utility` / `marketing` / `authentication` / `service`) is load-bearing for Stage 4 messaging-window tracking and Stage 6 cost observability.
+  - **Where**: `parseWhatsAppStatus` in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 4.
+
+- **`contacts[].user_id` / `messages[].from_user_id` / `statuses[].recipient_user_id` (US.\*-prefixed identifiers)** — A Meta-internal user identifier (e.g. `US.0000000000000001`) that persists across phone-number changes, distinct from `wa_id` (E.164 phone). Likely useful for Stage 5 contact tracking when a user changes phone number mid-conversation. Not yet surfaced on `IncomingMessage` / `StatusUpdate`.
+  - **Where**: `parseWhatsAppMessage` and `parseWhatsAppStatus` in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 5 (conversation agent — when stable cross-phone-change identity becomes load-bearing).
+
+- **`contacts[].profile.name`** — The user's WhatsApp profile name. Useful for Stage 6 identity enrichment / contact upsert flows. Treat as PII.
+  - **Where**: `parseWhatsAppMessage` in [`src/meta/parser.ts`](../src/meta/parser.ts).
+  - **When**: Stage 6 (operational visibility / identity resolution).
+
+## Setup / Dashboard observations
+
+- **`pages_read_engagement` Dashboard visibility quirk** — During Stage 3 manual setup, a developer reported the Permissions and Features Dashboard initially indicated `pages_read_engagement` "doesn't exist on this app" (would need to be added), then on re-check the permission was present in the list as expected. Meta's Dashboard UX appears inconsistent here — possibly tied to product configuration order, region, app age, or stale page state. If a future developer reports they cannot locate `pages_read_engagement` (or another standard Messenger permission) in the Permissions and Features list, the first remediation is a hard refresh / wait a few minutes before treating it as a real missing-permission issue. Not a code defect; logged for institutional memory.
+  - **Where**: Meta App Dashboard → App Review → Permissions and Features.
+  - **When**: If reported by a user during setup, otherwise no action.
+
+- **WhatsApp inbound webhooks require the app to be Live** — Meta's Dashboard surfaces a warning under the WhatsApp product: "Apps will only be able to receive test webhooks sent from the app dashboard while the app is unpublished. No production data, including from app admins, developers or testers, will be delivered unless the app has been published." This is specific to the WhatsApp product. Messenger and Instagram deliver webhooks to roled users (Tester / Admin / Developer) while the app is in Development mode; WhatsApp does not. Implication for setup verification: until the app is published (Live mode + App Review for WhatsApp messaging permissions), the inbound step of `setup:whatsapp` can only be exercised via the Dashboard's "Send Test" button under WhatsApp → Configuration → Webhook, or by publishing the app. The verify script has no `--skip-inbound` flag today; a Stage 4+ touch-up should add one so a developer running Development-mode verification can mark the inbound step as `skip` rather than waiting for a timeout that cannot succeed.
+  - **Where**: [`scripts/setup/verify-whatsapp.ts`](../scripts/setup/verify-whatsapp.ts) inbound step; [`docs/META-SETUP-GUIDE.md`](./META-SETUP-GUIDE.md) WhatsApp section.
+  - **When**: Stage 4+ (add `--skip-inbound` flag to `setup:whatsapp` once outbound clients land and the verify scripts evolve to cover them).
+
+- **System User tokens cannot subscribe Pages via `POST /{pageId}/subscribed_apps`** — Validated during Stage 3 manual testing AND confirmed against Meta's documentation. [Meta's reference page for the endpoint](https://developers.facebook.com/docs/graph-api/reference/page/subscribed_apps/) explicitly requires "*A Page access token requested by a person who can perform CREATE_CONTENT, MANAGE, or MODERATE task on the Page*" along with `pages_manage_metadata` and `pages_show_list`. The load-bearing phrase is "requested by a person" — System User tokens are app-installed (not user-initiated) and don't satisfy that requirement regardless of what scopes they carry or what Page-asset roles the System User has. Empirically: a System User token (`type: SYSTEM_USER`, `profile_id: undefined` per `GET /debug_token`) with the required scopes and explicit Page asset access ("full control" via Business Settings → System Users → Add Assets → Pages) returns HTTP 403 / code 210 ("Subject not visible") on the subscribed_apps endpoint, while a Dashboard-generated Page Access Token (`type: PAGE`, `profile_id` = page id, minted from the logged-in admin user) succeeds. Every other Page operation we exercised (token introspection, send message) worked fine with the System User token, so this is a per-endpoint design choice by Meta. Documentation steers developers to the Dashboard "Generate Token" button for Messenger. The System User permanence story is **WhatsApp-specific** (Cloud API has no Dashboard "Generate Permanent Token" alternative); Messenger and Instagram do not need it.
+  - **Where**: [`scripts/setup/register-webhooks.ts`](../scripts/setup/register-webhooks.ts) `subscribeMessengerPageApp`; documented in [META-SETUP-GUIDE.md](./META-SETUP-GUIDE.md) Messenger section and [CLAUDE.md](../CLAUDE.md) load-bearing constraints.
+  - **When**: No code change needed today — the documentation guides developers to the right token type. If Meta ever relaxes the restriction, the documentation note becomes obsolete; no other adjustment required.
+
+- **Dashboard "Generate Token" produces a minimal-scope Page Access Token** — Validated during Stage 3 manual testing. The Messenger → Settings → Access Tokens → Generate Token button mints a `type: PAGE` token bound to the Page id (good — that's what `subscribed_apps` needs), but the resulting token's scope set is constrained to whatever the underlying user has already authorized for the app via OAuth — not the scopes the developer wants. A token observed in practice carried only `pages_messaging` + `public_profile`, missing `pages_read_engagement` (needed for `GET /{pageId}` introspection) and `pages_manage_metadata` (needed for some subscription operations). The Dashboard does not surface scope checkboxes inline on that button. The resolution is **Facebook Login for Business**: create a configuration with the full scope set in App Dashboard → Facebook Login for Business → Configurations, save the `config_id` to `MESSENGER_LOGIN_CONFIG_ID` in `.env`, then run `npm run setup:oauth:messenger`. The script drives the authorize-URL → User Token → `/me/accounts` → Page Token flow and produces a `type: PAGE` token carrying all configured scopes.
+  - **Where**: [`scripts/setup/oauth-messenger.ts`](../scripts/setup/oauth-messenger.ts); documented in [META-SETUP-GUIDE.md](./META-SETUP-GUIDE.md) Messenger section "Path B" and [CLAUDE.md](../CLAUDE.md) load-bearing constraints.
+  - **When**: No code change needed — the script is the resolution. If Meta ever adds inline scope selection to the Dashboard "Generate Token" button, the FB Login for Business path remains valid but becomes optional. Update [META-SETUP-GUIDE.md](./META-SETUP-GUIDE.md) at that point.
+
+- **Instagram messaging webhooks require Instagram Tester registration in Development mode** — Validated during a live walkthrough on 2026-05-20. While the app is unpublished, Instagram only delivers messaging webhooks for DMs sent from accounts registered as **Instagram Testers**. Instagram keeps a SEPARATE tester list from the Facebook app roles (App Dashboard → App Roles → Roles → **Instagram Testers**). Empirically, BOTH the business account and the personal account sending the test DM must appear there as **accepted** testers; otherwise the inbound webhook silently never arrives — no error, no log, identical symptom to the "Allow access to messages" silent killer. Two compounding gotchas: (1) the tester INVITE can only be ACCEPTED on the web (instagram.com → Settings → Apps and websites → Tester invites) — the Instagram mobile app does not surface the acceptance screen; (2) a first DM from a non-connected account lands in the "message requests" folder, but this is cosmetic — the Send API can reply within the 24h window without manually accepting the request, and the request routing is NOT the cause of webhook silence (the tester gate is). `verify-instagram.ts` step 5 now surfaces this as a manual confirmation, paralleling `verify-messenger.ts`'s app-role reminder.
+  - **Where**: [`scripts/setup/verify-instagram.ts`](../scripts/setup/verify-instagram.ts) step 5; documented in [META-SETUP-GUIDE.md](./META-SETUP-GUIDE.md) Instagram section + section 9 pitfalls.
+  - **When**: No code change needed beyond the reminder step (already added). Resolves naturally once the app is published (Live mode).
+
+- **`message_echoes` is not a valid Instagram subscribed field** — Verified against the live API on 2026-05-20. It exists only on the Messenger (`page`) object; including it in the Instagram (`instagram`) subscribe call returns HTTP 400 / code 100 ("Param subscribed_fields[N] must be one of {...} - got message_echoes"). It was mistakenly added to `SUBSCRIBED_FIELDS.instagram` during the Stage 3 review's M3 fix (correct for Messenger, wrong for IG) and silently broke every IG registration until removed. The accepted IG set is `messages, messaging_postbacks, messaging_seen, message_reactions, messaging_referral`. There is no IG echo-webhook field; Instagram outbound tracking relies on the Send API response, not an echo.
+  - **Where**: [`scripts/setup/register-webhooks.ts`](../scripts/setup/register-webhooks.ts) `SUBSCRIBED_FIELDS.instagram`; test guard in [`tests/unit/scripts-register-webhooks.test.ts`](../tests/unit/scripts-register-webhooks.test.ts).
+  - **When**: Fixed (field removed + regression test asserts `not.toContain('message_echoes')`). No further action.
+
+- **The `verify-instagram` step-3 webhook audit is IG-blind** — `inspectExistingSubscriptions` checks app-level `GET /{appId}/subscriptions`, which never surfaces Instagram's per-user subscription (created via `graph.instagram.com/{userId}/subscribed_apps`). The audit therefore always warns "No `instagram` subscription found" even when registration succeeded. Cosmetic — the registration block above it reports the true state (registration actually succeeds via the per-user `graph.instagram.com/{userId}/subscribed_apps` call). A fix would query the IG per-user subscription endpoint instead of (or in addition to) the app-level one — i.e. an IG-aware audit. Flagged again during the 2026-05-20 Instagram signature-verification fix as a benign false-warn.
+  - **Where**: [`scripts/setup/verify-instagram.ts`](../scripts/setup/verify-instagram.ts) step 3; [`scripts/setup/register-webhooks.ts`](../scripts/setup/register-webhooks.ts) `inspectExistingSubscriptions`.
+  - **When**: Stage 4+ polish. Low priority — misleading warn only, no functional impact.
+
+### Fixed during Stage 3 manual testing (kept for institutional memory)
+
+- **Instagram inbound webhooks were rejected — IG signs with `INSTAGRAM_APP_SECRET`, not `META_APP_SECRET`** — Found + fixed during Stage 3 manual testing on 2026-05-20. The signature verifier (`src/http/security.ts`) accepted only a single secret, and both the runtime app (`src/http/app.ts`) and the capture server (`scripts/lib/capture-server.ts`) passed only `META_APP_SECRET`. Empirically verified against the live Meta API: capturing a real Instagram DM webhook and recomputing the `X-Hub-Signature-256` HMAC with both secrets showed it matched **only `INSTAGRAM_APP_SECRET`** — Instagram (`object: instagram`) signs with the Instagram product's own app secret, while WhatsApp (`whatsapp_business_account`) and Messenger (`page`) sign with `META_APP_SECRET`. Result: every real Instagram webhook failed verification and was `401`'d in production, not just in setup tooling.
+  - **Fix**: `verifyMetaSignature` / `createMetaSignatureVerifier` now accept `string | readonly string[]` and accept a signature matching ANY configured secret (try-all, chosen over channel-aware parsing because verification runs on the raw bytes BEFORE JSON parsing — parsing untrusted input to pick a secret would add a parse-before-verify risk surface; both secrets share the same Meta App trust domain). `loadConfig` reads `INSTAGRAM_APP_SECRET` onto `config.instagram.appSecret` (optional, does not gate channel-enabled). `createApp` and the capture server build the deduped candidate set `[META_APP_SECRET, ...(INSTAGRAM_APP_SECRET if set)]` and warn at startup if the IG channel is enabled without its secret. Multi-secret unit tests added in `tests/unit/security.test.ts`.
+  - **Where**: [`src/http/security.ts`](../src/http/security.ts), [`src/config/loader.ts`](../src/config/loader.ts), [`src/http/app.ts`](../src/http/app.ts), [`scripts/lib/capture-server.ts`](../scripts/lib/capture-server.ts); docs in [`docs/features/webhook-security.md`](./features/webhook-security.md) + [`docs/features/configuration.md`](./features/configuration.md) + [CLAUDE.md](../CLAUDE.md).
+  - **When**: Fixed. Open follow-up: live secret rotation still requires a process restart (candidate set is built once at `createApp` time) — see [Webhook security](./features/webhook-security.md) known limitations.
+
+## How to use this file
+
+- When deferring an item during a stage's implementation, add an entry here with stage / location / rationale.
+- When a stage lands, sweep the file and either resolve the entry (remove it) or push it forward to a later stage with a one-line rationale.
+- Cosmetic / non-blocking items are fine — the goal is institutional memory, not a strict TODO list.
+
+See [Architecture](./ARCHITECTURE.md) for the full module map and [`meta-ai-agent-implementation-plan.md`](../meta-ai-agent-implementation-plan.md) for the staged roadmap.

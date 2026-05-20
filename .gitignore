@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+.captures/
+
+# Env files — ignore everything except the committed template.
+# The bare `.env` pattern does NOT match `.env.bak.*`, so `.env.*` is required
+# to keep credential backups out of the repo.
+.env
+.env.*
+!.env.example
+
+.DS_Store
+*.log
+
+# Reference package kept locally for parity; it is its own git repo and is not
+# part of this package.
+sendblue-ai-agent/

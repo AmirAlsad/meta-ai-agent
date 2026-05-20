@@ -1,0 +1,61 @@
+{
+  "name": "meta-ai-agent",
+  "version": "0.1.0",
+  "description": "Messaging infrastructure for deploying AI agents over WhatsApp, Messenger, and Instagram with a single Meta App.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "node --import tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "vitest run --config vitest.config.ts tests/unit",
+    "test:integration": "vitest run --config vitest.config.ts tests/integration",
+    "typecheck": "tsc --noEmit",
+    "setup:whatsapp": "node --import tsx scripts/setup/verify-whatsapp.ts",
+    "setup:messenger": "node --import tsx scripts/setup/verify-messenger.ts",
+    "setup:instagram": "node --import tsx scripts/setup/verify-instagram.ts",
+    "setup:all": "node --import tsx scripts/setup/verify-all.ts",
+    "setup:oauth:instagram": "node --import tsx scripts/setup/oauth-instagram.ts",
+    "setup:oauth:messenger": "node --import tsx scripts/setup/oauth-messenger.ts",
+    "meta:webhooks": "node --import tsx scripts/setup/register-webhooks.ts",
+    "capture:fixtures": "node --import tsx scripts/capture/fixture-capture.ts",
+    "capture:guided": "node --import tsx scripts/capture/guided-capture.ts"
+  },
+  "keywords": [
+    "meta",
+    "whatsapp",
+    "messenger",
+    "instagram",
+    "ai-agent",
+    "webhook",
+    "messaging"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pino": "^9.6.0"
+  },
+  "devDependencies": {
+    "@ngrok/ngrok": "^1.7.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.5",
+    "@types/supertest": "^7.2.0",
+    "node-mocks-http": "^1.16.1",
+    "pino-pretty": "latest",
+    "supertest": "^7.2.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

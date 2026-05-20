@@ -1,0 +1,26 @@
+{
+  "object": "page",
+  "entry": [
+    {
+      "time": 1779231805149,
+      "id": "100000000000002",
+      "messaging": [
+        {
+          "sender": {
+            "id": "9000000000000001"
+          },
+          "recipient": {
+            "id": "100000000000002"
+          },
+          "timestamp": 1779231804978,
+          "reaction": {
+            "mid": "m_TESToutboundMid0000000000000000000000000000000000000000002",
+            "action": "react",
+            "emoji": "😆",
+            "reaction": "laugh"
+          }
+        }
+      ]
+    }
+  ]
+}

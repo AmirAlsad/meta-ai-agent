@@ -1,0 +1,39 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "100000000000001",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15551234567",
+              "phone_number_id": "200000000000002"
+            },
+            "statuses": [
+              {
+                "id": "wamid.HBgLMTU1NTc2NTQzMjEVAgASGBQzQTAwMDAwMDAwMDAwMDAwMDE0AA=",
+                "status": "failed",
+                "timestamp": "1716000140",
+                "recipient_id": "15557654321",
+                "errors": [
+                  {
+                    "code": 131026,
+                    "title": "Message undeliverable",
+                    "message": "Recipient's number is not a valid WhatsApp number",
+                    "href": "https://developers.facebook.com/docs/whatsapp/cloud-api/support/error-codes/",
+                    "error_data": {
+                      "details": "The phone number could not be reached."
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

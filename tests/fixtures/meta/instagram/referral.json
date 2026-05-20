@@ -1,0 +1,21 @@
+{
+  "object": "instagram",
+  "entry": [
+    {
+      "id": "17841400000000007",
+      "time": 1716000410000,
+      "messaging": [
+        {
+          "sender": { "id": "1780000000000008" },
+          "recipient": { "id": "17841400000000007" },
+          "timestamp": 1716000410000,
+          "referral": {
+            "source": "IG_ME_LINK",
+            "type": "OPEN_THREAD",
+            "ref": "ig_campaign_ref_01"
+          }
+        }
+      ]
+    }
+  ]
+}

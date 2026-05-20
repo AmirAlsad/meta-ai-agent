@@ -1,0 +1,40 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "100000000000001",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "15551234567",
+              "phone_number_id": "200000000000002"
+            },
+            "contacts": [
+              {
+                "profile": { "name": "Test User" },
+                "wa_id": "15557654321"
+              }
+            ],
+            "messages": [
+              {
+                "from": "15557654321",
+                "id": "wamid.HBgLMTU1NTc2NTQzMjEVAgASGBQzQTAwMDAwMDAwMDAwMDAwMDAyAA=",
+                "timestamp": "1716000010",
+                "type": "image",
+                "image": {
+                  "id": "300000000000003",
+                  "mime_type": "image/jpeg",
+                  "sha256": "abc123def4567890abc123def4567890abc123def4567890abc123def4567890",
+                  "caption": "Look at this"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
