@@ -14,8 +14,8 @@
  * for every method here is `POST {igUserId}/messages` on that host. (Meta's docs
  * note the legacy Facebook-Login flow used `graph.facebook.com/{IG_USER_ID}/...`
  * and both can work depending on the integration; we standardize on
- * `graph.instagram.com` for the Business-Login token this package issues. FLAG
- * for the fidelity reviewer — confirm against current Meta docs.) The access
+ * `graph.instagram.com` for the Business-Login token this package issues —
+ * live-verified working on this host 2026-05-20.) The access
  * token is supplied per request from {@link InstagramConfig.accessToken} and the
  * transport puts it in the `Authorization: Bearer` header — never the URL.
  *
@@ -164,10 +164,9 @@ export class InstagramClient implements ChannelAdapter {
    * Sent as its own `sender_action: "mark_seen"` POST (same separate-request
    * constraint as typing).
    *
-   * FLAG for fidelity reviewer: confirm Instagram supports `mark_seen` via the
-   * Send API. Messenger documents it; the Instagram-Login messaging surface is
-   * less explicit. If unsupported, `supports('read_receipt')` should flip to
-   * false and `markRead` should become a no-op or throw.
+   * `mark_seen` on the Instagram-Login Send API is live-verified working
+   * (accepted on `graph.instagram.com` 2026-05-20), so `supports('read_receipt')`
+   * is true.
    */
   async markSeen(recipientId: string): Promise<void> {
     const body = {
@@ -242,10 +241,8 @@ export class InstagramClient implements ChannelAdapter {
     switch (feature) {
       case 'typing_indicator':
         return true;
-      // read_receipt (mark_seen) is wired but PENDING fidelity confirmation on
-      // the Instagram-Login Send API — see the flag on markSeen. Advertised true
-      // so the agent attempts it; flip to false if a fidelity review proves it
-      // unsupported.
+      // read_receipt (mark_seen) is live-verified working on the Instagram-Login
+      // Send API (accepted on graph.instagram.com 2026-05-20) — see markSeen.
       case 'read_receipt':
         return true;
       // reply_to is FALSE: the Instagram-Login Send API does not support outbound
