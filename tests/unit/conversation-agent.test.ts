@@ -1113,10 +1113,13 @@ describe('ConversationAgent', () => {
     const firstId = (await (h.adapters.messenger!.sendText.mock.results[0]!.value as Promise<SendResult>)).messageId;
     const secondId = (await (h.adapters.messenger!.sendText.mock.results[1]!.value as Promise<SendResult>)).messageId;
 
-    // The tracker only advances ids it already knows about. Seed both with a
-    // `sent` (as the live transport's status pipeline would) before the read.
-    h.statusTracker!.applyStatusUpdate({ channelMessageId: firstId, channel: 'messenger', status: 'sent', timestamp: FIXED_NOW });
-    h.statusTracker!.applyStatusUpdate({ channelMessageId: secondId, channel: 'messenger', status: 'sent', timestamp: FIXED_NOW });
+    // Regression guard: the agent itself seeds a `sent` status record at SEND
+    // time for on_send channels (Messenger/IG), which emit no per-message status
+    // webhook. Without that seeding the watermark read below would be a no-op
+    // (getStatus would return undefined). No manual pre-seed here — the records
+    // must already exist purely from the agent having sent the two messages.
+    expect(h.statusTracker!.getStatus(firstId)!.current).toBe('sent');
+    expect(h.statusTracker!.getStatus(secondId)!.current).toBe('sent');
 
     // Feed a read watermark covering both sentAt timestamps (= FIXED_NOW).
     await h.agent.handleStatus({

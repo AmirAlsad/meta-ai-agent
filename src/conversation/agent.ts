@@ -714,6 +714,24 @@ export class ConversationAgent {
         messageIndex: record.currentOutboundIndex,
         ...(traceId !== undefined ? { traceId } : {})
       });
+
+      // Seed a 'sent' status record at send time for on_send channels
+      // (Messenger/Instagram). They emit NO per-message status webhook, so
+      // without this the tracker would never hold a record for them:
+      // GET /admin/status/:messageId would 404, and a read watermark's
+      // applyReadWatermark would find nothing to mark. WhatsApp (on_status) is
+      // seeded by its own 'sent' status webhook in handleStatusImpl, so it is
+      // skipped here to avoid a duplicate history entry.
+      if (advancementMode(record.channel) === 'on_send') {
+        this.statusTracker?.applyStatusUpdate({
+          channelMessageId: sentMessageId,
+          channel: record.channel,
+          status: 'sent',
+          timestamp: this.now(),
+          conversationKey: key,
+          recipientId: userId
+        });
+      }
     }
 
     // WHY reaction/typing always advance-on-send: they are fire-and-forget — no
