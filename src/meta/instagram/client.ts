@@ -32,7 +32,13 @@
 import type pino from 'pino';
 import type { InstagramConfig } from '../../config/loader.js';
 import type { GraphClient } from '../shared/graph-client.js';
-import type { ChannelAdapter, ChannelFeature, SendOptions, SendResult } from '../shared/adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelFeature,
+  MediaSendInput,
+  SendOptions,
+  SendResult
+} from '../shared/adapter.js';
 
 /** Host serving the Instagram-Login messaging endpoints. */
 const INSTAGRAM_GRAPH_HOST = 'graph.instagram.com' as const;
@@ -140,6 +146,40 @@ export class InstagramClient implements ChannelAdapter {
   }
 
   /**
+   * Send a one-shot Private Reply to a public comment (the comment-to-DM funnel).
+   *
+   * This is the mechanism that turns a public comment on the business's post/reel
+   * into a private DM thread: `POST {igUserId}/messages` with the recipient keyed
+   * by `comment_id` instead of a user id. Routed through the same
+   * {@link InstagramClient.send} path (and thus the rate pacer) as every other IG
+   * send.
+   *
+   * WHY `recipient: { comment_id }` and NOT `recipient: { id }`: it is the
+   * `comment_id` key that makes Meta treat this as a Private Reply (delivering the
+   * DM to the comment's author and opening the thread); a `recipient.id` body is
+   * an ordinary DM and is NOT a reply to the comment. The two are mutually
+   * exclusive — this method always uses `comment_id`.
+   *
+   * 7-DAY WINDOW: a Private Reply is a SINGLE message and must be sent within
+   * 7 DAYS of the comment being posted. Outside that window (or after a reply has
+   * already been sent for that comment) Meta rejects the call; the rejection
+   * surfaces as a MetaApiError for the caller to fail-soft on. This is distinct
+   * from the standard 24-hour messaging window — the comment-to-DM funnel gets
+   * its own 7-day, one-message allowance.
+   */
+  async sendPrivateReply(commentId: string, text: string): Promise<SendResult> {
+    const body = {
+      // `comment_id` (NOT `id`) is what makes this a Private Reply to the comment.
+      recipient: { comment_id: commentId },
+      message: { text }
+    };
+    const raw = await this.send(body, 'instagram.sendPrivateReply');
+    // The reply is keyed to the comment, not a user id — surface the comment id
+    // as the SendResult.recipientId so callers have a stable correlation key.
+    return this.toSendResult(commentId, raw);
+  }
+
+  /**
    * Show a typing indicator to the user.
    *
    * WHY a SEPARATE request (not piggy-backed on a message): like Messenger,
@@ -233,9 +273,88 @@ export class InstagramClient implements ChannelAdapter {
     await this.send(body, 'instagram.sendReaction');
   }
 
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /* Media sends (image / audio / video) — URL-based attachments              */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
   /**
-   * Capability matrix advertised to the conversation agent. Returns `true`
-   * ONLY for features actually wired at Stage 4.
+   * Send an image attachment by URL via `POST {igUserId}/messages`.
+   *
+   * Media is URL-based: Instagram fetches the asset from the supplied public
+   * `url`. Routed through the SAME {@link InstagramClient.send} pacer as every
+   * other IG send — media counts against the per-account rate ceiling (the
+   * stricter ~10/sec audio/video sub-limit the 100ms floor is sized for).
+   */
+  async sendImage(recipientId: string, url: string): Promise<SendResult> {
+    return this.sendAttachment(recipientId, 'image', url, 'instagram.sendImage');
+  }
+
+  /** Send an audio attachment by URL. Paced like every other IG send (see {@link InstagramClient.sendImage}). */
+  async sendAudio(recipientId: string, url: string): Promise<SendResult> {
+    return this.sendAttachment(recipientId, 'audio', url, 'instagram.sendAudio');
+  }
+
+  /** Send a video attachment by URL. Paced like every other IG send (see {@link InstagramClient.sendImage}). */
+  async sendVideo(recipientId: string, url: string): Promise<SendResult> {
+    return this.sendAttachment(recipientId, 'video', url, 'instagram.sendVideo');
+  }
+
+  /**
+   * Send a document (PDF) attachment by URL via `POST {igUserId}/messages`.
+   *
+   * Routed through the SAME private {@link InstagramClient.sendAttachment} helper
+   * as image/audio/video — the only difference is the attachment `type` is
+   * `'file'`: `message.attachment.{type:'file', payload:{url}}`.
+   *
+   * WHY `type: 'file'` and the PDF/size caveat: per Meta's "Instagram API with
+   * Instagram Login — messaging" reference, the IG `file` attachment is
+   * PDF-ONLY and capped at ~25MB. We deliberately do NOT validate the MIME or
+   * size here (out of scope — see the Stage 7 notes): we send what we're given
+   * and let Meta reject a non-PDF / oversized file. A rejection surfaces as a
+   * MetaApiError, which the conversation agent's per-item fail-soft catch turns
+   * into a skip+advance — so a bad document never wedges the queue.
+   *
+   * This is per Meta docs
+   * (https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/messaging-api);
+   * like other IG specifics in this client it is worth live-verifying.
+   */
+  async sendDocument(recipientId: string, url: string): Promise<SendResult> {
+    return this.sendAttachment(recipientId, 'file', url, 'instagram.sendDocument');
+  }
+
+  /**
+   * {@link ChannelAdapter.sendMedia} — route a uniform media payload to the
+   * typed per-kind method above based on `input.kind`. `image`/`audio`/`video`
+   * map to their matching method; `document` maps to {@link
+   * InstagramClient.sendDocument} (an IG `file` / PDF attachment).
+   *
+   * The agent dispatches every media item through this single method without a
+   * channel/kind branch. Captions are not part of IG's URL-attachment body, so
+   * `input.caption` / `input.filename` are intentionally unused here. If Meta
+   * rejects the asset (e.g. a non-PDF or oversized `file`), the resulting
+   * MetaApiError is caught by the agent's per-item fail-soft catch, which marks
+   * the item skipped and advances the queue.
+   */
+  async sendMedia(recipientId: string, input: MediaSendInput): Promise<SendResult> {
+    switch (input.kind) {
+      case 'image':
+        return this.sendImage(recipientId, input.mediaIdOrUrl);
+      case 'audio':
+        return this.sendAudio(recipientId, input.mediaIdOrUrl);
+      case 'video':
+        return this.sendVideo(recipientId, input.mediaIdOrUrl);
+      case 'document':
+        // IG `file` attachment (PDF-only, ~25MB) — see sendDocument.
+        return this.sendDocument(recipientId, input.mediaIdOrUrl);
+    }
+  }
+
+  /**
+   * Capability matrix advertised to the conversation agent. Returns `true` only
+   * for features actually wired in this client; the matrix GROWS per stage as
+   * surfaces land (e.g. Stage 7 added media_send, Stage 8 added ice_breakers), so
+   * new `true`s appear over time. The per-case comments below are the source of
+   * truth for why each feature is true/false today.
    */
   supports(feature: ChannelFeature): boolean {
     switch (feature) {
@@ -257,20 +376,27 @@ export class InstagramClient implements ChannelAdapter {
       // No template messaging on Instagram (a WhatsApp-only concept).
       case 'template':
         return false;
-      // media_send lands in Stage 7 (media upload + send) — flips to true once
-      // image/audio/video send exists on this client.
+      // media_send is true: image/audio/video AND document attachments ARE
+      // supported via the URL-based Send API (see sendImage/sendAudio/sendVideo
+      // and sendDocument — the IG `file` attachment, PDF-only ~25MB per Meta
+      // docs). Meta rejects an unsupported file (non-PDF/oversized), which the
+      // agent's per-item fail-soft catch turns into a skip+advance.
       case 'media_send':
-        return false;
+        return true;
       // story_reply is an INBOUND concept (a user replying to the business's
       // story arrives via webhook) — it is not an outbound send capability.
       case 'story_reply':
         return false;
-      // ice_breakers lands in Stage 8 (Messenger/IG profile surfaces) — flips
-      // to true once the profile/ice-breaker API is wired.
+      // ice_breakers is TRUE as of Stage 8: Instagram ice breakers (setup-time
+      // conversation starters) are configurable out-of-band via
+      // `InstagramIceBreakers` (see ./ice-breakers.ts — POST {igUserId}/messenger_profile
+      // on graph.instagram.com). They are not sent on the per-message hot path,
+      // but the channel DOES support them, so the agent advertises the capability.
       case 'ice_breakers':
-        return false;
-      // get_started / persistent_menu are Messenger profile surfaces not
-      // applicable to the Instagram messaging client.
+        return true;
+      // get_started / persistent_menu stay FALSE. Instagram has NO Get Started
+      // button (it uses ice breakers instead — see plan), and persistent-menu
+      // support on the Instagram-Login flavor is not in scope for this client.
       case 'get_started':
       case 'persistent_menu':
         return false;
@@ -299,6 +425,32 @@ export class InstagramClient implements ChannelAdapter {
       accessToken: this.config.accessToken,
       operation
     });
+  }
+
+  /**
+   * Build and POST a URL-based media attachment body, shared by
+   * {@link InstagramClient.sendImage}/{@link InstagramClient.sendAudio}/{@link InstagramClient.sendVideo}.
+   * Goes through {@link InstagramClient.send} (and thus the pacer) like every
+   * other send; only the `attachment.type` differs per media kind.
+   *
+   * NOTE: this PRIVATE helper is distinct from the public {@link
+   * InstagramClient.sendMedia} (the {@link ChannelAdapter} entry point) — this one
+   * builds the per-type attachment body; the public one routes a uniform
+   * {@link MediaSendInput} to the per-kind method (including `document`, which
+   * maps to {@link InstagramClient.sendDocument} / `type: 'file'`).
+   */
+  private async sendAttachment(
+    recipientId: string,
+    type: 'image' | 'audio' | 'video' | 'file',
+    url: string,
+    operation: string
+  ): Promise<SendResult> {
+    const body = {
+      recipient: { id: recipientId },
+      message: { attachment: { type, payload: { url } } }
+    };
+    const raw = await this.send(body, operation);
+    return this.toSendResult(recipientId, raw);
   }
 
   /**

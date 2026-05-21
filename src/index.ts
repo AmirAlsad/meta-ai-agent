@@ -44,7 +44,12 @@ export function buildRuntime(
   // no adapter, and the agent drops a turn for a channel it can't send on.
   const adapters: Partial<Record<Channel, ChannelAdapter>> = {};
   if (config.whatsapp) {
-    adapters.whatsapp = new WhatsAppClient({ config: config.whatsapp, graph, logger });
+    adapters.whatsapp = new WhatsAppClient({
+      config: config.whatsapp,
+      graph,
+      apiVersion: config.meta.graphApiVersion,
+      logger
+    });
   }
   if (config.messenger) {
     adapters.messenger = new MessengerClient({ config: config.messenger, graph, logger });

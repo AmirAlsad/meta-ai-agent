@@ -53,7 +53,7 @@ export type ChatAction =
   | { type: 'typing'; durationMs?: number }
   | { type: 'reaction'; emoji: string; targetMessageId: string }
   | { type: 'reply'; text: string; targetMessageId: string }
-  | { type: 'media'; url: string; caption?: string; mimeType?: string }
+  | { type: 'media'; url: string; caption?: string; mimeType?: string; filename?: string }
   | { type: 'template'; name: string; language: string; components?: TemplateComponent[] }
   | { type: 'silence' };
 

@@ -111,8 +111,39 @@ describe('buildOutboundItems', () => {
 
     expect(items).toEqual([]);
     expect(skipped).toEqual([
-      { kind: 'media', reason: 'media_send unsupported (Stage 7)' },
+      { kind: 'media', reason: 'media_send unsupported on this channel' },
       { kind: 'template', reason: 'template unsupported on this channel' }
+    ]);
+  });
+
+  it('media action with a filename → item carries mediaFilename (gated on media_send)', () => {
+    const action: ChatAction = {
+      type: 'media',
+      url: 'https://cdn.example/report.pdf',
+      caption: 'Q2',
+      mimeType: 'application/pdf',
+      filename: 'q2-report.pdf'
+    };
+
+    // Supported: the filename is threaded onto the item alongside the other media
+    // fields.
+    const { items, skipped } = buildOutboundItems([action], supportsAll);
+    expect(skipped).toEqual([]);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: 'media',
+      mediaUrl: 'https://cdn.example/report.pdf',
+      mediaCaption: 'Q2',
+      mediaMimeType: 'application/pdf',
+      mediaFilename: 'q2-report.pdf'
+    });
+
+    // Still gated on supports('media_send'): a channel without it skips the whole
+    // media action (filename and all).
+    const noMedia = buildOutboundItems([action], (f) => f !== 'media_send');
+    expect(noMedia.items).toEqual([]);
+    expect(noMedia.skipped).toEqual([
+      { kind: 'media', reason: 'media_send unsupported on this channel' }
     ]);
   });
 

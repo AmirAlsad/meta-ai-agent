@@ -18,7 +18,7 @@ If exactly one of a pair is set, `loadConfig` throws with a clear error (`Partia
 
 At least one channel must be configured. If none of the three pairs is fully set, `loadConfig` throws.
 
-The returned `Config` object includes a `channels: { whatsapp: boolean, messenger: boolean, instagram: boolean }` map. Downstream code will use this to decide which adapters/routes to wire up in Stages 4–6. As of Stage 2, the parser itself does not consult this map — it routes by the inbound `object` field — but configured channels gate outbound and (later) per-channel feature toggles.
+The returned `Config` object includes a `channels: { whatsapp: boolean, messenger: boolean, instagram: boolean }` map. `buildRuntime` ([`src/index.ts`](../../src/index.ts)) uses the per-channel config to decide which adapters to wire up (only configured channels get a `ChannelAdapter`). The parser itself does not consult this map — it routes by the inbound `object` field — but configured channels gate outbound and per-channel feature toggles.
 
 ## Code files
 
@@ -38,7 +38,7 @@ Listed exactly as they appear in [`.env.example`](../../.env.example).
 | --- | --- |
 | `META_APP_SECRET` | Used to verify `X-Hub-Signature-256` on inbound WhatsApp (`whatsapp_business_account`) and Messenger (`page`) webhooks. **Instagram webhooks are signed with `INSTAGRAM_APP_SECRET` instead** (see below) — the verifier tries all configured secrets and accepts a match against any. |
 | `META_VERIFY_TOKEN` | Echoed during the GET `/webhook` handshake; configured identically in each product's webhook settings. Validation: must be at least 16 characters. |
-| `CHAT_ENDPOINT_URL` | The developer's HTTP endpoint that will receive inbound messages and return responses (consumed by `ChatClient` in Stage 5). Validated as a parseable URL at startup. |
+| `CHAT_ENDPOINT_URL` | The developer's HTTP endpoint that receives inbound messages and returns responses (consumed by `ChatClient`). Validated as a parseable URL at startup. |
 | `NGROK_DOMAIN` | Reserved static ngrok hostname (bare hostname, no scheme or path). Required because the Meta Dashboard pins webhook callback URLs and the IG Business Login OAuth redirect URI to a single public domain — an ephemeral hostname forces re-registration every run. Reserve a free one at <https://dashboard.ngrok.com/cloud-edge/domains>. |
 
 ### Required: at least one channel
@@ -81,19 +81,19 @@ The Messenger OAuth script also reads `META_APP_ID` and `META_APP_SECRET` — un
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `META_APP_ID` | unset | Optional; reserved for outbound clients (Stage 4) that may need the App ID for some Graph API admin calls. Not used in Stage 1. **Not used by `setup:oauth:instagram`** — Instagram OAuth uses the Instagram product's own `client_id` (parsed from `INSTAGRAM_AUTHORIZE_URL`) and `INSTAGRAM_APP_SECRET`, which are sibling-but-distinct credentials inside the same Meta App. |
-| `META_GRAPH_API_VERSION` | `v25.0` | Pinned Graph API version. Validated against `^v\d+\.\d+$`. Used by outbound clients in Stage 4. |
+| `META_APP_ID` | unset | Optional; loaded onto `config.appId` but not consumed by the running agent today (reserved for Graph API admin calls that may need the App ID). Read by `setup:oauth:messenger` to authenticate the OAuth flow. **Not used by `setup:oauth:instagram`** — Instagram OAuth uses the Instagram product's own `client_id` (parsed from `INSTAGRAM_AUTHORIZE_URL`) and `INSTAGRAM_APP_SECRET`, which are sibling-but-distinct credentials inside the same Meta App. |
+| `META_GRAPH_API_VERSION` | `v25.0` | Pinned Graph API version. Validated against `^v\d+\.\d+$`. Used by the outbound clients (the shared `GraphClient`). |
 | `PORT` | `3000` | Express listen port. Must be an integer between 1 and 65535. |
 | `USER_LOOKUP_URL` | unset | Optional Stage 6 identity-enrichment endpoint. The resolver POSTs `{ channel, channelScopedUserId, channelScopedBusinessId }` and shapes the JSON response into a `Contact` that rides on the `ChatRequest`. When unset, a no-op resolver runs and conversations proceed without enrichment. When set it must parse as a URL (validated at load, like `CHAT_ENDPOINT_URL`). Enrichment is fail-open. See [Identity resolution](./identity-resolution.md). |
 | `USER_LOOKUP_TIMEOUT_MS` | `5000` | Per-call timeout for the `USER_LOOKUP_URL` request (positive integer). A timeout drops enrichment rather than blocking the turn (fail-open). Loaded onto `config.conversation.userLookupTimeoutMs`, alongside `CHAT_ENDPOINT_TIMEOUT_MS`. Only consulted when `USER_LOOKUP_URL` is set. |
 | `REDIS_URL` | unset | Reserved for Stage 10 (Redis-backed conversation store, dedupe, BullMQ buffer timers). As of Stage 6 it is surfaced in `GET /ready` as `configured` vs `not_configured` (presence-only — the real ping lands in Stage 10). |
 | `ADMIN_API_TOKEN` | unset | Stage 6: gates the PII-bearing operational routes `GET /metrics`, `GET /admin/conversations/:key`, and `GET /admin/status/:messageId` (constant-time `Authorization: Bearer` / `x-admin-api-token` check). When **unset**, those routes are not mounted at all (a request 404s, not 401s — never advertise an admin surface a deploy hasn't configured a token for). When **set**, it must be at least **16 characters** (a high-entropy secret of **≥32** is recommended) — `loadConfig` throws otherwise. `/health` and `/ready` are unaffected (always on, unauthenticated). See [Operational visibility](./operational-visibility.md). |
-| `PUBLIC_BASE_URL` | unset | Used by Stage 3 webhook-registration and capture scripts to compute the callback URL. Not consumed by the running app. |
+| `PUBLIC_BASE_URL` | unset | Used by the webhook-registration and capture scripts to compute the callback URL. Not consumed by the running app. |
 | `AGENT_AUTOSTART` | `1` | `0` / `false` to prevent `src/index.ts` from auto-binding a port. Useful when embedding `createApp` in a custom entry point. |
 | `NODE_ENV` | `development` | When `test`, `src/index.ts` skips autostart so test imports do not bind a port. |
 | `LOG_LEVEL` | `info` | Consumed by `src/index.ts` when constructing the pino logger. |
 
-### E2E (planned, consumed by Stage 3 scripts)
+### E2E (consumed by the setup/capture scripts)
 
 | Variable | Purpose |
 | --- | --- |
@@ -102,7 +102,7 @@ The Messenger OAuth script also reads `META_APP_ID` and `META_APP_SECRET` — un
 | `E2E_TEST_INSTAGRAM_IGSID` | Developer's IGSID for Instagram testing. |
 | `NGROK_AUTHTOKEN` | ngrok SDK auth token. |
 
-None of these are consumed by the running agent in Stage 1; they are read by the Stage 3 setup/capture scripts.
+None of these are consumed by the running agent; they are read by the setup/capture scripts (see [Setup verification](./setup-verification.md) and [Payload capture](./payload-capture.md)).
 
 ## Validation rules summary
 
@@ -120,9 +120,9 @@ None of these are consumed by the running agent in Stage 1; they are read by the
 - `PORT` not an integer in `[1, 65535]`.
 - `AGENT_AUTOSTART` set to a value other than `1`, `0`, `true`, `false`.
 
-## Known limitations (Stages 1–2)
+## Known limitations
 
 - Token format is not validated. Stage 10 of the plan adds shape checks: WhatsApp System User tokens are long alphanumeric strings, Page Access Tokens start with `EAA`, Instagram tokens start with `IGQ`.
-- `META_APP_ID` is optional today and not asserted to be numeric. It will be required by some Stage 4 Graph API calls.
-- No cross-field validation yet (e.g. window/buffer/retry tunables introduced in later stages will need cross-checks).
+- `META_APP_ID` is optional and not asserted to be numeric; it is loaded but not consumed by the running agent today.
+- Cross-field validation is limited to the buffer window (`BUFFER_MAX_TIMEOUT_MS >= BUFFER_BASE_TIMEOUT_MS`); the broader rate-limit/retry tunables (Stage 10) will need their own cross-checks.
 - Boolean parsing for `AGENT_AUTOSTART` only accepts `1`/`0`/`true`/`false` — other affirmative strings like `yes`/`on` are rejected.

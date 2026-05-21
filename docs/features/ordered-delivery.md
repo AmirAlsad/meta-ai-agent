@@ -1,4 +1,4 @@
-# Ordered delivery (Stage 5)
+# Ordered delivery
 
 When the chat endpoint returns several actions for one turn — say a reaction, then
 a reply, then a follow-up message — they must reach the user in order. The
@@ -130,14 +130,14 @@ A send that throws (`MetaApiError` or anything else) does not wedge the queue:
 `sendNext` calls `markSkippedAndAdvance`, which stamps `skippedAt`/`skipReason` on
 the item and advances past it. One bad send never blocks the rest of the queue.
 Proper retry of a failed send is Stage 10. The capability filtering that decides
-which actions become items (e.g. media skipped until Stage 7, template
-WhatsApp-only, reply→message downgrade) happens earlier in `buildOutboundItems` —
+which actions become items (e.g. template WhatsApp-only, reply→message downgrade,
+media gated on `media_send`) happens earlier in `buildOutboundItems` —
 see [Rich chat actions](./rich-chat-actions.md).
 
 ## Testing
 
 [`tests/unit/delivery-queue.test.ts`](../../tests/unit/delivery-queue.test.ts)
-(17 tests) covers the pure logic: `buildOutboundItems` capability gating,
+covers the pure logic: `buildOutboundItems` capability gating,
 `advancementMode` / `statusAdvancesQueue` per channel, and cursor advancement. The
 agent's send loop, `on_status` vs `on_send` advancement, the delivery-timeout
 fallback, the handle-mapping correlation, and typing injection are covered in
@@ -149,7 +149,6 @@ and the WhatsApp send path is proven end-to-end in
 
 - No retry on a failed send — the item is skipped and the queue advances
   (Stage 10).
-- Media items are skipped before they reach the queue (Stage 7).
 - Out-of-window enforcement / WhatsApp template fallback is Stage 10.
 
 See [Known gaps](../KNOWN-GAPS.md) and [Architecture](../ARCHITECTURE.md).

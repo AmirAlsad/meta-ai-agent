@@ -15,6 +15,7 @@ npm run setup:all                # Verify every configured channel in one sessio
 npm run setup:oauth:instagram    # OAuth flow → long-lived (~60d) IG token (run first)
 npm run setup:oauth:messenger    # FB Login for Business → scope-controlled Messenger Page token
 npm run meta:webhooks            # Standalone programmatic webhook registration
+npm run setup:profile -- --config=<path>   # Apply Messenger Profile + IG ice breakers from a JSON config (Stage 8)
 ```
 
 Each script accepts `--help` (or `-h`) for a flag reference. Run order for a fresh app: `setup:oauth:instagram` (if using Instagram) → `setup:oauth:messenger` (if you need scopes beyond what the Dashboard "Generate Token" button can mint, e.g. `pages_read_engagement` / `pages_manage_metadata`) → `setup:all`.
@@ -178,7 +179,7 @@ Source: [`scripts/setup/verify-shared.ts`](../../scripts/setup/verify-shared.ts)
 
 - **Tester role is the silent gate.** Until the app is Live (requires App Review), only personal Facebook accounts with a Tester / Admin / Developer role on the Meta App can DM the Page. There is no Graph API to read these roles, so `verify-messenger` surfaces this as a manual confirmation prompt.
 - **`subscribed_fields` includes `message_echoes`** so the script receives a webhook for its own outbound reply (useful for round-trip confirmation). See `SUBSCRIBED_FIELDS.messenger` in [`scripts/setup/register-webhooks.ts`](../../scripts/setup/register-webhooks.ts).
-- **`sender_action` (typing / read) must be a separate request from the message.** Combining is rejected. Stage 4 concern, but it shapes the messenger reply step's "two-call" cadence.
+- **`sender_action` (typing / read) must be a separate request from the message.** Combining is rejected. This is a send-client behavior (see [Outbound clients](./outbound-clients.md)), but it also shapes the messenger reply step's "two-call" cadence here.
 
 ### Instagram
 
@@ -278,15 +279,106 @@ Runs the Facebook Login for Business OAuth flow to mint a Page Access Token with
 7. Selects the target Page (auto-picks when `MESSENGER_PAGE_ID` matches or only one Page is returned; prompts otherwise).
 8. Offers to append `MESSENGER_PAGE_ACCESS_TOKEN` (and `MESSENGER_PAGE_ID` if not already set) to `.env`. Refuses to clobber an existing non-empty token line; empty placeholders from `.env.example` are skipped.
 
-## What's intentionally NOT in scope (Stage 3)
+## Instagram / Messenger profile configuration (`setup:profile`)
 
-- **Outbound message sending beyond a single test message per channel.** The verify scripts call `POST /{phoneNumberId}/messages` (WhatsApp template), `POST /{pageId}/messages` (Messenger reply), and `POST graph.instagram.com/{userId}/messages` (Instagram reply) once each to confirm round-trip wiring. The full `ChannelAdapter` send surface (text, media, typing indicators, reactions, capability gates) lands in **Stage 4**.
-- **Conversation buffering or chat-endpoint integration.** Captures are written to disk; nothing is dispatched to a chat endpoint or buffered for proactive outreach. **Stage 5** wires `ConversationAgent` and `ChatClient`.
-- **Status tracking beyond a single delivery confirmation.** The outbound smoke test waits for any `sent` / `delivered` / `read` status to confirm the loop. The persistent `StatusTracker` with cross-payload dedupe arrives in **Stage 6**.
+[`scripts/setup/configure-profile.ts`](../../scripts/setup/configure-profile.ts)
+(Stage 8) applies the **Messenger Profile** surfaces (Get Started button, greeting,
+persistent menu, ice breakers) and the **Instagram ice breakers** from a single JSON
+config file. It is the companion to `register-webhooks.ts`: webhooks make events
+flow **in**; this makes the conversation-entry UI (buttons / menus / starters) show
+up on the threads. It reuses the **real** `MessengerProfileClient` /
+`InstagramIceBreakers` clients over the shared `GraphClient`, so it exercises the
+exact production body-mapping + validation code.
+
+```bash
+npm run setup:profile -- --config=<path> [--channels=messenger,instagram]
+```
+
+**Required env:** `META_APP_SECRET`, `META_VERIFY_TOKEN`, plus per-channel
+credentials (`MESSENGER_*` and/or `INSTAGRAM_*`) — the same `loadConfig` surface as
+the other setup scripts.
+
+**CLI flags** (defined in `configure-profile.ts`):
+
+| Flag | Effect |
+| --- | --- |
+| `--config=<path>` | Path to the profile JSON (**required** unless `--help`). |
+| `--channels=<list>` | Comma-separated channels to configure (`messenger`,`instagram`). Default: every channel that is **both** configured (creds set) **and** present in the JSON. |
+| `--help`, `-h` | Print usage (includes the JSON shape inline). |
+
+**JSON config shape** (all sections and fields optional; a sample ships at
+[`scripts/setup/profile.example.json`](../../scripts/setup/profile.example.json)):
+
+```json
+{
+  "messenger": {
+    "getStarted": { "payload": "GET_STARTED" },
+    "greeting": [{ "locale": "default", "text": "Hi! How can we help?" }],
+    "persistentMenu": [
+      {
+        "locale": "default",
+        "composerInputDisabled": false,
+        "callToActions": [
+          { "type": "postback", "title": "Talk to us", "payload": "TALK" },
+          { "type": "web_url", "title": "Website", "url": "https://example.com" }
+        ]
+      }
+    ],
+    "iceBreakers": [
+      {
+        "locale": "default",
+        "callToActions": [{ "question": "What are your hours?", "payload": "HOURS" }]
+      }
+    ]
+  },
+  "instagram": {
+    "iceBreakers": [
+      {
+        "locale": "default",
+        "callToActions": [{ "question": "How do I order?", "payload": "ORDER" }]
+      }
+    ]
+  }
+}
+```
+
+**Per-step ordering + partial success:**
+
+- For Messenger, present fields are applied in the fixed order
+  `get_started → greeting → persistent_menu → ice_breakers`. Get Started is applied
+  **before** the persistent menu because **Meta requires it** (a `persistent_menu`
+  with no `get_started` is rejected with error code 2018145) — see
+  [Messenger profile](./messenger-profile.md#ordering-get-started-must-precede-the-persistent-menu).
+  Instagram has only an `ice_breakers` step.
+- Every step runs in its own `try`/`catch`: a failing step is recorded (with the
+  Meta error code/subcode/fbtrace_id) and the **next** step and channel still run
+  (**partial success**). The script prints a per-channel, per-step pass/fail table.
+- A channel is applied only when it is **both** configured (creds present) **and**
+  has a section in the JSON; absent channels/sections are skipped (with a `warn` for
+  any channel you plausibly expected to apply). The script **never crashes** — a bad
+  file / malformed JSON is a friendly console error and a non-zero `process.exitCode`.
+  It exits non-zero only when a step actually **failed**; "nothing to do" is a no-op
+  success.
+
+The pure `applyProfile` / `parseProfileConfig` / `parseProfileArgs` seams are
+unit-tested in
+[`tests/unit/scripts-configure-profile.test.ts`](../../tests/unit/scripts-configure-profile.test.ts).
+Full detail: [Messenger profile](./messenger-profile.md) and
+[Instagram platform](./instagram-platform.md).
+
+## What's intentionally NOT in scope (the verify scripts)
+
+The verify scripts confirm wiring, not the full runtime. These concerns live in the runtime, not the setup tooling:
+
+- **Outbound message sending beyond a single test message per channel.** The verify scripts call `POST /{phoneNumberId}/messages` (WhatsApp template), `POST /{pageId}/messages` (Messenger reply), and `POST graph.instagram.com/{userId}/messages` (Instagram reply) once each to confirm round-trip wiring. The full `ChannelAdapter` send surface (text, media, typing indicators, reactions, capability gates) lives in the [outbound clients](./outbound-clients.md).
+- **Conversation buffering or chat-endpoint integration.** Captures are written to disk; nothing is dispatched to a chat endpoint or buffered for proactive outreach. The [`ConversationAgent`](./conversation-state.md) and [`ChatClient`](./rich-chat-actions.md) own that path in the runtime.
+- **Status tracking beyond a single delivery confirmation.** The outbound smoke test waits for any `sent` / `delivered` / `read` status to confirm the loop. The persistent [`StatusTracker`](./status-tracking.md) lives in the runtime.
 
 ## Related documents
 
 - [Meta App setup guide](../META-SETUP-GUIDE.md) — go from zero to a populated `.env`.
+- [Messenger profile](./messenger-profile.md) — the `setup:profile` Messenger surfaces (Get Started, persistent menu, ice breakers, greeting).
+- [Instagram platform](./instagram-platform.md) — the `setup:profile` Instagram ice breakers + the comment-to-DM `sendPrivateReply`.
 - [Payload capture](./payload-capture.md) — passive + guided capture tooling.
 - [Webhook security](./webhook-security.md) — the signature verifier the capture server reuses.
 - [Configuration](./configuration.md) — env var reference.

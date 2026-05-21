@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { GraphClient } from '../../src/meta/shared/graph-client.js';
 import { MetaApiError } from '../../src/meta/shared/errors.js';
 import { WhatsAppClient } from '../../src/meta/whatsapp/client.js';
@@ -269,6 +269,389 @@ describe('WhatsAppClient.sendTemplate', () => {
 });
 
 /* ────────────────────────────────────────────────────────────────────────── */
+/* sendImage                                                                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('WhatsAppClient.sendImage', () => {
+  it('sends image:{ id } for a media id (no caption) and parses the wamid', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.IMG1' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client.sendImage('15551234567', 'MEDIA_ID_123');
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const { url, init, body } = callAt(fetchImpl, 0);
+    expect(url).toBe(MESSAGES_URL);
+    expect(init.method).toBe('POST');
+    expect(authHeader(init)).toBe(`Bearer ${ACCESS_TOKEN}`);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'image',
+      image: { id: 'MEDIA_ID_123' }
+    });
+    // No caption key when none was supplied.
+    expect((((body as Record<string, unknown>).image) as Record<string, unknown>).caption).toBeUndefined();
+
+    expect(result.channel).toBe('whatsapp');
+    expect(result.messageId).toBe('wamid.IMG1');
+    expect(result.recipientId).toBe('15551234567');
+  });
+
+  it('sends image:{ link } for an https URL', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.IMG2' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendImage('15551234567', 'https://cdn.example.com/cat.jpg');
+
+    const { body } = callAt(fetchImpl, 0);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'image',
+      image: { link: 'https://cdn.example.com/cat.jpg' }
+    });
+  });
+
+  it('includes the caption when provided', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.IMG3' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendImage('15551234567', 'MEDIA_ID_123', 'a caption');
+
+    const { body } = callAt(fetchImpl, 0);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'image',
+      image: { id: 'MEDIA_ID_123', caption: 'a caption' }
+    });
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* sendAudio                                                                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('WhatsAppClient.sendAudio', () => {
+  it('sends audio:{ id } with NO caption field', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.AUD1' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client.sendAudio('15551234567', 'AUDIO_MEDIA_ID');
+
+    const { url, body } = callAt(fetchImpl, 0);
+    expect(url).toBe(MESSAGES_URL);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'audio',
+      audio: { id: 'AUDIO_MEDIA_ID' }
+    });
+    // WhatsApp audio does not support a caption — make sure we never add one.
+    expect((((body as Record<string, unknown>).audio) as Record<string, unknown>).caption).toBeUndefined();
+    expect(result.messageId).toBe('wamid.AUD1');
+  });
+
+  it('sends audio:{ link } for an http URL', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.AUD2' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendAudio('15551234567', 'http://cdn.example.com/voice.ogg');
+
+    const { body } = callAt(fetchImpl, 0);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'audio',
+      audio: { link: 'http://cdn.example.com/voice.ogg' }
+    });
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* sendVideo                                                                   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('WhatsAppClient.sendVideo', () => {
+  it('sends video:{ link, caption } for a URL with a caption', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.VID1' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client.sendVideo('15551234567', 'https://cdn.example.com/clip.mp4', 'watch this');
+
+    const { url, body } = callAt(fetchImpl, 0);
+    expect(url).toBe(MESSAGES_URL);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'video',
+      video: { link: 'https://cdn.example.com/clip.mp4', caption: 'watch this' }
+    });
+    expect(result.messageId).toBe('wamid.VID1');
+  });
+
+  it('sends video:{ id } with no caption when omitted', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.VID2' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendVideo('15551234567', 'VIDEO_MEDIA_ID');
+
+    const { body } = callAt(fetchImpl, 0);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'video',
+      video: { id: 'VIDEO_MEDIA_ID' }
+    });
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* sendDocument                                                                */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('WhatsAppClient.sendDocument', () => {
+  it('sends document:{ id, filename } (no caption)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.DOC1' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client.sendDocument('15551234567', 'DOC_MEDIA_ID', 'invoice.pdf');
+
+    const { url, body } = callAt(fetchImpl, 0);
+    expect(url).toBe(MESSAGES_URL);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'document',
+      document: { id: 'DOC_MEDIA_ID', filename: 'invoice.pdf' }
+    });
+    expect(result.messageId).toBe('wamid.DOC1');
+  });
+
+  it('sends document:{ link, filename, caption } for a URL with a caption', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.DOC2' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendDocument(
+      '15551234567',
+      'https://cdn.example.com/report.pdf',
+      'report.pdf',
+      'Q2 report'
+    );
+
+    const { body } = callAt(fetchImpl, 0);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'document',
+      document: { link: 'https://cdn.example.com/report.pdf', filename: 'report.pdf', caption: 'Q2 report' }
+    });
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* sendMedia (uniform ChannelAdapter entry point → per-kind body)              */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('WhatsAppClient.sendMedia', () => {
+  it('image → image body with caption', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.M_IMG' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client.sendMedia('15551234567', {
+      kind: 'image',
+      mediaIdOrUrl: 'https://cdn.example.com/cat.jpg',
+      caption: 'a cat'
+    });
+
+    const { url, body } = callAt(fetchImpl, 0);
+    expect(url).toBe(MESSAGES_URL);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'image',
+      image: { link: 'https://cdn.example.com/cat.jpg', caption: 'a cat' }
+    });
+    expect(result.messageId).toBe('wamid.M_IMG');
+  });
+
+  it('audio → audio body and DROPS the caption (WhatsApp audio has none)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.M_AUD' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendMedia('15551234567', {
+      kind: 'audio',
+      mediaIdOrUrl: 'AUDIO_MEDIA_ID',
+      caption: 'should be dropped'
+    });
+
+    const { body } = callAt(fetchImpl, 0);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'audio',
+      audio: { id: 'AUDIO_MEDIA_ID' }
+    });
+    // The caption must NOT have leaked into the audio body.
+    expect(JSON.stringify(body)).not.toContain('should be dropped');
+  });
+
+  it('video → video body with caption', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.M_VID' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendMedia('15551234567', {
+      kind: 'video',
+      mediaIdOrUrl: 'https://cdn.example.com/clip.mp4',
+      caption: 'watch'
+    });
+
+    const { body } = callAt(fetchImpl, 0);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'video',
+      video: { link: 'https://cdn.example.com/clip.mp4', caption: 'watch' }
+    });
+  });
+
+  it('document → document body using the supplied filename + caption', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.M_DOC' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendMedia('15551234567', {
+      kind: 'document',
+      mediaIdOrUrl: 'https://cdn.example.com/x/report.pdf',
+      caption: 'Q2',
+      filename: 'custom.pdf'
+    });
+
+    const { body } = callAt(fetchImpl, 0);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'document',
+      document: { link: 'https://cdn.example.com/x/report.pdf', filename: 'custom.pdf', caption: 'Q2' }
+    });
+  });
+
+  it('document → derives the filename from the URL basename when none is supplied', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.M_DOC2' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendMedia('15551234567', {
+      kind: 'document',
+      mediaIdOrUrl: 'https://cdn.example.com/files/2026/report.pdf?token=abc'
+    });
+
+    const { body } = callAt(fetchImpl, 0);
+    const document = (body as Record<string, unknown>).document as Record<string, unknown>;
+    // Basename of the path (query stripped) is the derived filename.
+    expect(document.filename).toBe('report.pdf');
+    expect(document.link).toBe('https://cdn.example.com/files/2026/report.pdf?token=abc');
+  });
+
+  it('document → falls back to "file" for a bare media id (no URL to derive from)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { messages: [{ id: 'wamid.M_DOC3' }] }));
+    const { client } = makeClient(fetchImpl);
+
+    await client.sendMedia('15551234567', { kind: 'document', mediaIdOrUrl: 'DOC_MEDIA_ID' });
+
+    const { body } = callAt(fetchImpl, 0);
+    expect(body).toEqual({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: '15551234567',
+      type: 'document',
+      document: { id: 'DOC_MEDIA_ID', filename: 'file' }
+    });
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* media send — error path                                                     */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('WhatsAppClient media send — error handling', () => {
+  it('throws MetaApiError on a 400 from sendImage', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(400, {
+        error: {
+          message: 'Invalid media id',
+          type: 'OAuthException',
+          code: 100,
+          fbtrace_id: 'trace-wa-media-400'
+        }
+      })
+    );
+    const { client } = makeClient(fetchImpl);
+
+    let caught: unknown;
+    try {
+      await client.sendImage('15551234567', 'BAD_MEDIA_ID');
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(MetaApiError);
+    const meta = caught as MetaApiError;
+    expect(meta.httpStatus).toBe(400);
+    expect(meta.errorCode).toBe(100);
+    expect(meta.operation).toBe('whatsapp.sendImage');
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* uploadMedia                                                                 */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('WhatsAppClient.uploadMedia', () => {
+  // `uploadMedia` delegates to the shared `uploadWhatsAppMedia`, which uses
+  // `globalThis.fetch` (it builds its own multipart URL outside the GraphClient).
+  // So we stub the global here rather than the GraphClient's injected fetch.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('uploads via /media using the injected apiVersion and returns the id', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { id: 'UPLOADED_MEDIA_ID' }));
+    vi.stubGlobal('fetch', fetchImpl);
+    const graph = new GraphClient({ apiVersion: API_VERSION, sleep: () => Promise.resolve() });
+    const client = new WhatsAppClient({ config: CONFIG, graph, apiVersion: API_VERSION });
+
+    const id = await client.uploadMedia(new Uint8Array([1, 2, 3]), 'image/png', 'pic.png');
+
+    expect(id).toBe('UPLOADED_MEDIA_ID');
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe(`https://graph.facebook.com/${API_VERSION}/${PHONE_NUMBER_ID}/media`);
+    expect(init.body).toBeInstanceOf(FormData);
+    expect((init.body as FormData).get('type')).toBe('image/png');
+    expect((init.body as FormData).get('file')).toBeInstanceOf(Blob);
+  });
+
+  it('throws a clear error when apiVersion was not injected', async () => {
+    const { client } = makeClient(vi.fn());
+    await expect(client.uploadMedia(new Uint8Array([1]), 'image/png')).rejects.toThrow(/apiVersion/);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
 /* Error path                                                                  */
 /* ────────────────────────────────────────────────────────────────────────── */
 
@@ -311,15 +694,16 @@ describe('WhatsAppClient — error handling', () => {
 /* ────────────────────────────────────────────────────────────────────────── */
 
 describe('WhatsAppClient.supports', () => {
-  it('returns the exact Stage 4 capability matrix', () => {
+  it('returns the exact capability matrix', () => {
     const { client } = makeClient(vi.fn());
     expect(client.supports('typing_indicator')).toBe(true);
     expect(client.supports('read_receipt')).toBe(true);
     expect(client.supports('reaction')).toBe(true);
     expect(client.supports('reply_to')).toBe(true);
     expect(client.supports('template')).toBe(true);
-    // Not yet implemented at Stage 4.
-    expect(client.supports('media_send')).toBe(false);
+    // Wired at Stage 7 (sendImage/sendAudio/sendVideo/sendDocument + uploadMedia).
+    expect(client.supports('media_send')).toBe(true);
+    // Messenger/Instagram-only profile surfaces — not applicable to WhatsApp.
     expect(client.supports('persistent_menu')).toBe(false);
     expect(client.supports('get_started')).toBe(false);
     expect(client.supports('ice_breakers')).toBe(false);

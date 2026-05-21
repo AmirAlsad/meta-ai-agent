@@ -19,6 +19,7 @@ import type { ChatRequest, NormalizedChatResponse } from '../../src/chat/types.j
 import type {
   ChannelAdapter,
   ChannelFeature,
+  MediaSendInput,
   SendResult
 } from '../../src/meta/shared/adapter.js';
 import type { Channel, IncomingMessage, StatusUpdate } from '../../src/meta/types.js';
@@ -78,6 +79,7 @@ interface FakeAdapter extends ChannelAdapter {
   sendTypingIndicator: ReturnType<typeof vi.fn>;
   markRead: ReturnType<typeof vi.fn>;
   sendReaction: ReturnType<typeof vi.fn>;
+  sendMedia: ReturnType<typeof vi.fn>;
   sendTemplate?: ReturnType<typeof vi.fn>;
 }
 
@@ -86,7 +88,11 @@ let messageIdCounter = 0;
 function makeAdapter(
   channel: Channel,
   supports: (f: ChannelFeature) => boolean,
-  opts: { template?: boolean } = {}
+  opts: {
+    template?: boolean;
+    /** When set, `sendMedia` uses this implementation (e.g. to throw for an IG document). */
+    sendMedia?: (recipientId: string, input: MediaSendInput) => Promise<SendResult>;
+  } = {}
 ): FakeAdapter {
   const sendResult = (recipientId: string): SendResult => ({
     channel,
@@ -100,7 +106,10 @@ function makeAdapter(
     sendText: vi.fn(async (recipientId: string) => sendResult(recipientId)),
     sendTypingIndicator: vi.fn(async () => undefined),
     markRead: vi.fn(async () => undefined),
-    sendReaction: vi.fn(async () => undefined)
+    sendReaction: vi.fn(async () => undefined),
+    sendMedia: vi.fn(
+      opts.sendMedia ?? (async (recipientId: string, _input: MediaSendInput) => sendResult(recipientId))
+    )
   };
   if (opts.template) {
     adapter.sendTemplate = vi.fn(async (recipientId: string) => sendResult(recipientId));
@@ -558,6 +567,351 @@ describe('ConversationAgent', () => {
     await flushBuffer();
 
     expect(h.adapters.messenger!.sendText).toHaveBeenCalledWith('fb-user', 'threaded', { replyTo: 'wamid.parent' });
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Stage 8: postback / referral routing                                     */
+  /*                                                                          */
+  /* WHY these tests exist (and add NO routing code): postback + referral are */
+  /* just IncomingMessage variants. handleInbound buffers EVERY type and      */
+  /* flush ships the whole batch in ChatRequest.messages[] — there is no       */
+  /* special path. These tests PROVE the structured payload reaches the chat   */
+  /* endpoint intact, so a future change that accidentally drops a non-text    */
+  /* type (e.g. a text-only buffer guard, or an over-broad echo filter) fails  */
+  /* here.                                                                     */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  describe('postback / referral reach the chat endpoint (Stage 8)', () => {
+    it('postback inbound → ChatRequest.messages[0] carries type:postback + payload', async () => {
+      const h = makeHarness({ responses: [textResponse('welcome!')] });
+
+      await h.agent.handleInbound(
+        inbound({
+          channel: 'messenger',
+          channelMessageId: 'm_pb1',
+          channelScopedUserId: 'fb-user',
+          type: 'postback',
+          // A Get Started / button postback carries no free text — only the
+          // structured payload. Drop `text` to mirror the real shape.
+          text: undefined,
+          postback: { title: 'Get Started', payload: 'GET_STARTED_PAYLOAD' }
+        })
+      );
+      await flushBuffer();
+
+      // The chat client was actually called with the postback in messages[].
+      expect(h.chat.complete).toHaveBeenCalledTimes(1);
+      const req = h.chat.calls[0]!;
+      expect(req.messages).toHaveLength(1);
+      const m = req.messages[0]!;
+      expect(m.type).toBe('postback');
+      expect(m.postback).toEqual({ title: 'Get Started', payload: 'GET_STARTED_PAYLOAD' });
+      // The endpoint replied → its action was dispatched to the adapter.
+      expect(h.adapters.messenger!.sendText).toHaveBeenCalledWith('fb-user', 'welcome!');
+    });
+
+    it('referral inbound → ChatRequest.messages[] carries the referral with its ref', async () => {
+      const h = makeHarness({ responses: [textResponse('thanks for clicking')] });
+
+      await h.agent.handleInbound(
+        inbound({
+          channel: 'messenger',
+          channelMessageId: 'm_ref1',
+          channelScopedUserId: 'fb-user',
+          type: 'referral',
+          text: undefined,
+          referral: { source: 'ADS', type: 'OPEN_THREAD', ref: 'my_ref' }
+        })
+      );
+      await flushBuffer();
+
+      expect(h.chat.complete).toHaveBeenCalledTimes(1);
+      const req = h.chat.calls[0]!;
+      expect(req.messages).toHaveLength(1);
+      const m = req.messages[0]!;
+      expect(m.type).toBe('referral');
+      expect(m.referral).toEqual({ source: 'ADS', type: 'OPEN_THREAD', ref: 'my_ref' });
+    });
+
+    it('a text-less postback still flushes (turn not dropped for empty aggregated text)', async () => {
+      // The buffer aggregates the structured message; the backward-compat
+      // `message` string is empty (no text), but the turn MUST still flush and
+      // carry the postback in messages[]. This guards against a "drop empty
+      // turns" regression.
+      const h = makeHarness({ responses: [textResponse('hi')] });
+
+      await h.agent.handleInbound(
+        inbound({
+          channel: 'messenger',
+          channelMessageId: 'm_pb_empty',
+          channelScopedUserId: 'fb-user',
+          type: 'postback',
+          text: undefined,
+          postback: { payload: 'NO_TEXT_PAYLOAD' }
+        })
+      );
+      await flushBuffer();
+
+      expect(h.chat.complete).toHaveBeenCalledTimes(1);
+      const req = h.chat.calls[0]!;
+      // Aggregated text is empty (no `text` on the postback) ...
+      expect(req.message).toBe('');
+      // ... but the structured postback survived and reached the endpoint.
+      expect(req.messages).toHaveLength(1);
+      expect(req.messages[0]!.type).toBe('postback');
+      expect(req.messages[0]!.postback).toEqual({ payload: 'NO_TEXT_PAYLOAD' });
+    });
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Stage 7: media dispatch                                                  */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  describe('media dispatch (Stage 7)', () => {
+    /** Messenger supports + media_send (so a media action survives buildOutboundItems). */
+    const messengerWithMedia = (f: ChannelFeature): boolean =>
+      f === 'media_send' || messengerSupports(f);
+
+    it('media action → adapter.sendMedia called with inferred kind + url + caption (on_send advances)', async () => {
+      // Messenger is on_send: the queue advances on the send response, so after
+      // one flush the conversation reaches idle.
+      const adapter = makeAdapter('messenger', messengerWithMedia);
+      const h = makeHarness({
+        responses: [
+          {
+            actions: [
+              {
+                type: 'media',
+                url: 'https://cdn.example.com/cat.jpg',
+                caption: 'a cat',
+                mimeType: 'image/jpeg'
+              }
+            ]
+          }
+        ],
+        adapters: { messenger: adapter },
+        withMetrics: true
+      });
+
+      await h.agent.handleInbound(
+        inbound({ channel: 'messenger', channelMessageId: 'm_med1', channelScopedUserId: 'fb-user' })
+      );
+      await flushBuffer();
+
+      expect(adapter.sendMedia).toHaveBeenCalledTimes(1);
+      // image/jpeg → kind 'image'; url + caption threaded through; no filename.
+      expect(adapter.sendMedia).toHaveBeenCalledWith('fb-user', {
+        kind: 'image',
+        mediaIdOrUrl: 'https://cdn.example.com/cat.jpg',
+        caption: 'a cat'
+      });
+
+      // on_send: the queue advanced and the conversation is idle.
+      const record = await h.store.getConversation('messenger:biz-1:fb-user');
+      expect(record!.state).toBe('idle');
+      expect(record!.currentOutboundIndex).toBe(1);
+
+      // The send metric is recorded with operation 'media:image'.
+      expect(
+        counterValue(h.collector!, 'outbound_send_total', {
+          channel: 'messenger',
+          operation: 'media:image',
+          result: 'success',
+          error_code: 'none'
+        })
+      ).toBe(1);
+      expect(
+        histogramCount(h.collector!, 'outbound_send_duration_seconds', {
+          channel: 'messenger',
+          operation: 'media:image'
+        })
+      ).toBe(1);
+    });
+
+    it('threads a document filename through to sendMedia (kind document)', async () => {
+      const adapter = makeAdapter('messenger', messengerWithMedia);
+      const h = makeHarness({
+        responses: [
+          {
+            actions: [
+              {
+                type: 'media',
+                url: 'https://cdn.example.com/report.pdf',
+                mimeType: 'application/pdf',
+                filename: 'q2-report.pdf'
+              }
+            ]
+          }
+        ],
+        adapters: { messenger: adapter }
+      });
+
+      await h.agent.handleInbound(
+        inbound({ channel: 'messenger', channelMessageId: 'm_med2', channelScopedUserId: 'fb-user' })
+      );
+      await flushBuffer();
+
+      // application/pdf → kind 'document'; filename carried through.
+      expect(adapter.sendMedia).toHaveBeenCalledWith('fb-user', {
+        kind: 'document',
+        mediaIdOrUrl: 'https://cdn.example.com/report.pdf',
+        filename: 'q2-report.pdf'
+      });
+    });
+
+    it('IG document: sendMedia is called with kind document and SENT (on_send advances, success counted)', async () => {
+      // Instagram now supports documents (sent as a `file`/PDF attachment), so a
+      // document media item is dispatched like any other: sendMedia is called with
+      // kind 'document', the on_send queue advances, and the send is counted as a
+      // success — NOT skipped via a throw.
+      const igMedia = (f: ChannelFeature): boolean =>
+        f === 'media_send' || f === 'typing_indicator' || f === 'reaction';
+      const adapter = makeAdapter('instagram', igMedia);
+      const h = makeHarness({
+        responses: [
+          {
+            actions: [
+              {
+                type: 'media',
+                url: 'https://cdn.example.com/report.pdf',
+                mimeType: 'application/pdf',
+                filename: 'q2-report.pdf'
+              },
+              { type: 'message', text: 'after the doc' }
+            ]
+          }
+        ],
+        adapters: { instagram: adapter },
+        withMetrics: true
+      });
+
+      await h.agent.handleInbound(
+        inbound({ channel: 'instagram', channelMessageId: 'ig_med1', channelScopedUserId: 'ig-user' })
+      );
+      await flushBuffer();
+
+      // The document was SENT (kind 'document', filename threaded through), and
+      // the following message also sent.
+      expect(adapter.sendMedia).toHaveBeenCalledTimes(1);
+      expect(adapter.sendMedia).toHaveBeenCalledWith('ig-user', {
+        kind: 'document',
+        mediaIdOrUrl: 'https://cdn.example.com/report.pdf',
+        filename: 'q2-report.pdf'
+      });
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(adapter.sendText).toHaveBeenCalledWith('ig-user', 'after the doc');
+
+      // on_send: the queue advanced past both items → idle, and the media item was
+      // NOT skipped.
+      const key = 'instagram:biz-1:ig-user';
+      const record = await h.store.getConversation(key);
+      expect(record!.state).toBe('idle');
+      expect(record!.currentOutboundIndex).toBe(2);
+      const mediaItem = record!.outboundQueue[0]!;
+      expect(mediaItem.kind).toBe('media');
+      expect(mediaItem.skippedAt).toBeUndefined();
+      expect(mediaItem.skipReason).toBeUndefined();
+
+      // The send is counted as a SUCCESS for operation 'media:document'.
+      expect(
+        counterValue(h.collector!, 'outbound_send_total', {
+          channel: 'instagram',
+          operation: 'media:document',
+          result: 'success',
+          error_code: 'none'
+        })
+      ).toBe(1);
+    });
+
+    it('media send that Meta rejects: sendMedia throws → item skipped, queue advances, error counted', async () => {
+      // Repoints the former IG-document skip-via-catch test to a still-throwing
+      // path (a fake adapter whose sendMedia throws), so the agent's fail-soft
+      // catch — skip the item, advance, count an error — stays covered without
+      // relying on IG documents (which now send).
+      const igMedia = (f: ChannelFeature): boolean =>
+        f === 'media_send' || f === 'typing_indicator' || f === 'reaction';
+      const adapter = makeAdapter('instagram', igMedia, {
+        sendMedia: async () => {
+          // A non-MetaApiError throw hits the agent's `: 'other'` error_code branch.
+          throw new Error('media rejected by Meta');
+        }
+      });
+      const h = makeHarness({
+        responses: [
+          {
+            actions: [
+              { type: 'media', url: 'https://cdn.example.com/report.pdf', mimeType: 'application/pdf' },
+              { type: 'message', text: 'after the doc' }
+            ]
+          }
+        ],
+        adapters: { instagram: adapter },
+        withMetrics: true
+      });
+
+      await h.agent.handleInbound(
+        inbound({ channel: 'instagram', channelMessageId: 'ig_med_reject', channelScopedUserId: 'ig-user' })
+      );
+      await flushBuffer();
+
+      // sendMedia was attempted and threw; the following message still sent.
+      expect(adapter.sendMedia).toHaveBeenCalledTimes(1);
+      expect(adapter.sendText).toHaveBeenCalledWith('ig-user', 'after the doc');
+
+      // The queue advanced past both items → idle; the media item is marked skipped.
+      const key = 'instagram:biz-1:ig-user';
+      const record = await h.store.getConversation(key);
+      expect(record!.state).toBe('idle');
+      expect(record!.currentOutboundIndex).toBe(2);
+      const mediaItem = record!.outboundQueue[0]!;
+      expect(mediaItem.skippedAt).toBeDefined();
+
+      // The failed send is counted as an error for operation 'media:document'.
+      expect(
+        counterValue(h.collector!, 'outbound_send_total', {
+          channel: 'instagram',
+          operation: 'media:document',
+          result: 'error',
+          error_code: 'other'
+        })
+      ).toBe(1);
+    });
+
+    it('WhatsApp (on_status): a media send waits for a delivery status to advance', async () => {
+      // WhatsApp is on_status — a media send (with a real id) is treated like a
+      // text send: the queue holds until a delivery/sent status arrives.
+      const waMedia = (f: ChannelFeature): boolean =>
+        f === 'media_send' || whatsappSupports(f);
+      const adapter = makeAdapter('whatsapp', waMedia, { template: true });
+      const h = makeHarness({
+        responses: [
+          { actions: [{ type: 'media', url: 'https://cdn.example.com/clip.mp4', mimeType: 'video/mp4' }] }
+        ],
+        adapters: { whatsapp: adapter }
+      });
+
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.med1' }));
+      await flushBuffer();
+
+      expect(adapter.sendMedia).toHaveBeenCalledTimes(1);
+      expect(adapter.sendMedia).toHaveBeenCalledWith('user-1', {
+        kind: 'video',
+        mediaIdOrUrl: 'https://cdn.example.com/clip.mp4'
+      });
+
+      const key = 'whatsapp:biz-1:user-1';
+      const waiting = await h.store.getConversation(key);
+      // on_status: still sending, holding the in-flight media handle.
+      expect(waiting!.state).toBe('sending');
+      const mediaId = (await (adapter.sendMedia.mock.results[0]!.value as Promise<SendResult>)).messageId;
+      expect(waiting!.currentOutboundMessageId).toBe(mediaId);
+
+      // A delivery status releases the queue → idle.
+      await h.agent.handleStatus(status(mediaId, 'delivered'));
+      const done = await h.store.getConversation(key);
+      expect(done!.state).toBe('idle');
+      expect(done!.currentOutboundIndex).toBe(1);
+    });
   });
 
   it('typing injection: when enabled+supported, sendTypingIndicator is called before sendText', async () => {

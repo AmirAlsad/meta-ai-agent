@@ -5,7 +5,7 @@
 Two capture modes for collecting real Meta webhook payloads:
 
 - **Passive (`fixture-capture`)** — "leave it running, see what arrives". Boots a tunnel + capture server, optionally registers webhooks, and writes every inbound webhook to disk with parser output and signature validity attached. Useful for discovering payload variants without a script in front of the developer.
-- **Guided (`guided-capture`)** — interactive scenario walker. Prints a per-scenario prompt ("Send an image now"), waits for a webhook matching that scenario's predicate, saves it with the scenario name baked into the filename and a self-describing JSON wrapper, advances to the next scenario. The output is the raw material for the `tests/fixtures/captured/` corpus that future stages will replay against the parser and (later) the conversation agent.
+- **Guided (`guided-capture`)** — interactive scenario walker. Prints a per-scenario prompt ("Send an image now"), waits for a webhook matching that scenario's predicate, saves it with the scenario name baked into the filename and a self-describing JSON wrapper, advances to the next scenario. The output is the raw material for the `tests/fixtures/captured/` corpus replayed against the parser in [`tests/unit/parser-captured.test.ts`](../../tests/unit/parser-captured.test.ts) (and, later, against the conversation agent).
 
 Both modes mount a separate Express app from the production runtime ([`scripts/lib/capture-server.ts`](../../scripts/lib/capture-server.ts)). The capture server mirrors production signature middleware so app-secret typos still fail fast, but it never dispatches to the conversation agent — captures are side-effect-free.
 
@@ -111,7 +111,7 @@ Captures may contain personal data (phone numbers, IGSIDs, PSIDs, profile names,
 
 **Always manually redact before promoting captures into `tests/fixtures/meta/{channel}/captured/`.**
 
-## Stage 3+ workflow for fixture refresh
+## Workflow for fixture refresh
 
 1. **Capture.** Run `npm run setup:<channel>` (which also captures key payloads as part of verification) or `npm run capture:guided -- --channel=<x>` and walk through the scenarios.
 2. **Inspect.** Open the JSON files under `.captures/meta/{channel}/`. Compare against the documentation-derived fixtures in `tests/fixtures/meta/{channel}/`. Look for new fields, renamed fields, undocumented additions — Meta payloads regularly drift from published examples.

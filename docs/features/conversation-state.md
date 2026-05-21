@@ -1,4 +1,4 @@
-# Conversation state (Stage 5)
+# Conversation state
 
 The conversation layer is the orchestrator that sits between the inbound parser
 and the outbound send clients. It owns one record per (channel, business, user)
@@ -68,7 +68,8 @@ is `channelScopedUserId`
 There is **no cross-channel merge at this layer.** Meta does not link `wa_id`,
 PSID, and IGSID, so the same human reaching the business on WhatsApp and on
 Instagram is two separate records. Joining them is an explicit app decision left
-to the identity resolver (Stage 6 — see [Known gaps](../KNOWN-GAPS.md)). Because
+to the [identity resolver](./identity-resolution.md) (via the
+`unifiedContactId` its `USER_LOOKUP_URL` returns). Because
 the user side is always normalized to the user (echoes are unflipped at the
 parser boundary), the key is stable regardless of message direction.
 
@@ -85,11 +86,11 @@ The record is the unit the store persists and the agent mutates
 | `outboundQueue` | Ordered `OutboundItem`s produced from the chat response. |
 | `currentOutboundIndex` | Cursor into `outboundQueue` for the in-flight item. |
 | `currentOutboundMessageId` | Channel message id of the in-flight outbound, for status correlation (set only while WhatsApp waits on a status). |
-| `deliveredMessageIds` | Channel message ids confirmed sent/delivered (observability; full history is Stage 6). |
+| `deliveredMessageIds` | Channel message ids confirmed sent/delivered (observability; the full per-message status history lives in the [status tracker](./status-tracking.md)). |
 | `lastInboundMessageId` | Channel message id of the MOST RECENT inbound. WhatsApp's typing indicator is anchored to an inbound `wamid` (typing is coupled with mark-read), so the agent threads outbound typing back to it. |
 | `lastInboundAt`, `lastOutboundAt`, `lastActivity` | Activity timestamps (Unix ms). |
 | `windowExpiresAt` | Unix ms the 24h messaging window closes (`lastInboundAt + 24h`). |
-| `contact` | Resolved identity, when available. Undefined in Stage 5 (no identity resolver yet). |
+| `contact` | Resolved identity, when available. Populated by the [identity resolver](./identity-resolution.md) when `USER_LOOKUP_URL` is configured; otherwise undefined. |
 | `traceId` | Request-scoped trace id captured at the inbound webhook entry. |
 
 `createIdleConversation(...)` builds a fresh record with empty buffers/queues and
@@ -132,7 +133,7 @@ set and strictly in the future (an unset value — no inbound seen yet — is tr
 as CLOSED).
 
 The flag is surfaced to the chat endpoint as `context.windowOpen` in the
-`ChatRequest` (see [Rich chat actions](./rich-chat-actions.md)). Stage 5 only
+`ChatRequest` (see [Rich chat actions](./rich-chat-actions.md)). The agent
 *tracks and reports* the window; full enforcement (blocking out-of-window sends
 or forcing a WhatsApp template fallback) is Stage 10 — see
 [Known gaps](../KNOWN-GAPS.md).
@@ -245,11 +246,12 @@ Buffer-timing knobs are documented in [Message buffering](./message-buffering.md
 
 ## Known limitations
 
-- No identity resolution — `contact` is always undefined (Stage 6).
-- No metrics — the scheduler's failure catch is a TODO for Stage 6.
 - No persistence — in-memory store/scheduler only (Stage 10).
 - No rate limiting and no out-of-window enforcement (Stage 10).
-- Media actions are skipped (Stage 7).
+- The scheduler's own `setTimeout` failure catch is still uncounted at the
+  scheduler level (the flush itself is instrumented via
+  `buffer_flush_total{result:'error'}` at the agent level — see
+  [Message buffering](./message-buffering.md)).
 
 See [Known gaps](../KNOWN-GAPS.md) for the full deferral list and
 [Architecture](../ARCHITECTURE.md) for where this layer sits in the runtime.

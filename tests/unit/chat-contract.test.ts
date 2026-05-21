@@ -123,6 +123,24 @@ describe('normalizeChatResponse — rich actions passthrough', () => {
     expect(normalizeChatResponse({ actions: [action] })).toEqual({ actions: [action] });
   });
 
+  it('threads a media action filename through (documents)', () => {
+    const action: ChatAction = {
+      type: 'media',
+      url: 'https://x/report.pdf',
+      mimeType: 'application/pdf',
+      filename: 'q2-report.pdf'
+    };
+    expect(normalizeChatResponse({ actions: [action] })).toEqual({ actions: [action] });
+  });
+
+  it('ignores a non-string media filename but keeps the rest of the action', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'media', url: 'https://x/y.jpg', filename: 123 }]
+    });
+    // A bad filename does not invalidate the action — it is simply dropped.
+    expect(result).toEqual({ actions: [{ type: 'media', url: 'https://x/y.jpg' }] });
+  });
+
   it('passes a template action through with components', () => {
     const action: ChatAction = {
       type: 'template',
