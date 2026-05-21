@@ -1213,6 +1213,13 @@ export class ConversationAgent {
         if (sentItem) {
           sentItem.channelMessageId = sentMessageId;
           sentItem.sentAt = this.now();
+          // ROOT-CAUSE clear (double-send safety): once an item has SENT, drop its
+          // transient-retry bookkeeping so a later boot recovery can never mistake a
+          // successfully-sent item (e.g. a WhatsApp item awaiting its status) for a
+          // pending retry and re-send it. Pairs with the `channelMessageId === undefined`
+          // guard in recoverPendingRetries (B1) as defense-in-depth.
+          delete sentItem.retryCount;
+          delete sentItem.nextRetryAt;
         }
         await this.store.setConversation(after);
       }
@@ -1593,7 +1600,17 @@ export class ConversationAgent {
           // (B1) `sending` mid-retry — re-arm the transient-retry timer (claim-guarded,
           // scoped to THIS attempt {key}:{itemId}:{retryCount} so a later restart with
           // a new attempt claims a fresh token).
-          if (item.nextRetryAt !== undefined && (item.retryCount ?? 0) > 0) {
+          //
+          // LOAD-BEARING `channelMessageId === undefined` guard (double-send safety):
+          // re-arm a transient retry (which RE-SENDS) ONLY for an item that was NOT yet
+          // sent. `channelMessageId` is set only AFTER a successful send. A retry whose
+          // send already SUCCEEDED — then sat awaiting a WhatsApp status when the process
+          // died — still carries `retryCount`/`nextRetryAt` (sendNext clears them on
+          // success, but a record persisted by an older build, or any gap, could retain
+          // them). Without this guard B1 would match and re-send it (DOUBLE-SEND), and
+          // B2 (the safe delivery-timeout re-arm) would never be reached. With it, an
+          // already-sent item falls through to B2 instead.
+          if (item.nextRetryAt !== undefined && (item.retryCount ?? 0) > 0 && item.channelMessageId === undefined) {
             // Compute remainingMs BEFORE the claim so it drives the claim TTL too:
             // expire the claim shortly after the retry would have fired (+grace), so a
             // crashed claimer doesn't block re-recovery for the conversation lifetime.

@@ -2945,6 +2945,59 @@ describe('ConversationAgent', () => {
       expect(adapter.sendText).toHaveBeenCalledWith('wa-user', 'second');
       await agent.close();
     });
+
+    it('recoverPendingRetries: a SENT WhatsApp item with STALE retry fields is NOT re-sent (B1 guard → B2)', async () => {
+      // Double-send regression: a WhatsApp item that was retried, SUCCEEDED
+      // (channelMessageId set), then crashed awaiting its status could still carry
+      // retryCount/nextRetryAt. B1 must NOT match (that would RE-SEND it); the
+      // `channelMessageId === undefined` guard sends it to B2 (delivery-timeout
+      // re-arm), which advances past the already-sent item without re-sending.
+      const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const agent = new ConversationAgent({
+        store,
+        scheduler: new InMemoryBufferScheduler(),
+        chatClient: makeChatClient([textResponse('unused')]),
+        adapters: { whatsapp: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined,
+        limitTracker: makeLimitTracker()
+      });
+
+      await store.setConversation({
+        ...createIdleConversation({
+          key: 'whatsapp:biz-1:wa-user',
+          channel: 'whatsapp',
+          channelScopedUserId: 'wa-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'sending',
+        outboundQueue: [
+          // SENT (channelMessageId set) but still carrying stale retry bookkeeping.
+          { id: 'item-0', kind: 'message', text: 'first', channelMessageId: 'wamid.sent', sentAt: FIXED_NOW, retryCount: 1, nextRetryAt: FIXED_NOW - 1000 },
+          { id: 'item-1', kind: 'message', text: 'second' }
+        ],
+        currentOutboundIndex: 0,
+        currentOutboundMessageId: 'wamid.sent',
+        lastInboundMessageId: 'wamid.in'
+      });
+
+      const result = await agent.recoverPendingRetries();
+      // B1 was skipped (item already sent) → B2 re-armed the delivery timeout instead.
+      expect(result.transientRetriesResumed).toBe(0);
+      expect(result.deliveryTimeoutsRearmed).toBe(1);
+      expect(adapter.sendText).not.toHaveBeenCalled(); // item0 NOT re-sent
+
+      // The fallback advances past the already-sent item0 and sends only item1.
+      await vi.advanceTimersByTimeAsync(makeConfig().conversation.outboundDeliveryTimeoutMs);
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(adapter.sendText).toHaveBeenCalledWith('wa-user', 'second');
+      await agent.close();
+    });
   });
 });
 
