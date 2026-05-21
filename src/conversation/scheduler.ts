@@ -239,7 +239,23 @@ export class BullMqBufferScheduler implements BufferScheduler {
 
   async cancel(conversationKey: string): Promise<void> {
     const job = await this.queue.getJob(this.jobId(conversationKey));
-    if (job) await job.remove();
+    if (!job) return;
+    try {
+      await job.remove();
+    } catch (err) {
+      // RACE: BullMQ throws if the job is ACTIVE (the worker picked up the delayed
+      // job between getJob and remove). This is reachable when a concurrent inbound
+      // calls schedule()→cancel() in the narrow gap before the agent lock flips the
+      // record out of `buffering`. Swallow it: the in-flight flush proceeds on the
+      // existing schedule and the new message is already in the buffer, so the
+      // conversation makes forward progress either way — only the burst-window
+      // extension is skipped. (A non-active remove failure is equally non-fatal
+      // here — the next schedule() will re-cancel.)
+      this.logger?.debug(
+        { err, conversationKey },
+        'bullmq cancel: job.remove() failed (likely active); proceeding'
+      );
+    }
   }
 
   async close(): Promise<void> {
