@@ -47,6 +47,7 @@ import type {
   ChannelFeature,
   TemplateComponent
 } from '../meta/shared/adapter.js';
+import { inferMediaKind } from '../meta/shared/media.js';
 import type { Channel, IncomingMessage, StatusUpdate } from '../meta/types.js';
 import type { WhatsAppClient } from '../meta/whatsapp/client.js';
 import type { AgentMetrics } from '../metrics/registry.js';
@@ -608,9 +609,13 @@ export class ConversationAgent {
     }
 
     let sendResult: { messageId: string } | undefined;
+    // The histogram/counter `operation` label distinguishes text vs. reaction vs.
+    // template vs. media latency. For media we refine it to `media:<kind>`
+    // (e.g. `media:image`) so the per-kind send is visible; everything else uses
+    // the bare item kind.
+    let operation: string = item.kind;
     // Time each adapter (Meta Graph API) call; injectable clock keeps it
-    // deterministic in tests. `operation` is the item kind so the histogram
-    // distinguishes text vs. reaction vs. template latency.
+    // deterministic in tests.
     const sendT0 = this.now();
     try {
       switch (item.kind) {
@@ -653,26 +658,53 @@ export class ConversationAgent {
           }
           break;
         }
-        case 'media':
+        case 'media': {
+          // Defensive: buildOutboundItems always sets mediaUrl from the action's
+          // url (a non-empty string), but guard against a malformed item rather
+          // than sending an empty reference.
+          if (item.mediaUrl === undefined) {
+            logger.warn({ conversationKey: key, kind: item.kind }, 'media item missing mediaUrl; skipping');
+            break;
+          }
+          // Infer the send-kind from the MIME (image/audio/video/document; a
+          // missing/unknown MIME → document). The uniform adapter.sendMedia routes
+          // it to the right per-channel method WITHOUT any channel branching here.
+          const kind = inferMediaKind(item.mediaMimeType);
+          operation = `media:${kind}`;
+          // WHY no channel/kind guard before this call: every channel implements
+          // sendMedia for all kinds (Instagram now sends documents as a `file`
+          // attachment too), so the agent stays channel-agnostic. If a particular
+          // send is rejected by Meta (e.g. an IG `file` that isn't a PDF, or an
+          // oversized asset), adapter.sendMedia throws and the per-item catch
+          // below turns it into a skip+advance (fail-soft) — the same path as any
+          // other send error, so a bad item never crashes or wedges the queue.
+          sendResult = await adapter.sendMedia(userId, {
+            kind,
+            mediaIdOrUrl: item.mediaUrl,
+            ...(item.mediaCaption !== undefined ? { caption: item.mediaCaption } : {}),
+            ...(item.mediaFilename !== undefined ? { filename: item.mediaFilename } : {})
+          });
+          break;
+        }
         case 'silence':
         default:
-          // media is filtered until Stage 7; silence never produces an item.
-          // Either appearing here is unexpected — skip rather than crash.
+          // silence never produces an item; an unknown kind is unexpected — skip
+          // rather than crash.
           logger.warn({ conversationKey: key, kind: item.kind }, 'unexpected outbound item kind; skipping');
           break;
       }
       // The send returned (or was a benign no-op skip). Record success — for the
-      // no-op skip kinds (media/silence/unhandled) the adapter call didn't run,
-      // but counting them as a zero-latency success keeps the metric simple and
-      // these kinds don't reach here in normal Stage 6 flows anyway.
+      // no-op skip kinds (silence/unhandled, or a defensive media skip) the
+      // adapter call didn't run, but counting them as a zero-latency success keeps
+      // the metric simple and those kinds don't reach here in normal flows.
       this.metrics?.outboundSendTotal.inc({
         channel: record.channel,
-        operation: item.kind,
+        operation,
         result: 'success',
         error_code: 'none'
       });
       this.metrics?.outboundSendDuration.observe(
-        { channel: record.channel, operation: item.kind },
+        { channel: record.channel, operation },
         (this.now() - sendT0) / 1000
       );
     } catch (error) {
@@ -680,7 +712,7 @@ export class ConversationAgent {
       const errorCode = error instanceof MetaApiError ? normalizeErrorCodeLabel(error.errorCode) : 'other';
       this.metrics?.outboundSendTotal.inc({
         channel: record.channel,
-        operation: item.kind,
+        operation,
         result: 'error',
         error_code: errorCode
       });
@@ -740,12 +772,14 @@ export class ConversationAgent {
     const fireAndForget = item.kind === 'reaction' || item.kind === 'typing';
 
     if (fireAndForget || sentMessageId === undefined) {
-      // sentMessageId === undefined => media/silence/skipped-template (no result).
+      // sentMessageId === undefined => silence/skipped-template/defensive-media-skip
+      // (no send result). A media item that DID send has a real id and falls
+      // through to the message/reply/template path below.
       await this.advanceAndContinue(key, undefined, traceId);
       return;
     }
 
-    // message / reply / template with a real send result:
+    // message / reply / template / media with a real send result:
     if (advancementMode(record.channel) === 'on_send') {
       // Messenger/Instagram: no per-message delivery webhook, so the send API
       // response is the only confirmation — advance now.

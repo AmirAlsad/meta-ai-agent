@@ -43,6 +43,8 @@ export interface OutboundItem {
   mediaUrl?: string;
   mediaCaption?: string;
   mediaMimeType?: string;
+  /** Document filename hint (used by `kind: 'media'` when the kind is a document). */
+  mediaFilename?: string;
   templateName?: string;
   templateLanguage?: string;
   /**

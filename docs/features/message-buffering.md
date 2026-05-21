@@ -1,4 +1,4 @@
-# Message buffering (Stage 5)
+# Message buffering
 
 People send messages in bursts — three quick lines instead of one paragraph.
 Calling the chat endpoint once per line produces three disjointed replies and
@@ -97,11 +97,11 @@ chat call` asserts both forms: `messages` holds both entries in order and
 
 `BufferScheduler`
 ([`src/conversation/scheduler.ts`](../../src/conversation/scheduler.ts)) is the
-interface that arms the per-conversation flush timer. Stage 5 ships
+interface that arms the per-conversation flush timer. The runtime ships
 `InMemoryBufferScheduler` (setTimeout-based, single-process). The Redis-backed
 `'bullmq'` implementation is Stage 10; `kind` (`'in_memory' | 'bullmq'`) and
-`getStats()` exist now so the future `/ready` route and the BullMQ impl share one
-shape.
+`getStats()` are wired into the `/ready` route now so it and the BullMQ impl
+share one shape.
 
 Behavior of the in-memory scheduler:
 
@@ -111,11 +111,14 @@ Behavior of the in-memory scheduler:
   conversation.
 - **Trace propagation.** The trace id captured when the flush was last scheduled
   is stored per key and passed to the handler when it fires, so the flush
-  correlates back to the originating inbound (trace middleware is Stage 6, so
-  this is undefined for now).
+  correlates back to the originating inbound. The trace middleware stamps that id
+  at the webhook boundary and the agent threads it through, so a flush's log lines
+  chain back to the triggering inbound.
 - **Swallowed rejections.** A timer-fired handler that rejects is caught and
-  dropped so an unhandled rejection can't crash the process. Stage 6 wires
-  metrics/logging into that catch.
+  dropped so an unhandled rejection can't crash the process. The flush itself is
+  instrumented at the agent level (`buffer_flush_total{result:'error'}`); the
+  scheduler's own `setTimeout` catch remains uncounted at the scheduler level (a
+  minor recorded gap).
 - **Clean shutdown.** `close()` clears every pending timer so no dangling handle
   keeps the event loop (and the process) alive.
 
@@ -146,11 +149,11 @@ for the lock itself.
 ## Testing
 
 [`tests/unit/conversation-buffering.test.ts`](../../tests/unit/conversation-buffering.test.ts)
-(10 tests) drives `calculateBufferTimeout` with an injected `random` so the
+drives `calculateBufferTimeout` with an injected `random` so the
 growth curve, the cap, the zero-noise short-circuit, and the jitter clamp bounds
 are all deterministic.
 [`tests/unit/conversation-scheduler.test.ts`](../../tests/unit/conversation-scheduler.test.ts)
-(11 tests) covers reschedule-replaces-timer, trace propagation, the
+covers reschedule-replaces-timer, trace propagation, the
 `delayMs <= 0` inline path, and `close()` cleanup. The aggregation behavior is
 proven end-to-end with `vi.useFakeTimers()` in
 [`tests/integration/end-to-end-flow.test.ts`](../../tests/integration/end-to-end-flow.test.ts).
@@ -159,6 +162,7 @@ proven end-to-end with `vi.useFakeTimers()` in
 
 - In-memory scheduler only; timers are per-process and lost on restart. BullMQ is
   Stage 10.
-- The scheduler's failure catch logs nothing yet (Stage 6 metrics).
+- The scheduler's own `setTimeout` failure catch is uncounted at the scheduler
+  level (the flush is instrumented at the agent level via `buffer_flush_total`).
 
 See [Known gaps](../KNOWN-GAPS.md) and [Architecture](../ARCHITECTURE.md).

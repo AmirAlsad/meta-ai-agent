@@ -1,29 +1,32 @@
-# Outbound send clients (Stage 4)
+# Outbound send clients
 
 The outbound layer turns a desired action ("send this text", "show typing", "mark
-read", "react") into the exact Meta Graph API request each channel expects, and
-sends it through a shared HTTP transport with retry/backoff. It is the
-counterpart to the Stage 2 inbound parser: the parser folds three channels into
-one normalized `IncomingMessage`; the outbound clients fan one uniform
-`ChannelAdapter` call back out to three channel-specific request shapes.
+read", "react", "send media", "send a WhatsApp template") into the exact Meta
+Graph API request each channel expects, and sends it through a shared HTTP
+transport with retry/backoff. It is the counterpart to the inbound parser: the
+parser folds three channels into one normalized `IncomingMessage`; the outbound
+clients fan one uniform `ChannelAdapter` call back out to three channel-specific
+request shapes. The uniform surface covers text, typing indicators, read
+receipts, reactions, media (`sendMedia`), and — on WhatsApp — message templates
+(`sendTemplate`).
 
 ## Purpose
 
 Every per-channel client (WhatsApp / Messenger / Instagram) implements the same
-[`ChannelAdapter`](../../src/meta/shared/adapter.ts) interface. The (future)
-conversation agent (Stage 5) can therefore dispatch an outbound message without
-branching on `channel === 'whatsapp'`: it holds a `ChannelAdapter`, calls
-`sendText` / `sendTypingIndicator` / `markRead` / `sendReaction`, and asks
-`supports(feature)` before attempting anything channel-specific. Capability
-differences are surfaced at runtime via `supports()` rather than by throwing, so
-an unsupported request (e.g. a template on Instagram) is skipped cleanly instead
-of erroring.
+[`ChannelAdapter`](../../src/meta/shared/adapter.ts) interface. The
+[conversation agent](./conversation-state.md) therefore dispatches an outbound
+message without branching on `channel === 'whatsapp'`: it holds a
+`ChannelAdapter`, calls `sendText` / `sendTypingIndicator` / `markRead` /
+`sendReaction` / `sendMedia`, and asks `supports(feature)` before attempting
+anything channel-specific. Capability differences are surfaced at runtime via
+`supports()` rather than by throwing, so an unsupported request (e.g. a template
+on Instagram) is skipped cleanly instead of erroring.
 
 The clients are transport adapters only. They own request body shapes and the
 read of the success envelope; they do not buffer, sequence, dedupe, or decide
 *when* to send. That sequencing (typing → delay → text, ordered delivery,
-cross-payload dedupe) is the conversation agent / delivery queue's job in
-Stage 5.
+cross-payload dedupe) is the conversation agent / delivery queue's job — see
+[Ordered delivery](./ordered-delivery.md).
 
 ## The shared `GraphClient`
 
@@ -138,9 +141,24 @@ interface ChannelAdapter {
   sendTypingIndicator(recipientId: string, messageId?: string): Promise<void>;
   markRead(recipientId: string, messageId: string): Promise<void>;
   sendReaction(recipientId: string, messageId: string, emoji: string): Promise<void>;
+  sendMedia(recipientId: string, input: MediaSendInput): Promise<SendResult>;
   supports(feature: ChannelFeature): boolean;
 }
 ```
+
+`sendMedia` (Stage 7) sends a media attachment (image / audio / video / document)
+by URL — or, for WhatsApp, a pre-uploaded `media_id`. It is a **single** method
+rather than four (`sendImage` / `sendAudio` / `sendVideo` / `sendDocument`)
+deliberately: the per-channel clients expose typed, channel-shaped media methods,
+but those diverge (Messenger's document method is `sendFile`, WhatsApp's
+`sendDocument` requires a `filename`, WhatsApp `sendAudio` takes no caption,
+Instagram's document is a PDF-only `file`). Each client implements one `sendMedia`
+that switches on `input.kind` and routes to its own typed method internally, so
+the conversation agent dispatches a media item with **zero** channel/kind
+branching. `MediaSendInput` is `{ kind, mediaIdOrUrl, caption?, filename? }`; the
+agent resolves `kind` from the action's MIME via `inferMediaKind`. See
+[Media send](./media.md) for the full per-channel body shapes and the
+upload/download utilities.
 
 A uniform signature is kept even where a channel ignores a parameter, so the
 conversation agent's dispatch code stays channel-agnostic:
@@ -184,8 +202,8 @@ Per-send options; channels ignore fields they do not support.
 ## The `supports()` capability matrix
 
 `supports(feature: ChannelFeature)` returns whether a channel actually has a
-feature wired **at Stage 4**. The conversation agent checks this before
-attempting a feature. The `ChannelFeature` union and the per-channel answers:
+feature wired. The conversation agent checks this before attempting a feature. The
+`ChannelFeature` union and the per-channel answers:
 
 | Feature | WhatsApp | Messenger | Instagram |
 | --- | --- | --- | --- |
@@ -194,20 +212,34 @@ attempting a feature. The `ChannelFeature` union and the per-channel answers:
 | `reaction` | Yes | Yes | Yes |
 | `reply_to` | Yes | Yes | No |
 | `template` | Yes | No | No |
-| `media_send` | No | No | No |
-| `persistent_menu` | No | No | No |
-| `get_started` | No | No | No |
-| `ice_breakers` | No | No | No |
+| `media_send` | Yes | Yes | Yes |
+| `persistent_menu` | No | **Yes** | No |
+| `get_started` | No | **Yes** | No |
+| `ice_breakers` | No | **Yes** | **Yes** |
 | `story_reply` | No | No | No |
 
-Notes on the `No` cells:
+Notes on the cells:
 
 - `template` is the WhatsApp message-template concept. Messenger's own message
-  templates are a different feature and are out of Stage 4 scope; Instagram has no
-  template messaging at all.
-- `media_send` lands in Stage 7 (media upload + send) on all three channels.
-- `persistent_menu` / `get_started` / `ice_breakers` are Messenger/Instagram
-  profile surfaces (Stage 8); none apply to WhatsApp.
+  templates are a different feature and are out of scope; Instagram has no
+  template messaging at all. See [WhatsApp templates](./templates.md).
+- `media_send` is **Yes on all three channels** (Stage 7, was No). WhatsApp,
+  Messenger, and Instagram all send image / audio / video / document via the
+  uniform `sendMedia`. The per-channel nuances are summarized in
+  [Media send](#media-send-stage-7) below; full detail in [Media send](./media.md).
+- `persistent_menu` / `get_started` / `ice_breakers` are **setup-time** profile
+  surfaces (Stage 8) — configured **out-of-band** of the per-message hot path, not
+  sent per message. They are advertised as `supports()` capabilities so the
+  conversation agent includes them in its capability set; the actual configuration
+  lives in dedicated modules: the Messenger surfaces in `MessengerProfileClient`
+  (`{pageId}/messenger_profile`) and the Instagram ice breakers in
+  `InstagramIceBreakers` (`{igUserId}/messenger_profile` on `graph.instagram.com`).
+  - **Messenger**: `get_started`, `persistent_menu`, **and** `ice_breakers` are all
+    `Yes` (Stage 8, were No). See [Messenger profile](./messenger-profile.md).
+  - **Instagram**: only `ice_breakers` is `Yes` (Stage 8, was No). Instagram has
+    **no Get Started button and no persistent menu**, so `get_started` and
+    `persistent_menu` stay `No`. See [Instagram platform](./instagram-platform.md).
+  - None apply to WhatsApp.
 - `story_reply` is an **inbound** concept (a user replying to a business story
   arrives via webhook), not an outbound send capability, so it is `No`
   everywhere.
@@ -248,6 +280,38 @@ mechanism on each channel**. All three were live-verified on 2026-05-20:
   the user still receives the text — only the threading link is lost. (The
   Facebook-Login "Messenger API for Instagram" flavor supports `reply_to`; native IG
   quotes would require that different integration path. See [Known gaps](../KNOWN-GAPS.md).)
+
+## Media send (Stage 7)
+
+All three clients send media — image / audio / video / document — behind the
+uniform `ChannelAdapter.sendMedia(recipientId, { kind, mediaIdOrUrl, caption?, filename? })`.
+The conversation agent infers `kind` from the action's MIME via `inferMediaKind`
+(`image/*`→image, `audio/*`→audio, `video/*`→video, else→document) and dispatches
+without branching on channel or kind. Each client routes the kind to its own typed
+method internally. Per-channel nuances:
+
+- **WhatsApp** — `mediaIdOrUrl` may be a **pre-uploaded `media_id` OR a public
+  URL** (an `^https?://` value becomes `{ link }`, anything else `{ id }`). Typed
+  methods: `sendImage(to, mediaIdOrUrl, caption?)`, `sendAudio(to, mediaIdOrUrl)`
+  (**no caption** — Meta rejects it on audio), `sendVideo(to, mediaIdOrUrl,
+  caption?)`, `sendDocument(to, mediaIdOrUrl, filename, caption?)` (**filename
+  required**; `sendMedia` derives one from the URL basename when absent).
+  `uploadMedia(data, mimeType, filename?)` uploads bytes and returns a reusable
+  `media_id`.
+- **Messenger** — media is URL-based via `message.attachment` (`is_reusable:false`
+  default). Documents use `sendFile` (attachment `type:'file'`); image/audio/video
+  use `sendImage` / `sendAudio` / `sendVideo`. No caption/filename in the body.
+- **Instagram** — image/audio/video via `sendImage` / `sendAudio` / `sendVideo`,
+  plus a document via `sendDocument` — an IG `file` attachment that is **PDF-only
+  (~25MB)** per Meta docs. The client sends as-is and lets Meta reject a non-PDF /
+  oversized file (caught fail-soft by the agent). On `graph.instagram.com`.
+
+Untyped media (no `mimeType`) infers `document` — **supply a `mimeType`** so the
+kind routes correctly, especially on Instagram where a non-PDF sent as a `file` is
+rejected. A media send Meta rejects is caught by the agent's per-item fail-soft
+catch (skip + advance), like any other send error. See [Media send](./media.md)
+for the body shapes, the WhatsApp upload utility, and the download helpers
+(WhatsApp 2-step + Bearer + User-Agent + ~5min expiry; FB/IG pre-signed, no token).
 
 ## Per-channel client notes
 
@@ -334,6 +398,14 @@ comes from `InstagramConfig.accessToken`.
 - **React / unreact** mirror Messenger exactly:
   - React: `{ recipient: { id }, sender_action: 'react', payload: { message_id, reaction: emoji } }`.
   - Unreact (empty `emoji`): `{ recipient: { id }, sender_action: 'unreact', payload: { message_id } }`.
+- **`sendPrivateReply(commentId, text)`** is an **Instagram-specific** method (not
+  part of the uniform `ChannelAdapter`) for the **comment-to-DM funnel**: it POSTs
+  `{ recipient: { comment_id }, message: { text } }` — keyed by `comment_id` (NOT
+  `id`), which is what makes Meta treat it as a private reply to a public comment.
+  It must be sent within **7 days** of the comment (a separate window from the 24h
+  messaging window) and needs the `instagram_business_manage_comments` permission.
+  Routed through the same pacer as every other IG send. See
+  [Instagram platform](./instagram-platform.md#private-replies-comment-to-dm).
 - **In-process rate pacer.** Every IG send is routed through a minimal serialized
   pacer that enforces a minimum spacing between two outbound Graph calls for one
   account. The default is **100ms** (`DEFAULT_MIN_CALL_SPACING_MS`), overridable
@@ -370,18 +442,26 @@ comes from `InstagramConfig.accessToken`.
 
 ## What is NOT in scope yet
 
-- **Media send** (`sendImage` / `sendAudio` / `sendVideo` / `sendDocument`) —
-  Stage 7. `supports('media_send')` is `No` everywhere today.
 - **Templates beyond WhatsApp** — Messenger message templates and any IG
-  rich-message surfaces are out of scope; only WhatsApp `sendTemplate` exists.
-- **Profile surfaces** — persistent menu, Get Started, ice breakers — Stage 8.
+  rich-message surfaces are out of scope; only WhatsApp `sendTemplate` exists. See
+  [WhatsApp templates](./templates.md).
+- **Media streaming / size limits** — media is fully buffered in memory (no
+  streaming), and the clients do not validate MIME/size before sending (Meta
+  rejects an unsupported asset). See [Media send](./media.md) and
+  [Known gaps](../KNOWN-GAPS.md).
+- **Out-of-window enforcement** — `context.windowOpen` is surfaced to the chat
+  endpoint but the agent does not require a template when the window is closed
+  (Stage 10).
+- **Profile surfaces** — persistent menu, Get Started, ice breakers — landed in
+  Stage 8 as **setup-time** configs (not per-message sends): the Messenger surfaces
+  in [Messenger profile](./messenger-profile.md) (`MessengerProfileClient`) and the
+  Instagram ice breakers + the comment-to-DM `sendPrivateReply` in
+  [Instagram platform](./instagram-platform.md). The send clients' `supports()`
+  matrices now advertise these (Messenger `get_started`/`persistent_menu`/`ice_breakers`;
+  Instagram `ice_breakers`).
 - **Full rate limiting** — the real per-second + hourly model and cross-replica
   coordination — Stage 10 (`LimitTracker`). The IG 100ms pacer is an interim
   in-process floor only.
-- **Conversation wiring** — the clients are not yet called by any conversation
-  flow. The Stage 1 webhook route still discards the parsed `ParseResult`; Stage 5
-  introduces the `ConversationAgent` / delivery queue that drives these adapters
-  (typing → delay → text, ordered delivery).
 
 See [Known gaps](../KNOWN-GAPS.md) for the running deferral list.
 
@@ -391,17 +471,23 @@ Source:
 
 - [`src/meta/shared/errors.ts`](../../src/meta/shared/errors.ts) — canonical `MetaApiError`.
 - [`src/meta/shared/graph-client.ts`](../../src/meta/shared/graph-client.ts) — runtime transport, retry/backoff matrix.
-- [`src/meta/shared/adapter.ts`](../../src/meta/shared/adapter.ts) — `ChannelAdapter`, `SendResult`, `SendOptions`, `ChannelFeature`.
-- [`src/meta/whatsapp/client.ts`](../../src/meta/whatsapp/client.ts) — WhatsApp client (+ `sendTemplate`).
-- [`src/meta/messenger/client.ts`](../../src/meta/messenger/client.ts) — Messenger client.
-- [`src/meta/instagram/client.ts`](../../src/meta/instagram/client.ts) — Instagram client (+ rate pacer).
+- [`src/meta/shared/adapter.ts`](../../src/meta/shared/adapter.ts) — `ChannelAdapter`, `SendResult`, `SendOptions`, `ChannelFeature`, `MediaSendInput`, `TemplateComponent` / `TemplateParameter`.
+- [`src/meta/shared/media.ts`](../../src/meta/shared/media.ts) — `inferMediaKind`, WhatsApp upload, download utilities (see [Media send](./media.md)).
+- [`src/meta/whatsapp/client.ts`](../../src/meta/whatsapp/client.ts) — WhatsApp client (+ `sendTemplate`, media methods, `uploadMedia`).
+- [`src/meta/whatsapp/templates.ts`](../../src/meta/whatsapp/templates.ts) — `buildTemplateComponents` (see [WhatsApp templates](./templates.md)).
+- [`src/meta/messenger/client.ts`](../../src/meta/messenger/client.ts) — Messenger client (+ media via `sendFile` etc.).
+- [`src/meta/instagram/client.ts`](../../src/meta/instagram/client.ts) — Instagram client (+ rate pacer, media incl. PDF `file`).
 
 Tests (see [Testing](../TESTING.md)):
 
 - [`tests/unit/graph-client.test.ts`](../../tests/unit/graph-client.test.ts)
 - [`tests/unit/meta-errors.test.ts`](../../tests/unit/meta-errors.test.ts)
+- [`tests/unit/media.test.ts`](../../tests/unit/media.test.ts)
+- [`tests/unit/whatsapp-templates.test.ts`](../../tests/unit/whatsapp-templates.test.ts)
 - [`tests/unit/whatsapp-client.test.ts`](../../tests/unit/whatsapp-client.test.ts)
 - [`tests/unit/messenger-client.test.ts`](../../tests/unit/messenger-client.test.ts)
-- [`tests/unit/instagram-client.test.ts`](../../tests/unit/instagram-client.test.ts)
+- [`tests/unit/instagram-client.test.ts`](../../tests/unit/instagram-client.test.ts) (Stage 8 added `sendPrivateReply` coverage)
 
-Related: [Architecture](../ARCHITECTURE.md) · [Message parsing](./message-parsing.md) (the inbound counterpart) · [Webhook security](./webhook-security.md) (the Bearer-vs-query precedent).
+Stage 8 setup-time profile clients (covered separately): [`tests/unit/messenger-profile.test.ts`](../../tests/unit/messenger-profile.test.ts), [`tests/unit/instagram-ice-breakers.test.ts`](../../tests/unit/instagram-ice-breakers.test.ts) — see [Messenger profile](./messenger-profile.md) and [Instagram platform](./instagram-platform.md).
+
+Related: [Messenger profile](./messenger-profile.md) · [Instagram platform](./instagram-platform.md) · [Media send](./media.md) · [WhatsApp templates](./templates.md) · [Architecture](../ARCHITECTURE.md) · [Message parsing](./message-parsing.md) (the inbound counterpart) · [Webhook security](./webhook-security.md) (the Bearer-vs-query precedent).

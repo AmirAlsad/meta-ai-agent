@@ -39,6 +39,7 @@ import type { NormalizedChatResponse } from '../../src/chat/types.js';
 import type {
   ChannelAdapter,
   ChannelFeature,
+  MediaSendInput,
   SendResult
 } from '../../src/meta/shared/adapter.js';
 import type { Channel } from '../../src/meta/types.js';
@@ -143,14 +144,15 @@ function makeFakeChatClient(): FakeChatClient {
 
 /**
  * A fake {@link ChannelAdapter} with `vi.fn()` send methods and a REAL
- * `supports` matrix close to the live clients: typing/read/reaction/reply true
- * everywhere; template true only for WhatsApp; media false everywhere (Stage 7).
+ * `supports` matrix close to the live clients: typing/read/reaction/reply +
+ * media true everywhere; template true only for WhatsApp.
  */
 interface FakeAdapter extends ChannelAdapter {
   sendText: Mock;
   sendReaction: Mock;
   sendTypingIndicator: Mock;
   markRead: Mock;
+  sendMedia: Mock;
 }
 
 function makeFakeAdapter(channel: Channel): FakeAdapter {
@@ -164,23 +166,35 @@ function makeFakeAdapter(channel: Channel): FakeAdapter {
       timestamp: Date.now()
     })
   );
+  const sendMedia = vi.fn(
+    async (recipientId: string, _input: MediaSendInput): Promise<SendResult> => ({
+      channel,
+      messageId: `${channel}-media-${sendMedia.mock.calls.length}`,
+      recipientId,
+      timestamp: Date.now()
+    })
+  );
   return {
     channel,
     sendText,
     sendReaction: vi.fn(async () => undefined),
     sendTypingIndicator: vi.fn(async () => undefined),
     markRead: vi.fn(async () => undefined),
+    sendMedia,
     supports(feature: ChannelFeature): boolean {
       switch (feature) {
         case 'typing_indicator':
         case 'read_receipt':
         case 'reaction':
         case 'reply_to':
+        // media_send is wired at Stage 7 — all three live clients advertise it.
+        case 'media_send':
           return true;
         case 'template':
           return channel === 'whatsapp';
         default:
-          // media_send + the profile surfaces are out of Stage 5 scope.
+          // The profile surfaces (persistent_menu/get_started/ice_breakers/
+          // story_reply) are out of scope here.
           return false;
       }
     }
@@ -318,6 +332,35 @@ describe('end-to-end Stage 5 flow', () => {
     expect(wa.sendText).toHaveBeenCalledTimes(1);
     expect(wa.sendText.mock.calls[0][0]).toBe('15557654321');
     expect(wa.sendText.mock.calls[0][1]).toBe('hi there');
+  });
+
+  it('drives a media chat action through to the adapter sendMedia (kind inferred from MIME)', async () => {
+    // The chat endpoint returns a media action instead of text; after the flush
+    // the WhatsApp adapter's sendMedia must be called with the inferred kind.
+    fakeChat.complete.mockResolvedValue({
+      actions: [{ type: 'media', url: 'https://cdn.example.com/pic.png', mimeType: 'image/png' }]
+    } satisfies NormalizedChatResponse);
+
+    const bodyBuf = loadFixtureBuffer('whatsapp/text-inbound.json');
+    const res = await postSigned(app, bodyBuf);
+    expect(res.status).toBe(200);
+
+    await flushBuffer();
+
+    expect(fakeChat.complete).toHaveBeenCalledTimes(1);
+
+    const wa = adapters.whatsapp as FakeAdapter;
+    // No text was sent — only a media attachment.
+    expect(wa.sendText).not.toHaveBeenCalled();
+    expect(wa.sendMedia).toHaveBeenCalledTimes(1);
+    // image/png → kind 'image'; the url is forwarded as the media reference.
+    expect(wa.sendMedia.mock.calls[0][0]).toBe('15557654321');
+    expect(wa.sendMedia.mock.calls[0][1]).toEqual({
+      kind: 'image',
+      mediaIdOrUrl: 'https://cdn.example.com/pic.png'
+    });
+    // No handler error along the media path.
+    expect(logger.mock.error).not.toHaveBeenCalled();
   });
 
   it('routes a Messenger inbound to the Messenger adapter, not WhatsApp', async () => {

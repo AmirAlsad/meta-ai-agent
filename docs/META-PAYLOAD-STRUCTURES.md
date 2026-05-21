@@ -14,21 +14,21 @@ Today's `tests/fixtures/meta/{whatsapp,messenger,instagram}/*.json` (non-`captur
 
 ### Real-world fields observed that our parser does NOT currently extract
 
-The first round of captures surfaced several fields Meta sends that aren't yet surfaced on `IncomingMessage` / `StatusUpdate`. They are preserved on `raw` for downstream consumers but listed here so Stage 4+ work can prioritize:
+The first round of captures surfaced several fields Meta sends that aren't yet surfaced on `IncomingMessage` / `StatusUpdate`. They are preserved on `raw` for downstream consumers but listed here so the messaging-window / cost-observability work (Stage 10) can prioritize them:
 
 | Field path | Type | Notes |
 |---|---|---|
 | `entry[].id` | string | The **WABA id** (NOT the phone_number_id). Our parser correctly uses `metadata.phone_number_id` for the business id; this is informational. |
-| `value.contacts[].user_id` | string `US.*` | A new Meta-internal user identifier prefixed `US.`, distinct from `wa_id` (E.164). Persistent across phone-number changes. Likely useful for Stage 5 contact tracking. |
-| `value.contacts[].profile.name` | string | The user's WhatsApp profile name. PII — handle carefully in logs. Useful for Stage 6 identity enrichment. |
+| `value.contacts[].user_id` | string `US.*` | A new Meta-internal user identifier prefixed `US.`, distinct from `wa_id` (E.164). Persistent across phone-number changes. Potentially useful for cross-phone-change contact tracking; not adopted by the Stage 5 agent (which keys on `wa_id`). |
+| `value.contacts[].profile.name` | string | The user's WhatsApp profile name. PII — handle carefully in logs. Stage 6 identity enrichment uses `USER_LOOKUP_URL` instead, so this inline name is still `raw`-only. |
 | `value.messages[].from_user_id` | string `US.*` | Same `US.*` identifier on the message itself; redundant with `contacts[].user_id` but per-message. |
 | `value.statuses[].recipient_user_id` | string `US.*` | Same `US.*` identifier on outbound status callbacks. |
-| `value.statuses[].pricing` | object | The new PMP (Per-Message Pricing) block — `{ billable, pricing_model: "PMP", category: "utility" \| "marketing" \| "authentication" \| "service", type: "regular" }`. Replaces the older conversation-pricing block in 2025. Load-bearing for Stage 4 messaging-window tracking and cost accounting. |
-| `value.statuses[].conversation` (not yet observed) | object | Reserved for future window-tracking work — Stage 4. |
+| `value.statuses[].pricing` | object | The new PMP (Per-Message Pricing) block — `{ billable, pricing_model: "PMP", category: "utility" \| "marketing" \| "authentication" \| "service", type: "regular" }`. Replaces the older conversation-pricing block in 2025. Load-bearing for messaging-window tracking and cost accounting (Stage 10). |
+| `value.statuses[].conversation` (not yet observed) | object | Reserved for future window-tracking work — Stage 10. |
 
 ### Pricing model note
 
-The `pricing.pricing_model: "PMP"` is the per-message pricing model that replaced the 24-hour conversation-pricing window on July 1, 2025. Stage 4's messaging-window tracker will need to consume `pricing.category` to classify outbound traffic.
+The `pricing.pricing_model: "PMP"` is the per-message pricing model that replaced the 24-hour conversation-pricing window on July 1, 2025. Stage 10's messaging-window tracker will need to consume `pricing.category` to classify outbound traffic.
 
 ### Still TODO (need capture)
 

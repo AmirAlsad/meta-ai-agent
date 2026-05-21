@@ -1,0 +1,25 @@
+{
+  "name": "meta-ai-agent-showcase-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference LLM-backed chat endpoint for meta-ai-agent, powered by Claude via the Anthropic SDK. A separate package with its own dependencies — intentionally outside the root package's model-provider-free dependency graph.",
+  "scripts": {
+    "start": "node --import tsx index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.97.1",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.9.1",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3"
+  }
+}

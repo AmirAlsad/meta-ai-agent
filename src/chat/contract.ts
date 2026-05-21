@@ -181,12 +181,18 @@ function validateAction(value: unknown, path: string): ValidationResult {
       if (url === undefined) return invalid(path, 'media action requires a non-empty "url"');
       const caption = readNonEmptyString(value.caption);
       const mimeType = readNonEmptyString(value.mimeType);
+      // `filename` (for documents) is optional; carry it through only when it is
+      // a non-empty string. A non-string filename is simply ignored (not an
+      // error) — the rest of the media action is still deliverable, and the
+      // WhatsApp client derives a sensible default when none is supplied.
+      const filename = readNonEmptyString(value.filename);
       return {
         action: {
           type: 'media',
           url,
           ...(caption !== undefined ? { caption } : {}),
-          ...(mimeType !== undefined ? { mimeType } : {})
+          ...(mimeType !== undefined ? { mimeType } : {}),
+          ...(filename !== undefined ? { filename } : {})
         }
       };
     }

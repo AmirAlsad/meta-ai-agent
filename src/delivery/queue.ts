@@ -94,16 +94,22 @@ export function buildOutboundItems(
         break;
 
       case 'media':
+        // Media is sent (Stage 7) when the channel advertises `media_send`
+        // (WhatsApp / Messenger / Instagram all do). The agent infers the
+        // send-kind from `mediaMimeType` and routes via `adapter.sendMedia`. A
+        // channel that does NOT support media (or, e.g., an Instagram document —
+        // skipped at send time via the adapter's throw) is recorded here.
         if (supports('media_send')) {
           items.push({
             id: randomUUID(),
             kind: 'media',
             mediaUrl: action.url,
             mediaCaption: action.caption,
-            mediaMimeType: action.mimeType
+            mediaMimeType: action.mimeType,
+            mediaFilename: action.filename
           });
         } else {
-          skipped.push({ kind: 'media', reason: 'media_send unsupported (Stage 7)' });
+          skipped.push({ kind: 'media', reason: 'media_send unsupported on this channel' });
         }
         break;
 

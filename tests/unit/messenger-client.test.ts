@@ -283,6 +283,181 @@ describe('MessengerClient.sendReaction', () => {
 });
 
 /* ────────────────────────────────────────────────────────────────────────── */
+/* Media sends — message.attachment with a URL payload                         */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('MessengerClient media sends', () => {
+  const IMAGE_URL = 'https://cdn.example.com/pic.jpg';
+  const AUDIO_URL = 'https://cdn.example.com/clip.mp3';
+  const VIDEO_URL = 'https://cdn.example.com/movie.mp4';
+  const FILE_URL = 'https://cdn.example.com/report.pdf';
+
+  /** Expected attachment body for a given media type + url (is_reusable:false). */
+  function attachmentBody(type: string, url: string) {
+    return {
+      recipient: { id: RECIPIENT },
+      messaging_type: 'RESPONSE',
+      message: { attachment: { type, payload: { url, is_reusable: false } } }
+    };
+  }
+
+  it('sendImage POSTs an image attachment and returns a SendResult from message_id', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(200, { recipient_id: RECIPIENT, message_id: 'm_img1' }));
+    const client = makeClient(fetchImpl);
+
+    const before = Date.now();
+    const result = await client.sendImage(RECIPIENT, IMAGE_URL);
+    const after = Date.now();
+
+    // Versioned page-messages endpoint.
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(fetchImpl.mock.calls[0]![0]).toBe(MESSAGES_URL);
+
+    // Exact body contract: attachment type + payload.url + is_reusable:false.
+    expect(bodyOf(fetchImpl)).toEqual(attachmentBody('image', IMAGE_URL));
+
+    // Token is an Authorization: Bearer header, NOT in the URL.
+    expect(headersOf(fetchImpl)['authorization']).toBe(`Bearer ${PAGE_ACCESS_TOKEN}`);
+    expect(fetchImpl.mock.calls[0]![0]).not.toContain(PAGE_ACCESS_TOKEN);
+    expect(fetchImpl.mock.calls[0]![0]).not.toContain('access_token');
+
+    // SendResult parsed from the response.
+    expect(result.channel).toBe('messenger');
+    expect(result.messageId).toBe('m_img1');
+    expect(result.recipientId).toBe(RECIPIENT);
+    expect(result.timestamp).toBeGreaterThanOrEqual(before);
+    expect(result.timestamp).toBeLessThanOrEqual(after);
+    expect(result.raw).toEqual({ recipient_id: RECIPIENT, message_id: 'm_img1' });
+  });
+
+  it('sendAudio POSTs an audio attachment with is_reusable:false', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { message_id: 'm_aud1' }));
+    const client = makeClient(fetchImpl);
+
+    const result = await client.sendAudio(RECIPIENT, AUDIO_URL);
+
+    expect(fetchImpl.mock.calls[0]![0]).toBe(MESSAGES_URL);
+    expect(bodyOf(fetchImpl)).toEqual(attachmentBody('audio', AUDIO_URL));
+    expect(headersOf(fetchImpl)['authorization']).toBe(`Bearer ${PAGE_ACCESS_TOKEN}`);
+    expect(result.messageId).toBe('m_aud1');
+  });
+
+  it('sendVideo POSTs a video attachment with is_reusable:false', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { message_id: 'm_vid1' }));
+    const client = makeClient(fetchImpl);
+
+    const result = await client.sendVideo(RECIPIENT, VIDEO_URL);
+
+    expect(fetchImpl.mock.calls[0]![0]).toBe(MESSAGES_URL);
+    expect(bodyOf(fetchImpl)).toEqual(attachmentBody('video', VIDEO_URL));
+    expect(result.messageId).toBe('m_vid1');
+  });
+
+  it('sendFile POSTs a file attachment (type:file, not document) with is_reusable:false', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { message_id: 'm_file1' }));
+    const client = makeClient(fetchImpl);
+
+    const result = await client.sendFile(RECIPIENT, FILE_URL);
+
+    expect(fetchImpl.mock.calls[0]![0]).toBe(MESSAGES_URL);
+    // Messenger's document attachment type is literally 'file'.
+    expect(bodyOf(fetchImpl)).toEqual(attachmentBody('file', FILE_URL));
+    expect(result.messageId).toBe('m_file1');
+  });
+
+  it('defaults is_reusable to false but honors opts.isReusable = true', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { message_id: 'm_reuse' }));
+    const client = makeClient(fetchImpl);
+
+    await client.sendImage(RECIPIENT, IMAGE_URL, { isReusable: true });
+
+    expect(bodyOf(fetchImpl)).toEqual({
+      recipient: { id: RECIPIENT },
+      messaging_type: 'RESPONSE',
+      message: { attachment: { type: 'image', payload: { url: IMAGE_URL, is_reusable: true } } }
+    });
+  });
+
+  it('wraps a 400 from a media send in MetaApiError (no retry)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(400, {
+        error: {
+          message: 'Invalid attachment url.',
+          type: 'OAuthException',
+          code: 100,
+          fbtrace_id: 'MediaTrace'
+        }
+      })
+    );
+    const client = makeClient(fetchImpl);
+
+    let thrown: unknown;
+    try {
+      await client.sendImage(RECIPIENT, IMAGE_URL);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(MetaApiError);
+    const apiError = thrown as MetaApiError;
+    expect(apiError.operation).toBe('messenger.sendImage');
+    expect(apiError.httpStatus).toBe(400);
+    expect(apiError.errorCode).toBe(100);
+    // 400 is a deterministic client error — not retried (single fetch call).
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* sendMedia (uniform ChannelAdapter entry point → per-kind attachment body)   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('MessengerClient.sendMedia', () => {
+  const URL_ = 'https://cdn.example.com/asset.bin';
+
+  /** Expected attachment body for a given Messenger attachment type. */
+  function attachmentBody(type: string) {
+    return {
+      recipient: { id: RECIPIENT },
+      messaging_type: 'RESPONSE',
+      message: { attachment: { type, payload: { url: URL_, is_reusable: false } } }
+    };
+  }
+
+  it.each([
+    ['image', 'image'],
+    ['audio', 'audio'],
+    ['video', 'video']
+  ] as const)('kind %s → attachment type %s', async (kind, type) => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { message_id: `m_${kind}` }));
+    const client = makeClient(fetchImpl);
+
+    const result = await client.sendMedia(RECIPIENT, { kind, mediaIdOrUrl: URL_ });
+
+    expect(fetchImpl.mock.calls[0]![0]).toBe(MESSAGES_URL);
+    expect(bodyOf(fetchImpl)).toEqual(attachmentBody(type));
+    expect(result.messageId).toBe(`m_${kind}`);
+  });
+
+  it('kind document → routes to sendFile (attachment type "file", NOT "document")', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { message_id: 'm_doc' }));
+    const client = makeClient(fetchImpl);
+
+    const result = await client.sendMedia(RECIPIENT, {
+      kind: 'document',
+      mediaIdOrUrl: URL_,
+      filename: 'ignored-by-messenger.pdf'
+    });
+
+    // Messenger's document attachment type is literally 'file'.
+    expect(bodyOf(fetchImpl)).toEqual(attachmentBody('file'));
+    expect(result.messageId).toBe('m_doc');
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
 /* Error path                                                                  */
 /* ────────────────────────────────────────────────────────────────────────── */
 
@@ -325,19 +500,22 @@ describe('MessengerClient error handling', () => {
 /* ────────────────────────────────────────────────────────────────────────── */
 
 describe('MessengerClient.supports', () => {
-  it('advertises the exact Stage-4 capability matrix', () => {
+  it('advertises the exact capability matrix', () => {
     const client = makeClient(vi.fn());
 
     expect(client.supports('typing_indicator')).toBe(true);
     expect(client.supports('read_receipt')).toBe(true);
     expect(client.supports('reply_to')).toBe(true);
     expect(client.supports('reaction')).toBe(true);
+    // Stage 7: media send is now supported.
+    expect(client.supports('media_send')).toBe(true);
+    // Profile surfaces are configured out-of-band via the Messenger Profile API
+    // (MessengerProfileClient) and are now advertised as supported.
+    expect(client.supports('persistent_menu')).toBe(true);
+    expect(client.supports('get_started')).toBe(true);
+    expect(client.supports('ice_breakers')).toBe(true);
 
     expect(client.supports('template')).toBe(false);
-    expect(client.supports('media_send')).toBe(false);
-    expect(client.supports('persistent_menu')).toBe(false);
-    expect(client.supports('get_started')).toBe(false);
-    expect(client.supports('ice_breakers')).toBe(false);
     expect(client.supports('story_reply')).toBe(false);
   });
 

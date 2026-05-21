@@ -26,7 +26,14 @@
 import type pino from 'pino';
 import type { WhatsAppConfig } from '../../config/loader.js';
 import type { GraphClient } from '../shared/graph-client.js';
-import type { ChannelAdapter, ChannelFeature, SendOptions, SendResult } from '../shared/adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelFeature,
+  MediaSendInput,
+  SendOptions,
+  SendResult
+} from '../shared/adapter.js';
+import { uploadWhatsAppMedia } from '../shared/media.js';
 
 // `TemplateComponent` / `TemplateParameter` were relocated to the shared
 // transport-contract module (`../shared/adapter.js`) so type-only consumers
@@ -41,6 +48,15 @@ export interface WhatsAppClientDeps {
   config: WhatsAppConfig;
   /** Shared Graph API transport — constructed once per process and injected. */
   graph: GraphClient;
+  /**
+   * Graph API version (e.g. `config.meta.graphApiVersion`, `'v25.0'`). Needed
+   * ONLY by {@link WhatsAppClient.uploadMedia}, which calls the shared
+   * {@link uploadWhatsAppMedia} (a multipart `fetch` that builds its own
+   * versioned URL outside the {@link GraphClient}, whose `apiVersion` is
+   * private). Optional so existing call sites that never upload keep working;
+   * `uploadMedia` throws a clear error if it is invoked without this set.
+   */
+  apiVersion?: string;
   /** Optional structured logger. */
   logger?: Pick<pino.Logger, 'info' | 'warn' | 'debug'>;
 }
@@ -55,11 +71,13 @@ export class WhatsAppClient implements ChannelAdapter {
 
   private readonly config: WhatsAppConfig;
   private readonly graph: GraphClient;
+  private readonly apiVersion?: string;
   private readonly logger?: Pick<pino.Logger, 'info' | 'warn' | 'debug'>;
 
   constructor(deps: WhatsAppClientDeps) {
     this.config = deps.config;
     this.graph = deps.graph;
+    if (deps.apiVersion !== undefined) this.apiVersion = deps.apiVersion;
     if (deps.logger) this.logger = deps.logger;
   }
 
@@ -190,6 +208,162 @@ export class WhatsAppClient implements ChannelAdapter {
   }
 
   /**
+   * Send an image by media id or public URL, with an optional caption.
+   *
+   * `mediaIdOrUrl` is resolved by {@link mediaRef} — an `http(s)://` URL becomes
+   * `{ link }` and anything else is treated as a pre-uploaded `{ id }`. The
+   * caption key is omitted entirely when undefined (sending `caption: undefined`
+   * would serialize the key away anyway, but we keep the body minimal/explicit).
+   */
+  async sendImage(to: string, mediaIdOrUrl: string, caption?: string): Promise<SendResult> {
+    const image: Record<string, unknown> = { ...this.mediaRef(mediaIdOrUrl) };
+    if (caption !== undefined) image['caption'] = caption;
+
+    const body = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'image',
+      image
+    };
+    const raw = await this.send(body, 'whatsapp.sendImage');
+    return this.toSendResult(to, raw);
+  }
+
+  /**
+   * Send an audio clip by media id or public URL.
+   *
+   * WHY there is no `caption` parameter: WhatsApp's `audio` message object does
+   * NOT support a caption field (unlike image / video / document). Including one
+   * is rejected by the API, so this method deliberately omits it.
+   */
+  async sendAudio(to: string, mediaIdOrUrl: string): Promise<SendResult> {
+    const body = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'audio',
+      audio: { ...this.mediaRef(mediaIdOrUrl) }
+    };
+    const raw = await this.send(body, 'whatsapp.sendAudio');
+    return this.toSendResult(to, raw);
+  }
+
+  /** Send a video by media id or public URL, with an optional caption. */
+  async sendVideo(to: string, mediaIdOrUrl: string, caption?: string): Promise<SendResult> {
+    const video: Record<string, unknown> = { ...this.mediaRef(mediaIdOrUrl) };
+    if (caption !== undefined) video['caption'] = caption;
+
+    const body = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'video',
+      video
+    };
+    const raw = await this.send(body, 'whatsapp.sendVideo');
+    return this.toSendResult(to, raw);
+  }
+
+  /**
+   * Send a document by media id or public URL. `filename` sets the name the
+   * recipient sees; `caption` is optional.
+   */
+  async sendDocument(
+    to: string,
+    mediaIdOrUrl: string,
+    filename: string,
+    caption?: string
+  ): Promise<SendResult> {
+    const document: Record<string, unknown> = { ...this.mediaRef(mediaIdOrUrl), filename };
+    if (caption !== undefined) document['caption'] = caption;
+
+    const body = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'document',
+      document
+    };
+    const raw = await this.send(body, 'whatsapp.sendDocument');
+    return this.toSendResult(to, raw);
+  }
+
+  /**
+   * {@link ChannelAdapter.sendMedia} — route a uniform media payload to the
+   * typed per-kind method above based on `input.kind`. The agent uses this so it
+   * can dispatch a media item without branching on channel or kind.
+   *
+   * WHY the document `filename` fallback: WhatsApp's document message REQUIRES a
+   * `filename` (it is the name the recipient sees). The uniform input makes it
+   * optional, so when absent we derive one from the URL's basename (e.g.
+   * `https://cdn/x/report.pdf` → `report.pdf`), falling back to `'file'` for a
+   * bare media_id or an unparseable URL. (`sendAudio` takes no caption — the
+   * caption is intentionally dropped for audio, matching WhatsApp's API.)
+   */
+  async sendMedia(to: string, input: MediaSendInput): Promise<SendResult> {
+    switch (input.kind) {
+      case 'image':
+        return this.sendImage(to, input.mediaIdOrUrl, input.caption);
+      case 'audio':
+        // WhatsApp audio has no caption field — drop it (see sendAudio).
+        return this.sendAudio(to, input.mediaIdOrUrl);
+      case 'video':
+        return this.sendVideo(to, input.mediaIdOrUrl, input.caption);
+      case 'document':
+        return this.sendDocument(
+          to,
+          input.mediaIdOrUrl,
+          input.filename ?? deriveFilename(input.mediaIdOrUrl),
+          input.caption
+        );
+    }
+  }
+
+  /**
+   * Upload media bytes and return the reusable `media_id` (convenience wrapper
+   * over the shared {@link uploadWhatsAppMedia}). Pass the returned id to any of
+   * the `send*` methods above.
+   *
+   * WHY it needs `apiVersion` injected separately: the upload is a multipart
+   * `fetch` that constructs its OWN versioned URL (the shared {@link GraphClient}
+   * is JSON-only and its `apiVersion` is private), so the version cannot be read
+   * off `this.graph`. It is supplied via {@link WhatsAppClientDeps.apiVersion}
+   * at construction; if absent we throw rather than guess a version.
+   */
+  async uploadMedia(
+    data: Uint8Array | Buffer | Blob,
+    mimeType: string,
+    filename?: string
+  ): Promise<string> {
+    if (this.apiVersion === undefined) {
+      throw new Error(
+        'WhatsAppClient.uploadMedia requires `apiVersion` to be set on WhatsAppClientDeps (pass config.meta.graphApiVersion).'
+      );
+    }
+    return uploadWhatsAppMedia({
+      phoneNumberId: this.config.phoneNumberId,
+      accessToken: this.config.accessToken,
+      apiVersion: this.apiVersion,
+      data,
+      mimeType,
+      ...(filename !== undefined ? { filename } : {})
+    });
+  }
+
+  /**
+   * Resolve a media reference for an outbound media message.
+   *
+   * WHY the regex test: WhatsApp accepts EITHER a previously-uploaded `media_id`
+   * (`{ id }`) OR a publicly reachable `{ link }` it fetches itself. We treat
+   * any value matching `http(s)://` as a public URL and everything else as a
+   * media id — so callers can pass whichever they have without a separate flag.
+   */
+  private mediaRef(mediaIdOrUrl: string): { id: string } | { link: string } {
+    return /^https?:\/\//i.test(mediaIdOrUrl) ? { link: mediaIdOrUrl } : { id: mediaIdOrUrl };
+  }
+
+  /**
    * Capability matrix advertised to the conversation agent. Returns `true`
    * ONLY for features actually wired at Stage 4.
    */
@@ -200,11 +374,10 @@ export class WhatsAppClient implements ChannelAdapter {
       case 'reaction':
       case 'reply_to':
       case 'template':
-        return true;
-      // media_send lands in Stage 7 (media upload + send) — a later stage flips
-      // this to true once `sendImage`/`sendDocument`/etc. exist on this client.
+      // media_send is wired (Stage 7): `sendImage`/`sendAudio`/`sendVideo`/
+      // `sendDocument` exist on this client (plus the `uploadMedia` convenience).
       case 'media_send':
-        return false;
+        return true;
       // Messenger/Instagram-only profile surfaces — not applicable to WhatsApp.
       case 'persistent_menu':
       case 'get_started':
@@ -248,5 +421,26 @@ export class WhatsAppClient implements ChannelAdapter {
       timestamp: Date.now(),
       raw
     };
+  }
+}
+
+/**
+ * Derive a document filename from a media reference for {@link
+ * WhatsAppClient.sendMedia} when the caller supplied none. Returns the last
+ * non-empty path segment of an `http(s)://` URL (query/hash stripped, URL-decoded),
+ * else `'file'` (a bare media_id, an opaque URL, or any parse failure). Never
+ * throws — WhatsApp requires SOME filename, so a sensible default beats erroring.
+ */
+function deriveFilename(mediaIdOrUrl: string): string {
+  if (!/^https?:\/\//i.test(mediaIdOrUrl)) return 'file';
+  try {
+    const { pathname } = new URL(mediaIdOrUrl);
+    const segments = pathname.split('/').filter(seg => seg.length > 0);
+    const last = segments[segments.length - 1];
+    if (last === undefined) return 'file';
+    const decoded = decodeURIComponent(last);
+    return decoded.length > 0 ? decoded : 'file';
+  } catch {
+    return 'file';
   }
 }

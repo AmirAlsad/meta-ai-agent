@@ -10,6 +10,7 @@
  */
 
 import type { Channel } from '../types.js';
+import type { MediaKind } from './media.js';
 
 /**
  * Result of a successful outbound send. Shared across all three channels so
@@ -93,6 +94,27 @@ export interface TemplateParameter {
   [key: string]: unknown;
 }
 
+/**
+ * Uniform input for the cross-channel {@link ChannelAdapter.sendMedia}.
+ *
+ * `kind` is the resolved {@link MediaKind} (the agent infers it from the chat
+ * action's MIME type via `inferMediaKind`); `mediaIdOrUrl` is a publicly
+ * reachable URL (all channels fetch the asset themselves) or, for WhatsApp, a
+ * pre-uploaded `media_id`. `caption` applies to image/video/document (WhatsApp
+ * audio drops it — see its `sendAudio`); `filename` names the document the
+ * recipient sees.
+ */
+export interface MediaSendInput {
+  /** Resolved send-kind: `'image' | 'audio' | 'video' | 'document'`. */
+  kind: MediaKind;
+  /** Public URL (every channel) or a WhatsApp pre-uploaded `media_id`. */
+  mediaIdOrUrl: string;
+  /** Optional caption (image / video / document; ignored where unsupported). */
+  caption?: string;
+  /** Optional document filename (used by `kind: 'document'`). */
+  filename?: string;
+}
+
 export interface ChannelAdapter {
   readonly channel: Channel;
   sendText(recipientId: string, text: string, opts?: SendOptions): Promise<SendResult>;
@@ -110,5 +132,25 @@ export interface ChannelAdapter {
    * channel-agnostic.
    */
   sendReaction(recipientId: string, messageId: string, emoji: string): Promise<void>;
+  /**
+   * Send a media attachment (image / audio / video / document) by URL (or, for
+   * WhatsApp, a pre-uploaded `media_id`).
+   *
+   * WHY a single `sendMedia` instead of four interface methods (sendImage /
+   * sendAudio / sendVideo / sendDocument): the per-channel clients already
+   * expose typed, channel-shaped media methods, but they DIVERGE — Messenger's
+   * document method is `sendFile` (its attachment type is literally `'file'`),
+   * WhatsApp's `sendDocument` requires a `filename`, WhatsApp `sendAudio` takes
+   * no caption, and Instagram's document is a `file` attachment that is PDF-only
+   * (~25MB) with no caption/filename in the body. Putting the per-kind switch on
+   * the INTERFACE would force the conversation agent to branch on channel + kind
+   * before every send. Instead each client implements one `sendMedia` that
+   * switches on `input.kind` and routes to its own typed method internally, so
+   * the agent dispatches a media item with ZERO channel branching. A send Meta
+   * rejects (e.g. a non-PDF / oversized Instagram `file`) throws; the agent
+   * catches that and skips the item (fail-soft), exactly like any other send
+   * error.
+   */
+  sendMedia(recipientId: string, input: MediaSendInput): Promise<SendResult>;
   supports(feature: ChannelFeature): boolean;
 }

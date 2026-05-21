@@ -1,0 +1,30 @@
+{
+  "messenger": {
+    "getStarted": { "payload": "GET_STARTED" },
+    "greeting": [{ "locale": "default", "text": "Hi! How can we help?" }],
+    "persistentMenu": [
+      {
+        "locale": "default",
+        "composerInputDisabled": false,
+        "callToActions": [
+          { "type": "postback", "title": "Talk to us", "payload": "TALK" },
+          { "type": "web_url", "title": "Website", "url": "https://example.com" }
+        ]
+      }
+    ],
+    "iceBreakers": [
+      {
+        "locale": "default",
+        "callToActions": [{ "question": "What are your hours?", "payload": "HOURS" }]
+      }
+    ]
+  },
+  "instagram": {
+    "iceBreakers": [
+      {
+        "locale": "default",
+        "callToActions": [{ "question": "How do I order?", "payload": "ORDER" }]
+      }
+    ]
+  }
+}

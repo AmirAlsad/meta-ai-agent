@@ -20,5 +20,5 @@
     "types": ["node", "vitest/globals"]
   },
   "include": ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts", "examples/**/*.ts", "vitest.config.ts"],
-  "exclude": ["node_modules", "dist", ".captures"]
+  "exclude": ["node_modules", "dist", ".captures", "examples/showcase-bot/**"]
 }

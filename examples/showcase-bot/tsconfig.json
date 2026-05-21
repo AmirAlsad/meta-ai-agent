@@ -1,0 +1,21 @@
+{
+  "//": "Self-contained tsconfig for the showcase-bot package ONLY. It deliberately does NOT extend the root tsconfig: this package has its own node_modules (it brings @anthropic-ai/sdk, which the root package must never pull in), so it must typecheck against those, independent of the root project.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["index.ts"],
+  "exclude": ["node_modules"]
+}

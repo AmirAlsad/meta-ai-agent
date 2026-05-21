@@ -1,4 +1,4 @@
-# Rich chat actions (Stage 5)
+# Rich chat actions
 
 The chat contract is the boundary between this transport package and the
 developer's AI logic. The agent POSTs a `ChatRequest` describing one buffered
@@ -26,7 +26,7 @@ developer's endpoint receives for one (possibly buffered) turn:
 | `conversationKey` | `string` | The `{channel}:{business}:{user}` key (see [Conversation state](./conversation-state.md)). |
 | `message` | `string` | Backward-compat aggregated text: the buffered bodies, newline-joined. |
 | `messages` | `IncomingMessage[]` | The structured per-message array for the buffered turn, in arrival order. |
-| `contact` | `Contact?` | Resolved identity, when available. Undefined in Stage 5 (no identity resolver yet). |
+| `contact` | `Contact?` | Resolved identity, when available. Populated by the [identity resolver](./identity-resolution.md) when `USER_LOOKUP_URL` is set; otherwise undefined. |
 | `capabilities` | `ChannelFeature[]` | The responding adapter's `supports()` truth set, so the endpoint can tailor its `actions[]` to what the channel can actually do. |
 | `context.windowOpen` | `boolean` | Whether the 24h customer-service window is currently open. |
 | `context.windowExpiresAt` | `number?` | Unix ms the window closes, when known. |
@@ -86,7 +86,7 @@ optional and supports four overlapping forms:
 | `reply` | `{ type: 'reply', text, targetMessageId }` | Send `text` threaded as a reply to `targetMessageId`. |
 | `reaction` | `{ type: 'reaction', emoji, targetMessageId }` | React to `targetMessageId` with `emoji`. |
 | `typing` | `{ type: 'typing', durationMs? }` | Show a typing indicator. |
-| `media` | `{ type: 'media', url, caption?, mimeType? }` | Send media at `url`. Skipped until Stage 7. |
+| `media` | `{ type: 'media', url, caption?, mimeType? }` | Send media at `url` (all three channels — see [Media send](./media.md)). |
 | `template` | `{ type: 'template', name, language, components? }` | Send a WhatsApp template. WhatsApp-only. |
 | `silence` | `{ type: 'silence' }` | A no-op signal — produces no outbound. |
 
@@ -171,7 +171,7 @@ a `skipped` list (for logging), not thrown:
 | `reply` | → `reply` item (`reply_to`) | **downgraded** to a plain `message` item (text still delivered; threading lost), recorded in `skipped` |
 | `reaction` | → `reaction` item | skipped with a reason |
 | `typing` | → `typing` item | skipped (best-effort; no content lost) |
-| `media` | → `media` item (`media_send`) | skipped — `media_send` is `false` everywhere until **Stage 7** |
+| `media` | → `media` item (`media_send`; the agent infers the kind from `mimeType` and routes via `sendMedia` — see [Media send](./media.md)) | skipped — only on a channel without `media_send` (all three support it since **Stage 7**) |
 | `template` | → `template` item (`template`) | skipped — only WhatsApp `supports('template')` |
 | `silence` | — | produces neither an item nor a skip note (pure no-op) |
 
@@ -186,19 +186,17 @@ queue is sent (ordering, channel-aware advancement) is
 ## Testing
 
 [`tests/unit/chat-contract.test.ts`](../../tests/unit/chat-contract.test.ts)
-(30 tests) covers `normalizeChatResponse`: the four forms, legacy ordering,
+covers `normalizeChatResponse`: the four forms, legacy ordering,
 mixed-silence drop, invalid-action drop, the lone-silence collapse, and the
 unknown-shape throw.
 [`tests/unit/chat-client.test.ts`](../../tests/unit/chat-client.test.ts)
-(10 tests) covers `HttpChatClient` with an injected `fetchImpl`: success, non-2xx,
+covers `HttpChatClient` with an injected `fetchImpl`: success, non-2xx,
 network/abort/parse failures all wrapping to `ChatEndpointError`, the timeout, and
 warning logging. `buildOutboundItems` capability gating lives in
 [`tests/unit/delivery-queue.test.ts`](../../tests/unit/delivery-queue.test.ts).
 
 ## Known limitations
 
-- `contact` is always undefined — no identity resolver yet (Stage 6).
-- `media` actions are skipped (Stage 7).
 - `context.windowOpen` is reported but not enforced (Stage 10).
 
 See [Known gaps](../KNOWN-GAPS.md) and [Architecture](../ARCHITECTURE.md).

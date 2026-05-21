@@ -151,6 +151,97 @@ describe('InstagramClient.sendText', () => {
 });
 
 /* ────────────────────────────────────────────────────────────────────────── */
+/* sendPrivateReply (comment-to-DM funnel — recipient.comment_id, 7-day window) */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('InstagramClient.sendPrivateReply', () => {
+  it('POSTs to graph.instagram.com /{userId}/messages with recipient.comment_id (NOT recipient.id)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(200, { recipient_id: '987', message_id: 'mid.IG_PR' })
+    );
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client.sendPrivateReply('comment-123', 'thanks for your comment!');
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const { url, init, body } = callAt(fetchImpl, 0);
+
+    // Same /messages endpoint on graph.instagram.com (NOT graph.facebook.com).
+    expect(url).toBe(MESSAGES_URL);
+    expect(init.method).toBe('POST');
+
+    // The comment_id key is what makes this a Private Reply — recipient must NOT
+    // carry an `id` (that would be an ordinary DM, not a comment-to-DM reply).
+    expect(body).toEqual({
+      recipient: { comment_id: 'comment-123' },
+      message: { text: 'thanks for your comment!' }
+    });
+    expect((body as { recipient: Record<string, unknown> }).recipient).not.toHaveProperty('id');
+
+    // Token is a Bearer header, NEVER in the URL.
+    const headers = init.headers as Record<string, string>;
+    expect(headers['authorization']).toBe(`Bearer ${ACCESS_TOKEN}`);
+    expect(url).not.toContain(ACCESS_TOKEN);
+    expect(url).not.toContain('access_token');
+
+    // SendResult parsed from message_id; recipientId carries the comment id.
+    expect(result).toMatchObject({
+      channel: 'instagram',
+      messageId: 'mid.IG_PR',
+      recipientId: 'comment-123'
+    });
+    expect(typeof result.timestamp).toBe('number');
+    expect(result.raw).toEqual({ recipient_id: '987', message_id: 'mid.IG_PR' });
+  });
+
+  it('honors the pacer: a back-to-back private reply respects the 100ms floor', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockImplementation(() => Promise.resolve(jsonResponse(200, { message_id: 'mid.IG_PR' })));
+    const clock = controllableClock(1000);
+    const sleep = recordingSleep();
+    const { client } = makeClient(fetchImpl, { now: clock.now, sleep: sleep.fn });
+
+    // Two private replies fired back-to-back at the SAME (frozen) clock time.
+    await Promise.all([
+      client.sendPrivateReply('comment-a', 'one'),
+      client.sendPrivateReply('comment-b', 'two')
+    ]);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    // Second call's reserved slot is 1000 + 100 = 1100; now is still 1000 → 100ms.
+    expect(sleep.calls).toEqual([100]);
+  });
+
+  it('surfaces a 400 Meta error as MetaApiError (e.g. outside the 7-day window)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(400, {
+        error: {
+          message: 'Outside of allowed window',
+          type: 'OAuthException',
+          code: 100,
+          error_subcode: 2534022,
+          fbtrace_id: 'trace-ig-pr-400'
+        }
+      })
+    );
+    const { client } = makeClient(fetchImpl);
+
+    let caught: unknown;
+    try {
+      await client.sendPrivateReply('comment-old', 'too late');
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(MetaApiError);
+    const meta = caught as MetaApiError;
+    expect(meta.operation).toBe('instagram.sendPrivateReply');
+    expect(meta.httpStatus).toBe(400);
+    expect(meta.errorCode).toBe(100);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
 /* Typing indicator (separate request)                                         */
 /* ────────────────────────────────────────────────────────────────────────── */
 
@@ -263,6 +354,178 @@ describe('InstagramClient.sendReaction', () => {
     });
     expect(body.payload).not.toHaveProperty('reaction');
     expect(body).not.toHaveProperty('message');
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Media sends — image / audio / video / document (URL-based attachments)      */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('InstagramClient media sends', () => {
+  const MEDIA_URL = 'https://cdn.example.com/asset.bin';
+
+  it.each([
+    ['sendImage', 'image'],
+    ['sendAudio', 'audio'],
+    ['sendVideo', 'video']
+  ] as const)('%s POSTs a URL-based attachment with type %s', async (method, type) => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { recipient_id: '987', message_id: 'mid.IG_MEDIA' }));
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client[method]('987', MEDIA_URL);
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const { url, init, body } = callAt(fetchImpl, 0);
+
+    // Exact host + URL (graph.instagram.com /{userId}/messages).
+    expect(url).toBe(MESSAGES_URL);
+    expect(init.method).toBe('POST');
+
+    // Exact request body: attachment.type + payload.url.
+    expect(body).toEqual({
+      recipient: { id: '987' },
+      message: { attachment: { type, payload: { url: MEDIA_URL } } }
+    });
+
+    // Token is a Bearer header, NEVER in the URL.
+    const headers = init.headers as Record<string, string>;
+    expect(headers['authorization']).toBe(`Bearer ${ACCESS_TOKEN}`);
+    expect(url).not.toContain(ACCESS_TOKEN);
+    expect(url).not.toContain('access_token');
+
+    // SendResult parsed from message_id.
+    expect(result).toMatchObject({
+      channel: 'instagram',
+      messageId: 'mid.IG_MEDIA',
+      recipientId: '987'
+    });
+    expect(typeof result.timestamp).toBe('number');
+  });
+
+  it('sendDocument POSTs a URL-based attachment with type "file" and returns a SendResult', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(200, { recipient_id: '987', message_id: 'mid.IG_DOC' })
+    );
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client.sendDocument('987', MEDIA_URL);
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const { url, init, body } = callAt(fetchImpl, 0);
+
+    // Exact host + URL (graph.instagram.com /{userId}/messages).
+    expect(url).toBe(MESSAGES_URL);
+    expect(init.method).toBe('POST');
+
+    // IG documents are sent as a `file` attachment (PDF-only ~25MB per Meta docs).
+    expect(body).toEqual({
+      recipient: { id: '987' },
+      message: { attachment: { type: 'file', payload: { url: MEDIA_URL } } }
+    });
+
+    // Token is a Bearer header, NEVER in the URL.
+    const headers = init.headers as Record<string, string>;
+    expect(headers['authorization']).toBe(`Bearer ${ACCESS_TOKEN}`);
+    expect(url).not.toContain(ACCESS_TOKEN);
+
+    // SendResult parsed from message_id.
+    expect(result).toMatchObject({
+      channel: 'instagram',
+      messageId: 'mid.IG_DOC',
+      recipientId: '987'
+    });
+    expect(typeof result.timestamp).toBe('number');
+  });
+
+  it('media sends honor the pacer: a back-to-back image+image respects the 100ms floor', async () => {
+    // Fresh Response per call (one-shot body stream).
+    const fetchImpl = vi.fn().mockImplementation(() => Promise.resolve(jsonResponse(200, { message_id: 'mid.IG_MEDIA' })));
+    const clock = controllableClock(1000);
+    const sleep = recordingSleep();
+    const { client } = makeClient(fetchImpl, { now: clock.now, sleep: sleep.fn });
+
+    // Two media sends fired back-to-back at the SAME (frozen) clock time.
+    await Promise.all([client.sendImage('987', MEDIA_URL), client.sendImage('987', MEDIA_URL)]);
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    // Second call's reserved slot is 1000 + 100 = 1100; now is still 1000 → 100ms.
+    expect(sleep.calls).toEqual([100]);
+  });
+
+  it('surfaces a 400 Meta error on a media send as MetaApiError', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(
+      jsonResponse(400, {
+        error: {
+          message: 'Invalid attachment',
+          type: 'OAuthException',
+          code: 100,
+          error_subcode: 2534022,
+          fbtrace_id: 'trace-ig-media-400'
+        }
+      })
+    );
+    const { client } = makeClient(fetchImpl);
+
+    let caught: unknown;
+    try {
+      await client.sendImage('987', MEDIA_URL);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(MetaApiError);
+    const meta = caught as MetaApiError;
+    expect(meta.operation).toBe('instagram.sendImage');
+    expect(meta.httpStatus).toBe(400);
+    expect(meta.errorCode).toBe(100);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* sendMedia (uniform ChannelAdapter entry point → per-kind attachment body)   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('InstagramClient.sendMedia', () => {
+  const MEDIA_URL = 'https://cdn.example.com/asset.bin';
+
+  it.each([
+    ['image', 'image'],
+    ['audio', 'audio'],
+    ['video', 'video']
+  ] as const)('kind %s → URL-based attachment type %s', async (kind, type) => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { message_id: 'mid.IG_MEDIA' }));
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client.sendMedia('987', { kind, mediaIdOrUrl: MEDIA_URL });
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const { url, body } = callAt(fetchImpl, 0);
+    expect(url).toBe(MESSAGES_URL);
+    expect(body).toEqual({
+      recipient: { id: '987' },
+      message: { attachment: { type, payload: { url: MEDIA_URL } } }
+    });
+    expect(result.messageId).toBe('mid.IG_MEDIA');
+  });
+
+  it('kind document → URL-based attachment type "file" (filename unused in the body)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(jsonResponse(200, { message_id: 'mid.IG_DOC' }));
+    const { client } = makeClient(fetchImpl);
+
+    const result = await client.sendMedia('987', {
+      kind: 'document',
+      mediaIdOrUrl: MEDIA_URL,
+      filename: 'x.pdf'
+    });
+
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const { url, body } = callAt(fetchImpl, 0);
+    expect(url).toBe(MESSAGES_URL);
+    // `document` maps to IG's `file` attachment; filename is not part of the body.
+    expect(body).toEqual({
+      recipient: { id: '987' },
+      message: { attachment: { type: 'file', payload: { url: MEDIA_URL } } }
+    });
+    expect(result.messageId).toBe('mid.IG_DOC');
   });
 });
 
@@ -407,9 +670,14 @@ describe('InstagramClient.supports', () => {
     expect(client.supports('reaction')).toBe(true);
 
     expect(client.supports('template')).toBe(false);
-    expect(client.supports('media_send')).toBe(false);
+    // media_send is TRUE — image/audio/video AND document (IG `file`, PDF-only)
+    // all send via URL-based attachments (Stage 7).
+    expect(client.supports('media_send')).toBe(true);
     expect(client.supports('story_reply')).toBe(false);
-    expect(client.supports('ice_breakers')).toBe(false);
+    // ice_breakers is TRUE as of Stage 8 — configurable out-of-band via
+    // InstagramIceBreakers (POST {userId}/messenger_profile on graph.instagram.com).
+    expect(client.supports('ice_breakers')).toBe(true);
+    // IG has no Get Started button and persistent menu is out of scope here.
     expect(client.supports('persistent_menu')).toBe(false);
     expect(client.supports('get_started')).toBe(false);
   });

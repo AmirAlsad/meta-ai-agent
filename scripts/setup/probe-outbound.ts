@@ -1325,7 +1325,13 @@ function reportSummary(
 /** Construct only the clients for configured channels (over the shared graph). */
 function buildClients(config: Config, graph: GraphClient, logger: pino.Logger): ChannelClients {
   const clients: ChannelClients = {};
-  if (config.whatsapp) clients.whatsapp = new WhatsAppClient({ config: config.whatsapp, graph, logger });
+  if (config.whatsapp)
+    clients.whatsapp = new WhatsAppClient({
+      config: config.whatsapp,
+      graph,
+      apiVersion: config.meta.graphApiVersion,
+      logger
+    });
   if (config.messenger) clients.messenger = new MessengerClient({ config: config.messenger, graph, logger });
   if (config.instagram) clients.instagram = new InstagramClient({ config: config.instagram, graph, logger });
   return clients;

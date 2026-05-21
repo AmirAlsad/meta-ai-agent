@@ -19,12 +19,31 @@
 import type pino from 'pino';
 import type { MessengerConfig } from '../../config/loader.js';
 import type { GraphClient } from '../shared/graph-client.js';
-import type { ChannelAdapter, ChannelFeature, SendOptions, SendResult } from '../shared/adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelFeature,
+  MediaSendInput,
+  SendOptions,
+  SendResult
+} from '../shared/adapter.js';
 
 export interface MessengerClientDeps {
   config: MessengerConfig;
   graph: GraphClient;
   logger?: Pick<pino.Logger, 'info' | 'warn' | 'debug'>;
+}
+
+/**
+ * Per-media-send options. Messenger media is URL-based, so the only knob is
+ * whether Meta should mint a reusable attachment id from the URL.
+ */
+export interface MediaSendOptions {
+  /**
+   * Ask Meta to return a reusable `attachment_id` for this asset (default
+   * `false`). Leave unset for one-shot sends — see the WHY-comment on
+   * {@link MessengerClient.sendAttachment}.
+   */
+  isReusable?: boolean;
 }
 
 /** Shape of the `{pageId}/messages` send response we care about. */
@@ -140,6 +159,109 @@ export class MessengerClient implements ChannelAdapter {
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */
+  /* Media sends — message.attachment with a URL payload                        */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Send an image: `message.attachment` with `type: 'image'` and a URL payload.
+   * Delegates to {@link sendAttachment}.
+   */
+  async sendImage(recipientId: string, url: string, opts?: MediaSendOptions): Promise<SendResult> {
+    return this.sendAttachment(recipientId, 'image', url, 'messenger.sendImage', opts);
+  }
+
+  /**
+   * Send an audio clip: `message.attachment` with `type: 'audio'` and a URL
+   * payload. Delegates to {@link sendAttachment}.
+   */
+  async sendAudio(recipientId: string, url: string, opts?: MediaSendOptions): Promise<SendResult> {
+    return this.sendAttachment(recipientId, 'audio', url, 'messenger.sendAudio', opts);
+  }
+
+  /**
+   * Send a video: `message.attachment` with `type: 'video'` and a URL payload.
+   * Delegates to {@link sendAttachment}.
+   */
+  async sendVideo(recipientId: string, url: string, opts?: MediaSendOptions): Promise<SendResult> {
+    return this.sendAttachment(recipientId, 'video', url, 'messenger.sendVideo', opts);
+  }
+
+  /**
+   * Send a generic file/document: `message.attachment` with `type: 'file'` and a
+   * URL payload. Delegates to {@link sendAttachment}.
+   *
+   * WHY this is `sendFile` (not `sendDocument`): Messenger's attachment type for
+   * arbitrary documents is literally `'file'`, so the method mirrors the API.
+   * (WhatsApp calls the same concept `sendDocument` — the uniform `sendMedia`
+   * maps a `document` kind to this method so the agent stays channel-agnostic.)
+   */
+  async sendFile(recipientId: string, url: string, opts?: MediaSendOptions): Promise<SendResult> {
+    return this.sendAttachment(recipientId, 'file', url, 'messenger.sendFile', opts);
+  }
+
+  /**
+   * {@link ChannelAdapter.sendMedia} — route a uniform media payload to the
+   * typed per-kind method above based on `input.kind`. `document` maps to
+   * {@link MessengerClient.sendFile} (Messenger's document attachment type is
+   * literally `'file'`); `image`/`audio`/`video` map to their matching methods.
+   * Captions are not part of Messenger's URL-attachment body, so `input.caption`
+   * / `input.filename` are intentionally unused here. The agent calls this so it
+   * can dispatch a media item without branching on channel or kind.
+   */
+  async sendMedia(recipientId: string, input: MediaSendInput): Promise<SendResult> {
+    switch (input.kind) {
+      case 'image':
+        return this.sendImage(recipientId, input.mediaIdOrUrl);
+      case 'audio':
+        return this.sendAudio(recipientId, input.mediaIdOrUrl);
+      case 'video':
+        return this.sendVideo(recipientId, input.mediaIdOrUrl);
+      case 'document':
+        return this.sendFile(recipientId, input.mediaIdOrUrl);
+    }
+  }
+
+  /**
+   * Shared media send: `POST {pageId}/messages` with
+   * `{ recipient, messaging_type: 'RESPONSE', message: { attachment: { type,
+   * payload: { url, is_reusable } } } }`.
+   *
+   * WHY URL-based (no upload step): Messenger fetches the asset from the supplied
+   * URL itself — unlike WhatsApp, there is no separate `/media` upload to obtain
+   * an id first. The caller is responsible for passing a publicly-reachable URL.
+   *
+   * WHY `is_reusable` defaults to `false`: these are one-shot sends. Setting
+   * `is_reusable: true` would make Meta mint a persistent reusable attachment id
+   * (to be cached and re-sent later) — needless server-side state for a single
+   * outbound message. Callers that genuinely want a reusable id opt in via
+   * `opts.isReusable`.
+   *
+   * NOTE: this PRIVATE helper is distinct from the public {@link
+   * MessengerClient.sendMedia} (the {@link ChannelAdapter} entry point). This one
+   * builds the attachment body for a Messenger attachment `type`; the public one
+   * routes a uniform {@link MediaSendInput} to the per-kind method.
+   */
+  private sendAttachment(
+    recipientId: string,
+    type: 'image' | 'audio' | 'video' | 'file',
+    url: string,
+    operation: string,
+    opts?: MediaSendOptions
+  ): Promise<SendResult> {
+    const body = {
+      recipient: { id: recipientId },
+      messaging_type: 'RESPONSE',
+      message: {
+        attachment: {
+          type,
+          payload: { url, is_reusable: opts?.isReusable ?? false }
+        }
+      }
+    };
+    return this.post(body, operation).then((raw) => this.toSendResult(recipientId, raw));
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────── */
   /* ChannelAdapter surface (uniform cross-channel signatures)                 */
   /* ──────────────────────────────────────────────────────────────────────── */
 
@@ -206,8 +328,14 @@ export class MessengerClient implements ChannelAdapter {
   }
 
   /**
-   * Stage-4 capability matrix for Messenger. Stage 7 (media) and Stage 8
-   * (persistent menu / get started / ice breakers) flip some of these on.
+   * Capability matrix for Messenger. Stage 7 flipped `media_send` on; the
+   * profile surfaces (persistent menu / get started / ice breakers) are now on
+   * too — they are CONFIGURED OUT-OF-BAND via the Messenger Profile API
+   * ({@link import('./profile.js').MessengerProfileClient}, hitting
+   * `{pageId}/messenger_profile`), NOT sent per message. `supports()` advertises
+   * that these surfaces EXIST for the channel so the conversation agent can
+   * include them in its capability set; the actual setup lives in the profile
+   * client.
    */
   supports(feature: ChannelFeature): boolean {
     switch (feature) {
@@ -225,11 +353,15 @@ export class MessengerClient implements ChannelAdapter {
         // message templates are a different feature and out of Stage-4 scope.
         return false;
       case 'media_send':
-        return false; // Stage 7.
+        // Stage 7: image/audio/video/file via `message.attachment` (URL payload)
+        // — see sendImage/sendAudio/sendVideo/sendFile.
+        return true;
       case 'persistent_menu':
       case 'get_started':
       case 'ice_breakers':
-        return false; // Stage 8.
+        // Configured out-of-band via the Messenger Profile API (see
+        // MessengerProfileClient), not per message. The channel supports them.
+        return true;
       case 'story_reply':
         return false; // Instagram-only concept.
       default:

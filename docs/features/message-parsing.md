@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The Stage 2 parser converts raw Meta webhook payloads from all three channels (WhatsApp Cloud API, Messenger Platform, Instagram Business Login) into a single normalized `IncomingMessage` / `StatusUpdate` shape. The conversation agent (Stage 5), status tracker (Stage 6), and outbound clients (Stage 4) consume that shape directly so they never branch on `channel === 'whatsapp'` for routing concerns the parser can hide. A unified shape matters because the three raw payloads disagree on timestamp units (WhatsApp seconds vs. Messenger/IG milliseconds), echo direction, identity fields (`wa_id` / PSID / IGSID), and message-id formats (`wamid.*` / `m_*` / base64-ish) — folding those differences into a single discriminated union is the only way to keep downstream stages tractable.
+The parser converts raw Meta webhook payloads from all three channels (WhatsApp Cloud API, Messenger Platform, Instagram Business Login) into a single normalized `IncomingMessage` / `StatusUpdate` shape. The conversation agent, status tracker, and outbound clients consume that shape directly so they never branch on `channel === 'whatsapp'` for routing concerns the parser can hide. A unified shape matters because the three raw payloads disagree on timestamp units (WhatsApp seconds vs. Messenger/IG milliseconds), echo direction, identity fields (`wa_id` / PSID / IGSID), and message-id formats (`wamid.*` / `m_*` / base64-ish) — folding those differences into a single discriminated union is the only way to keep downstream stages tractable.
 
 The parser is a pure, side-effect-free function: `parseMetaWebhook(payload: unknown): ParseResult`. It is wired into the POST `/webhook` route via `dispatchWebhook` in [`src/http/app.ts`](../../src/http/app.ts), which emits structured logs per message and per status update after the 200 ACK has already been sent.
 
@@ -78,7 +78,7 @@ Also defined in [`src/meta/types.ts`](../../src/meta/types.ts). Produced for out
 | Field | Type | Semantics |
 | --- | --- | --- |
 | `channel` | `Channel` | Source channel. |
-| `channelMessageId` | `string` | Channel id of the OUTBOUND message this status refers to. For Messenger/IG read events without an explicit `mid`, this is the stringified watermark — the status tracker (Stage 6) will sweep all outbound with `timestamp <= watermark`. |
+| `channelMessageId` | `string` | Channel id of the OUTBOUND message this status refers to. For Messenger/IG read events without an explicit `mid`, this is the stringified watermark — the [status tracker](./status-tracking.md) sweeps all outbound with `timestamp <= watermark`. |
 | `channelScopedUserId` | `string?` | The user side. WhatsApp provides this; Messenger/IG derive it from `messaging[].sender.id` on read/delivery events. |
 | `channelScopedBusinessId` | `string` | Your side. |
 | `status` | `'sent' \| 'delivered' \| 'read' \| 'failed'` | Cross-channel delivery enum. WhatsApp produces all four; Messenger emits `'delivered'` and `'read'`; Instagram emits only `'read'`. |
@@ -131,25 +131,25 @@ Also defined in [`src/meta/types.ts`](../../src/meta/types.ts). Produced for out
 - **The parser is non-throwing.** Every public entry point (`parseMetaWebhook`, `parseWhatsAppWebhook`, `parseMessengerWebhook`, `parseInstagramWebhook`) returns a `ParseResult` even for malformed, null, undefined, primitive, or array inputs. Throwing would corrupt the dead-letter-queue contract: Meta retries non-2xx for 7 days then permanently drops, so a thrown parser bug would either crash the handler or get swallowed and lose data. The dispatcher wraps the call in a defensive `try`/`catch` as a belt-and-suspenders safety net (see [Inbound webhooks](./inbound-webhooks.md)).
 - **Echo direction-flip.** For `is_echo: true` messages on Messenger and Instagram, raw `sender.id` is the BUSINESS and `recipient.id` is the USER. The parser unflips this so `channelScopedUserId` is ALWAYS the user side. Downstream code keys on `channelScopedUserId` for conversation routing, identity resolution, and dedupe — this rule is load-bearing.
 - **Timestamp normalization.** All timestamps land as Unix milliseconds. WhatsApp's seconds-as-string is parsed and upscaled (`* 1000` for values below 1e12). If the timestamp is missing or unparseable, the parser falls back to `Date.now()` rather than dropping the message — losing a parseable message because of a bad timestamp is worse than logging the moment we received it, since Meta will not retry a 200-ACKed delivery.
-- **Per-payload dedupe.** Both `messages` and `statuses` are deduped in-place by `channelMessageId`, preserving first occurrence. This handles Meta's observed habit of batching identical message blocks across `entry[]` items within a single delivery. **Cross-payload dedupe** (across redelivery) is the conversation agent's responsibility (Stage 5+).
+- **Per-payload dedupe.** Both `messages` and `statuses` are deduped in-place by `channelMessageId`, preserving first occurrence. This handles Meta's observed habit of batching identical message blocks across `entry[]` items within a single delivery. **Cross-payload dedupe** (across redelivery) is the conversation agent's responsibility.
 - **Reaction synthetic id is `${senderId}-${targetMessageId}-${action}` with no timestamp.** Meta retries non-2xx for 7 days, and batched events sometimes carry slightly-different timestamps for the same logical reaction. A stable id collapses identical reaction events across per-payload retries. Postback / referral synthetic ids deliberately keep the timestamp because they have meaningful single-payload uniqueness already.
 - **Unknown-event counter for Messenger/IG.** A monotonic counter scoped to a single `parseFbStylePayload` call prevents bursty opt-in / handover events at the same millisecond from collapsing to one record under dedupe. Postback / referral ids do not use the counter — they have other discriminators.
 - **`raw` is per-event, not the whole webhook.** Each `IncomingMessage.raw` is the per-message slice (e.g. `messages[i]` for WhatsApp or the `messaging[]` entry for Messenger/IG); each `StatusUpdate.raw` is the per-status slice. Keeping the slice small bounds memory and avoids leaking unrelated events into observability logs.
 
 ## What's intentionally NOT in scope yet
 
-- **WhatsApp `statuses[].conversation` / `pricing` blocks** are preserved on `raw` but not extracted. Stage 4 (messaging-window tracking) will pull `conversation.expiration_timestamp` and `pricing.category`.
-- **Order, contact-card, reel, and template-fallback attachments** are surfaced as `'unknown'`. Stage 7 (rich features) will add dedicated normalized variants.
-- **Cross-payload dedupe** is the conversation agent's job (Stage 5). The parser only dedupes within a single delivery.
+- **WhatsApp `statuses[].conversation` / `pricing` blocks** are preserved on `raw` but not extracted. Pulling `conversation.expiration_timestamp` and `pricing.category` (for messaging-window awareness and billing observability) is deferred to Stage 10 — see [Known gaps](../KNOWN-GAPS.md).
+- **Order, contact-card, reel, and template-fallback attachments** are surfaced as `'unknown'`. First-class normalized variants are deferred (revisit when real captures surface `reel` / `payment` / order shapes worth modeling) — see [Known gaps](../KNOWN-GAPS.md).
+- **Cross-payload dedupe** is the conversation agent's job. The parser only dedupes within a single delivery.
 - **Page-linked Instagram routing** is unsupported. This package targets the Instagram Business Login path (`object: 'instagram'`) only.
-- **Real-payload validation.** Fixtures today are documentation-derived; Stage 3 (`npm run capture:guided`) will replace them with redacted live captures, which often surface drift the parser will need to absorb.
+- **Real-payload validation.** Most fixtures are still documentation-derived; `npm run capture:guided` (and the `setup:<channel>` scripts) have promoted a handful of redacted live captures (exercised by `tests/unit/parser-captured.test.ts`), with more still to capture — live payloads often surface drift the parser will need to absorb. See [Payload capture](./payload-capture.md) and [Known gaps](../KNOWN-GAPS.md).
 
 ## Code references
 
 - [`src/meta/types.ts`](../../src/meta/types.ts) — raw + normalized type declarations.
 - [`src/meta/parser.ts`](../../src/meta/parser.ts) — `parseMetaWebhook` plus per-channel parsers, narrowing helpers, and `dedupeById`.
 - [`src/http/app.ts`](../../src/http/app.ts) — `dispatchWebhook` integration, per-message and per-status logging.
-- [`tests/unit/parser.test.ts`](../../tests/unit/parser.test.ts) — 61 parser tests covering all three channels.
+- [`tests/unit/parser.test.ts`](../../tests/unit/parser.test.ts) — parser tests covering all three channels.
 - [`tests/integration/webhook-routing.test.ts`](../../tests/integration/webhook-routing.test.ts) — full Express pipeline including the dispatcher's defensive catch.
 
-See [Inbound webhooks](./inbound-webhooks.md) for the route-level wiring and [Architecture](../ARCHITECTURE.md) for the planned downstream consumers.
+See [Inbound webhooks](./inbound-webhooks.md) for the route-level wiring and [Architecture](../ARCHITECTURE.md) for the downstream consumers.

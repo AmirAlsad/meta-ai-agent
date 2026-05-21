@@ -1,0 +1,124 @@
+import { describe, expect, it } from 'vitest';
+import {
+  buildTemplateComponents,
+  payloadParameter,
+  textParameter
+} from '../../src/meta/whatsapp/templates.js';
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* textParameter                                                               */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('textParameter', () => {
+  it('builds a { type: "text", text } parameter', () => {
+    expect(textParameter('Ada')).toEqual({ type: 'text', text: 'Ada' });
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* payloadParameter                                                            */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('payloadParameter', () => {
+  it('builds a { type: "payload", payload } parameter (the quick_reply button kind)', () => {
+    expect(payloadParameter('YES')).toEqual({ type: 'payload', payload: 'YES' });
+  });
+
+  it('produces a quick_reply button component carrying a payload parameter', () => {
+    const components = buildTemplateComponents({
+      buttonParameters: [{ subType: 'quick_reply', index: 0, parameters: [payloadParameter('CONFIRM')] }]
+    });
+    expect(components).toEqual([
+      {
+        type: 'button',
+        sub_type: 'quick_reply',
+        index: 0,
+        parameters: [{ type: 'payload', payload: 'CONFIRM' }]
+      }
+    ]);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* buildTemplateComponents                                                     */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('buildTemplateComponents', () => {
+  it('returns [] for empty input', () => {
+    expect(buildTemplateComponents({})).toEqual([]);
+  });
+
+  it('builds header + body + button components in order with the exact shape', () => {
+    const components = buildTemplateComponents({
+      headerParameters: [textParameter('Header')],
+      bodyParameters: [textParameter('Ada'), textParameter('Order #42')],
+      buttonParameters: [
+        { subType: 'quick_reply', index: 0, parameters: [{ type: 'payload', payload: 'YES' }] },
+        { subType: 'url', index: 1, parameters: [textParameter('track-123')] }
+      ]
+    });
+
+    expect(components).toEqual([
+      { type: 'header', parameters: [{ type: 'text', text: 'Header' }] },
+      {
+        type: 'body',
+        parameters: [
+          { type: 'text', text: 'Ada' },
+          { type: 'text', text: 'Order #42' }
+        ]
+      },
+      {
+        type: 'button',
+        sub_type: 'quick_reply',
+        index: 0,
+        parameters: [{ type: 'payload', payload: 'YES' }]
+      },
+      {
+        type: 'button',
+        sub_type: 'url',
+        index: 1,
+        parameters: [{ type: 'text', text: 'track-123' }]
+      }
+    ]);
+  });
+
+  it('omits the header when only body params are supplied', () => {
+    const components = buildTemplateComponents({
+      bodyParameters: [textParameter('Ada')]
+    });
+    expect(components).toEqual([{ type: 'body', parameters: [{ type: 'text', text: 'Ada' }] }]);
+  });
+
+  it('omits the body when only header params are supplied', () => {
+    const components = buildTemplateComponents({
+      headerParameters: [textParameter('Hi')]
+    });
+    expect(components).toEqual([{ type: 'header', parameters: [{ type: 'text', text: 'Hi' }] }]);
+  });
+
+  it('emits one button component per entry and no header/body when only buttons given', () => {
+    const components = buildTemplateComponents({
+      buttonParameters: [
+        { subType: 'quick_reply', index: 0, parameters: [{ type: 'payload', payload: 'A' }] }
+      ]
+    });
+    expect(components).toEqual([
+      { type: 'button', sub_type: 'quick_reply', index: 0, parameters: [{ type: 'payload', payload: 'A' }] }
+    ]);
+  });
+
+  it('passes non-text parameters (e.g. currency) through untouched', () => {
+    const currency = {
+      type: 'currency',
+      currency: { fallback_value: '$10.00', code: 'USD', amount_1000: 10000 }
+    };
+    const components = buildTemplateComponents({ bodyParameters: [currency] });
+    expect(components).toEqual([{ type: 'body', parameters: [currency] }]);
+  });
+
+  it('preserves an empty parameters array for a section (does not drop it)', () => {
+    // Supplying an explicit empty list is distinct from omitting the section.
+    const components = buildTemplateComponents({ bodyParameters: [] });
+    expect(components).toEqual([{ type: 'body', parameters: [] }]);
+  });
+});
