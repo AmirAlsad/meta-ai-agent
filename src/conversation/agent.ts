@@ -776,6 +776,13 @@ export class ConversationAgent {
               record.inboundBuffer = [...record.inboundBuffer, ...record.lateArrivals];
               record.lateArrivals = [];
               delete record.currentOutboundMessageId;
+              // Reset the reprocess counter: this is a FRESH follow-up turn, not a
+              // continuation of the failed (possibly committed-cap) one. Without
+              // this, a failure at `reprocessCount === MAX_REPROCESS` would make the
+              // rescued follow-up turn's first flush "committed" (no AbortController),
+              // so a message arriving during it couldn't abort+rebatch — losing the
+              // rebatch optimization for that turn (no messages dropped either way).
+              record.reprocessCount = 0;
               // Invariant: never `idle` with a non-empty `inboundBuffer`. We are
               // re-buffering unprocessed inbound, so `buffering` + a scheduled
               // flush is the correct resting state.
