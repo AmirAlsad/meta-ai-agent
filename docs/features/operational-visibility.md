@@ -55,7 +55,7 @@ When the token *is* set, the route is mounted and an absent/wrong token returns 
 ```
 
 - `checks.scheduler` — calls `scheduler.getStats()`; `ok` if it resolves (carrying the impl `kind` + stats), `error` if it throws (which fails readiness → 503), or `not_configured` when no scheduler is wired (still ready).
-- `checks.redis` — **presence-only**: `not_configured` when `REDIS_URL` is unset, `configured` when set. There is no real Redis ping yet; a configured-but-unpinged Redis does **not** fail readiness. The real ping (and the Redis-backed store / BullMQ scheduler it gates) lands in Stage 10 — see [Known gaps](../KNOWN-GAPS.md).
+- `checks.redis` — `not_configured` when `REDIS_URL` is unset (ready); `configured` when set but no client was injected (ready, presence-only — nothing to ping); and, when the Redis-backed runtime injects the shared client (Stage 10), a **real timeout-bounded `ping()`** raced against `READY_REDIS_TIMEOUT_MS` (default 2000) → `ok` (ready) or `error` (a rejection/timeout fails readiness → 503). See [Persistence → the `/ready` Redis ping](./persistence.md#the-ready-redis-ping).
 
 ## Metrics
 
@@ -147,17 +147,17 @@ The policy is **allow-list / fail-closed**: the inbound/outbound/record/status r
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ADMIN_API_TOKEN` | unset | Gates `/metrics` + `/admin/*` (constant-time bearer check). When unset, those routes are not mounted (404). When set, must be ≥16 chars (≥32 recommended). |
-| `REDIS_URL` | unset | Surfaced in `/ready` as `configured` vs `not_configured` (presence-only until the Stage 10 ping). |
+| `REDIS_URL` | unset | Selects the Stage 10 Redis persistence path; surfaced in `/ready` as `not_configured` / `configured` / a real `ping()` (`ok`/`error`) when the Redis runtime injects the client. See [Persistence](./persistence.md). |
 
 See [Configuration](./configuration.md) for the full env reference (including the identity knobs).
 
 ## Known limitations
 
-- **`/ready` Redis check is presence-only** — no real ping until Stage 10.
-- **Per-dispatch webhook logs still emit channel-scoped ids at `info`** — Stage 6 redacts only the admin-route *output*, not the dispatch logs. Gating dispatch-log PII is deferred to Stage 10.
+- **`/ready` Redis check does a real ping (Stage 10)** when the Redis-backed runtime injects a client; presence-only otherwise. See [Persistence](./persistence.md#the-ready-redis-ping).
+- **Per-dispatch webhook logs still emit channel-scoped ids at `info`** — Stage 6 redacts only the admin-route *output*, not the dispatch logs. Gating dispatch-log PII is still deferred.
 - **`contact.tags` / `customVariables` are not redacted** in admin output.
 - **Webhook signature-rejection metric is not wired** — rejections appear in warn logs only; `webhook_received_total` counts only signature-valid requests (the verifier 401s before the counter).
 - **Identity metric is coarse** (`resolved` / `none` / `disabled`).
-- **In-memory metrics/status/contact stores are unbounded** (apart from the metric cardinality cap) until the Redis swap in Stage 10.
+- **In-memory metrics/status/contact stores are unbounded** (apart from the metric cardinality cap) — Stage 10 made the conversation store, buffer scheduler, and limit-counter store Redis-backed, but these three stores stay in-memory in both paths; their Redis swaps with TTL eviction are still deferred (see [Known gaps](../KNOWN-GAPS.md)).
 
 See [Known gaps](../KNOWN-GAPS.md), [Status tracking](./status-tracking.md), [Read receipts](./read-receipts.md), [Identity resolution](./identity-resolution.md), and [Configuration](./configuration.md).

@@ -33,7 +33,11 @@ import type { Express } from 'express';
 import pino from 'pino';
 
 import type { Config } from '../src/config/loader.js';
-import { defaultConversationConfig } from '../src/config/loader.js';
+import {
+  defaultConversationConfig,
+  defaultLimitsConfig,
+  defaultPersistenceConfig
+} from '../src/config/loader.js';
 import { createApp } from '../src/http/app.js';
 import { ConversationAgent } from '../src/conversation/agent.js';
 import { InMemoryConversationStore } from '../src/conversation/store.js';
@@ -273,6 +277,8 @@ function buildReplConfig(chatEndpointUrl: string): Config {
       // lands the text well inside the flush window.
       typingRefreshIntervalMs: 50
     },
+    persistence: defaultPersistenceConfig(),
+    limits: defaultLimitsConfig(),
     chatEndpointUrl,
     ngrokDomain: 'repl.local',
     agentAutostart: false,

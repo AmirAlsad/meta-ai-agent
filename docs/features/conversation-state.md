@@ -157,10 +157,13 @@ set and strictly in the future (an unset value — no inbound seen yet — is tr
 as CLOSED).
 
 The flag is surfaced to the chat endpoint as `context.windowOpen` in the
-`ChatRequest` (see [Rich chat actions](./rich-chat-actions.md)). The agent
-*tracks and reports* the window; full enforcement (blocking out-of-window sends
-or forcing a WhatsApp template fallback) is Stage 10 — see
-[Known gaps](../KNOWN-GAPS.md).
+`ChatRequest` (see [Rich chat actions](./rich-chat-actions.md)). The agent both
+*tracks and reports* the window AND, on WhatsApp, **enforces** it: a send that
+fails with the 24h re-engagement error re-prompts the chat endpoint once for a
+template (Stage 10). See [Rate limiting → WhatsApp out-of-window
+re-prompt](./rate-limiting.md#whatsapp-out-of-window-re-prompt). (Messenger/Instagram
+have no reliable out-of-window mechanism for an automated bot, so there is nothing
+to enforce there.)
 
 ## Per-conversation serialization (load-bearing)
 
@@ -314,24 +317,27 @@ already ACKed the webhook 200 (Meta retries non-2xx for 7 days), so a thrown
 error would either crash the route after the ACK or get swallowed and lose data.
 `handleInboundImpl`, `handleStatusImpl`, and `flushImpl` wrap their bodies in a
 `try`/`catch` that logs and returns. Chat-endpoint errors and adapter send errors
-are logged; on a chat error the turn ends quietly (the user gets no reply — retry
-is Stage 10) and on a single bad send the item is marked skipped and the queue
-advances (see [Ordered delivery](./ordered-delivery.md)).
+are logged; on a chat error the turn ends quietly (the user gets no reply). On a
+single bad send, the error is classified (Stage 10): a known-safe transient failure
+is retried with backoff, a WhatsApp closed-window failure re-prompts for a template,
+and everything else is marked skipped and the queue advances (see
+[Ordered delivery](./ordered-delivery.md) and [Rate limiting](./rate-limiting.md)).
 
-## In-memory now, Redis in Stage 10
+## In-memory or Redis (dual-path)
 
-Stage 5 ships only `InMemoryConversationStore`
+The store and scheduler are dual-path, selected on `REDIS_URL`
+([`src/index.ts`](../../src/index.ts) `buildRuntime`). The in-memory pair —
+`InMemoryConversationStore`
 ([`src/conversation/store.ts`](../../src/conversation/store.ts)) and
-`InMemoryBufferScheduler`. State lives in plain `Map`s, is per-process, and
-disappears on restart, so the per-replica view diverges in a multi-replica
-deploy. The store holds three things: conversation records, an inbound dedupe set
-(presence-with-expiry simulating SETNX), and an outbound-handle map. The
-production path is the Redis-backed store (real `SET NX` for atomic dedupe, `SCAN`
-for `listConversationKeys`) plus a BullMQ-backed buffer scheduler, selected on
-`REDIS_URL`, which lands in Stage 10. The `ConversationStore` and
-`BufferScheduler` interfaces are the contract both implementations honor (the
-in-memory dedupe map is never swept — it relies on the later Redis TTL; see
-[Known gaps](../KNOWN-GAPS.md)).
+`InMemoryBufferScheduler` — keeps state in plain `Map`s: per-process, lost on
+restart, diverging across replicas (fine for tests, local runs, and single-replica
+deploys). The production path (`REDIS_URL` set) is `RedisConversationStore` (real
+`SET NX` for atomic cross-replica dedupe, `SCAN` for `listConversationKeys`, TTL
+eviction) plus the BullMQ-backed buffer scheduler. The `ConversationStore` and
+`BufferScheduler` interfaces are the contract both implementations honor. See
+[Persistence](./persistence.md) for the Redis key schema, the BullMQ scheduler, and
+the shared-client lifecycle. (The in-memory dedupe map is never swept — it relies on
+the Redis TTL on the production path; see [Known gaps](../KNOWN-GAPS.md).)
 
 ## Configuration
 
@@ -350,8 +356,12 @@ Buffer-timing knobs are documented in [Message buffering](./message-buffering.md
 
 ## Known limitations
 
-- No persistence — in-memory store/scheduler only (Stage 10).
-- No rate limiting and no out-of-window enforcement (Stage 10).
+- Persistence is dual-path (in-memory or Redis); the Stage 6 metrics/status/contact
+  stores stay in-memory in both paths (Redis swaps deferred — see
+  [Persistence](./persistence.md) and [Known gaps](../KNOWN-GAPS.md)).
+- Rate limiting and WhatsApp out-of-window enforcement landed in Stage 10, but
+  pacing is per-second only (no per-hour/per-day caps) — see
+  [Rate limiting](./rate-limiting.md).
 - The scheduler's own `setTimeout` failure catch is still uncounted at the
   scheduler level (the flush itself is instrumented via
   `buffer_flush_total{result:'error'}` at the agent level — see

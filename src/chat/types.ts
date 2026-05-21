@@ -41,6 +41,13 @@ export interface ChatRequest {
     windowOpen: boolean;
     /** Unix milliseconds the window closes, when known. */
     windowExpiresAt?: number;
+    /**
+     * Set true ONLY when the agent re-prompts after a WhatsApp send failed
+     * because the 24h messaging window is closed; signals the endpoint to reply
+     * with a `template` action (a free-form text will fail again). Absent on a
+     * normal turn.
+     */
+    requiresTemplate?: boolean;
   };
 }
 

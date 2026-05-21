@@ -16,7 +16,7 @@ import {
   type RegistrationContext
 } from '../../scripts/setup/register-webhooks.js';
 import type { Config } from '../../src/config/loader.js';
-import { defaultConversationConfig } from '../../src/config/loader.js';
+import { defaultConversationConfig, defaultLimitsConfig, defaultPersistenceConfig } from '../../src/config/loader.js';
 
 const META_BASE: Config['meta'] = {
   appId: 'app-111',
@@ -35,6 +35,8 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     instagram: { userId: 'ig-1', accessToken: 'ig-token' },
     channels: { whatsapp: true, messenger: true, instagram: true },
     conversation: defaultConversationConfig(),
+    persistence: defaultPersistenceConfig(),
+    limits: defaultLimitsConfig(),
     chatEndpointUrl: 'https://chat.example.com',
     ngrokDomain: 'test.ngrok-free.dev',
     agentAutostart: true,

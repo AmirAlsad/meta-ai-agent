@@ -4,6 +4,7 @@ import path from 'node:path';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import type pino from 'pino';
 import type { Config } from '../config/loader.js';
+import { tokenFormatWarnings } from '../config/loader.js';
 import { createMetaSignatureVerifier } from './security.js';
 import { traceMiddleware, requestContextFromLocals } from './trace.js';
 import { validateAdminToken } from './auth.js';
@@ -17,6 +18,15 @@ import { renderPrometheus, PROMETHEUS_CONTENT_TYPE } from '../metrics/prometheus
 import type { StatusTracker } from '../status/tracker.js';
 import type { ConversationStore } from '../conversation/store.js';
 import type { BufferScheduler } from '../conversation/scheduler.js';
+
+/**
+ * Minimal structural shape of an ioredis client for the GET /ready ping. Defined
+ * here (rather than importing ioredis's `Redis` into this module) so app.ts stays
+ * free of the ioredis dependency — ioredis's `Redis` is structurally assignable.
+ */
+export interface RedisPinger {
+  ping(): Promise<unknown>;
+}
 
 export interface AppDeps {
   config: Config;
@@ -38,12 +48,15 @@ export interface AppDeps {
    *  - `statusTracker`    → required (with adminApiToken) to MOUNT GET /admin/status.
    *  - `store`            → required (with adminApiToken) to MOUNT GET /admin/conversations.
    *  - `scheduler`        → drives the GET /ready dependency check.
+   *  - `redisClient`      → when supplied (the Redis persistence path), GET /ready
+   *                         PINGS it; absent ⇒ the redis check is presence-only.
    */
   metrics?: AgentMetrics;
   metricsCollector?: MetricsCollector;
   statusTracker?: StatusTracker;
   store?: ConversationStore;
   scheduler?: BufferScheduler;
+  redisClient?: RedisPinger;
 }
 
 /**
@@ -272,15 +285,20 @@ type ReadinessCheck = { status: string; [field: string]: unknown };
  *  - `scheduler`: call `getStats()` — healthy if it resolves; the report carries
  *    the impl `kind` + the returned stats. A missing scheduler is reported as
  *    `not_configured` (still ready — Stage 5 apps may run without one wired here).
- *  - `redis`: reported as `not_configured` when `config.redisUrl` is unset, else
- *    `configured`. WHY no ping: a real Redis ping (and the Redis-backed store /
- *    BullMQ scheduler it would gate) lands in Stage 10; until then we only report
- *    whether a URL is present, and a configured-but-unpinged Redis does NOT fail
- *    readiness.
+ *  - `redis` (Stage 10):
+ *      • `config.redisUrl` unset                  → `not_configured` (ready).
+ *      • set but no `redisClient` handed in       → `configured` (ready —
+ *        presence-only; the client wasn't injected, so there is nothing to ping).
+ *      • set WITH a `redisClient`                 → race `ping()` against
+ *        `config.persistence.readyRedisTimeoutMs`. A resolved ping → `ok`; a
+ *        rejection OR timeout → `error` and overall readiness fails. The timeout
+ *        timer is cleared so it can't leak. The whole check sits inside a
+ *        defensive try/catch so a throw degrades THIS check, never 500s the route.
  */
 async function buildReadinessReport(deps: {
   scheduler?: BufferScheduler;
   config: Config;
+  redisClient?: RedisPinger;
 }): Promise<{ ready: boolean; checks: Record<string, ReadinessCheck> }> {
   const checks: Record<string, ReadinessCheck> = {};
   let ready = true;
@@ -298,14 +316,40 @@ async function buildReadinessReport(deps: {
     }
   }
 
-  // redis check — presence-only until Stage 10 adds the real ping.
-  checks.redis = { status: deps.config.redisUrl ? 'configured' : 'not_configured' };
+  // redis check (Stage 10): presence-only when not configured / no client, else
+  // a real timeout-bounded PING.
+  if (!deps.config.redisUrl) {
+    checks.redis = { status: 'not_configured' };
+  } else if (!deps.redisClient) {
+    checks.redis = { status: 'configured' };
+  } else {
+    const client = deps.redisClient;
+    try {
+      // Race the ping against a cleared-on-settle timeout so neither a hung Redis
+      // nor a dangling timer can wedge the probe.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutMs = deps.config.persistence.readyRedisTimeoutMs;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`redis ping timed out after ${timeoutMs}ms`)), timeoutMs);
+      });
+      try {
+        await Promise.race([client.ping(), timeout]);
+        checks.redis = { status: 'ok' };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    } catch (err) {
+      ready = false;
+      checks.redis = { status: 'error', error: (err as Error).message };
+    }
+  }
 
   return { ready, checks };
 }
 
 export function createApp(deps: AppDeps): express.Express {
-  const { config, logger, agent, metrics, metricsCollector, statusTracker, store, scheduler } = deps;
+  const { config, logger, agent, metrics, metricsCollector, statusTracker, store, scheduler, redisClient } =
+    deps;
   const app = express();
   const startedAtMs = Date.now();
 
@@ -339,7 +383,7 @@ export function createApp(deps: AppDeps): express.Express {
   // each dependency check defensively (a thrown check fails that check rather
   // than 500ing the route) and returns 503 if ANY check fails, 200 otherwise.
   app.get('/ready', (_req: Request, res: Response) => {
-    void buildReadinessReport({ scheduler, config })
+    void buildReadinessReport({ scheduler, config, ...(redisClient ? { redisClient } : {}) })
       .then(({ ready, checks }) => {
         res
           .status(ready ? 200 : 503)
@@ -415,6 +459,15 @@ export function createApp(deps: AppDeps): express.Express {
       { channel: 'instagram' },
       'Instagram channel enabled but INSTAGRAM_APP_SECRET not set — inbound Instagram webhooks will fail signature verification.'
     );
+  }
+
+  // Advisory token-shape warnings (Stage 10): heuristic checks that catch common
+  // copy-paste mistakes (e.g. a Page token pasted into the WhatsApp slot, or a
+  // truncated token). These NEVER throw — token formats vary, so a false reject
+  // would break a working deploy. One warn line per returned warning, with the
+  // env var `field` so the cause is discoverable.
+  for (const warning of tokenFormatWarnings(config)) {
+    logger.warn({ field: warning.field }, warning.message);
   }
 
   const verifier = createMetaSignatureVerifier(signatureSecrets, logger);

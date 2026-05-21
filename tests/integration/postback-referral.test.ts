@@ -27,7 +27,7 @@ import request from 'supertest';
 import pino from 'pino';
 import { createApp } from '../../src/http/app.js';
 import type { Config } from '../../src/config/loader.js';
-import { defaultConversationConfig } from '../../src/config/loader.js';
+import { defaultConversationConfig, defaultLimitsConfig, defaultPersistenceConfig } from '../../src/config/loader.js';
 import { ConversationAgent } from '../../src/conversation/agent.js';
 import { InMemoryConversationStore } from '../../src/conversation/store.js';
 import { InMemoryBufferScheduler } from '../../src/conversation/scheduler.js';
@@ -73,6 +73,8 @@ function makeTestConfig(): Config {
     },
     channels: { whatsapp: false, messenger: true, instagram: true },
     conversation: defaultConversationConfig(),
+    persistence: defaultPersistenceConfig(),
+    limits: defaultLimitsConfig(),
     chatEndpointUrl: 'http://localhost:9999/chat',
     ngrokDomain: 'test.ngrok-free.dev',
     agentAutostart: false,
