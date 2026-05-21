@@ -1492,6 +1492,18 @@ export class ConversationAgent {
           if (!record || record.state !== 'sending') return false;
           const item = record.outboundQueue[record.currentOutboundIndex];
           if (!item || item.nextRetryAt === undefined || (item.retryCount ?? 0) <= 0) return false;
+          // MULTI-REPLICA DOUBLE-SEND GUARD: on a shared Redis, every replica runs
+          // this at boot and would each re-arm + re-send this same overdue retry
+          // (the per-process lock is not distributed). An atomic store claim, scoped
+          // to THIS attempt ({key}:{itemId}:{retryCount}), lets exactly one replica
+          // re-arm it. The in-memory store is single-process and always wins. A
+          // store without claimRecovery falls back to the prior single-replica
+          // behavior (true).
+          const claimToken = `${key}:${item.id}:${item.retryCount ?? 0}`;
+          const won = this.store.claimRecovery
+            ? await this.store.claimRecovery(claimToken, this.config.persistence.conversationTtlSeconds)
+            : true;
+          if (!won) return false;
           // Re-arm the SAME retry mechanism with the remaining delay (clamped to
           // >= 0 so an overdue retry fires promptly).
           const remainingMs = Math.max(0, item.nextRetryAt - this.now());

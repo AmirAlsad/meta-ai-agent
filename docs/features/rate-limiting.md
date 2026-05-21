@@ -207,6 +207,16 @@ timer with the *remaining* delay (`max(0, nextRetryAt - now)`, so an overdue ret
 promptly). Each per-key scan runs under `runExclusive` and is fail-soft so one bad
 record can't sink recovery. It returns `{ transientRetriesResumed }`.
 
+**Multi-replica double-send guard (load-bearing).** On a shared Redis, EVERY replica
+runs `recoverPendingRetries()` at boot (a rolling redeploy restarts them near-simultaneously),
+and the per-process `runExclusive` lock is NOT distributed — so without a guard each
+replica would re-arm and re-send the SAME overdue item (an N-replica double-send, since
+Meta has no idempotency key). Before re-arming, recovery makes an atomic
+`store.claimRecovery(claimToken, ttl)` call (`claimToken = {key}:{itemId}:{retryCount}`):
+the `RedisConversationStore` implements it as `SET NX EX` so exactly ONE replica wins and
+re-arms; the rest skip. The token is attempt-unique, so a *later* restart with a new retry
+attempt claims a fresh key. The in-memory store is single-process and always wins.
+
 **It does real work only against a durable (Redis) store.** The in-memory store wipes
 all state on restart, so `listConversationKeys()` yields nothing and the call returns
 `{ transientRetriesResumed: 0 }`. Recovery covers transient retries only — not in-flight

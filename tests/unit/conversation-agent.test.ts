@@ -2724,6 +2724,53 @@ describe('ConversationAgent', () => {
       expect(record!.currentOutboundIndex).toBe(1);
       await agent.close();
     });
+
+    it('recoverPendingRetries: does NOT re-arm when the store recovery claim is lost (multi-replica guard)', async () => {
+      // Simulate a "losing" replica: the shared store's claimRecovery returns false
+      // (another replica already claimed this retry). The pending retry must NOT be
+      // re-armed here, so the item is never re-sent by this replica — preventing the
+      // N-replica double-send.
+      const limitTracker = makeLimitTracker({ delayMs: 1000, maxAttempts: 3 });
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      // Override the (always-true) in-memory claim with a losing one.
+      store.claimRecovery = async () => false;
+      const scheduler = new InMemoryBufferScheduler();
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: makeChatClient([textResponse('unused')]),
+        adapters: { messenger: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined,
+        limitTracker
+      });
+
+      const sending: ConversationRecord = {
+        ...createIdleConversation({
+          key: 'messenger:biz-1:fb-user',
+          channel: 'messenger',
+          channelScopedUserId: 'fb-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'sending',
+        outboundQueue: [{ id: 'item-1', kind: 'message', text: 'resume me', retryCount: 1, nextRetryAt: FIXED_NOW - 5000 }],
+        currentOutboundIndex: 0
+      };
+      await store.setConversation(sending);
+
+      const result = await agent.recoverPendingRetries();
+      expect(result.transientRetriesResumed).toBe(0);
+
+      // No timer was armed → no re-send by this replica.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(adapter.sendText).not.toHaveBeenCalled();
+      await agent.close();
+    });
   });
 });
 

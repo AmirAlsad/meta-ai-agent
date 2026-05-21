@@ -67,6 +67,21 @@ describeRedis('RedisConversationStore (real redis)', () => {
     expect(await store.claimInboundHandle('wamid.2')).toBe(true);
   });
 
+  it('claimRecovery is atomic SET NX: only the first replica wins a given retry token', async () => {
+    // Two store instances share the same Redis client → simulate two replicas
+    // racing to recover the SAME pending retry. Exactly one wins.
+    const replicaA = new RedisConversationStore({ redis, dedupeTtlSeconds: 60, conversationTtlSeconds: 60 });
+    const replicaB = new RedisConversationStore({ redis, dedupeTtlSeconds: 60, conversationTtlSeconds: 60 });
+    const token = 'whatsapp:biz:user:item-1:1';
+    const [a, b] = await Promise.all([
+      replicaA.claimRecovery(token, 60),
+      replicaB.claimRecovery(token, 60)
+    ]);
+    expect([a, b].filter(Boolean)).toHaveLength(1); // exactly one winner
+    // A different retry token (next attempt) is independently claimable.
+    expect(await replicaA.claimRecovery('whatsapp:biz:user:item-1:2', 60)).toBe(true);
+  });
+
   it('peekInboundHandle TTL semantics: absent / present-with-ttl / present-no-ttl', async () => {
     expect(await store.peekInboundHandle('absent')).toEqual({ present: false });
 

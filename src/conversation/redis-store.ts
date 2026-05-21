@@ -35,6 +35,7 @@ const KEY_PREFIX = 'meta-ai-agent:';
 const CONVERSATION_PREFIX = `${KEY_PREFIX}conversation:`;
 const DEDUPE_INBOUND_PREFIX = `${KEY_PREFIX}dedupe:inbound:`;
 const OUTBOUND_PREFIX = `${KEY_PREFIX}outbound:`;
+const RECOVERY_PREFIX = `${KEY_PREFIX}recovery:`;
 
 function conversationKey(key: string): string {
   return `${CONVERSATION_PREFIX}${key}`;
@@ -46,6 +47,10 @@ function inboundDedupeKey(channelMessageId: string): string {
 
 function outboundMappingKey(channelMessageId: string): string {
   return `${OUTBOUND_PREFIX}${channelMessageId}`;
+}
+
+function recoveryKey(claimToken: string): string {
+  return `${RECOVERY_PREFIX}${claimToken}`;
 }
 
 export interface RedisConversationStoreOptions {
@@ -165,6 +170,17 @@ export class RedisConversationStore implements ConversationStore {
       cursor = next;
       for (const key of keys) yield key.slice(CONVERSATION_PREFIX.length);
     } while (cursor !== '0');
+  }
+
+  async claimRecovery(claimToken: string, ttlSeconds: number): Promise<boolean> {
+    // Atomic SET NX with TTL: across replicas booting at once on a SHARED Redis,
+    // only the FIRST to claim this specific retry ({key}:{itemId}:{retryCount})
+    // re-arms it — the rest get null and skip, so the in-flight item is re-sent by
+    // exactly one replica (no N-replica double-send). The token is attempt-unique,
+    // so a later restart with a NEW retry attempt claims a fresh key; the TTL is a
+    // belt-and-suspenders cleanup for tokens whose retry never completes.
+    const result = await this.redis.set(recoveryKey(claimToken), '1', 'EX', ttlSeconds, 'NX');
+    return result === 'OK';
   }
 
   /**

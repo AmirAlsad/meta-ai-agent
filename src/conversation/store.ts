@@ -44,6 +44,18 @@ export interface ConversationStore {
    * Redis impl will SCAN, the in-memory impl iterates the Map).
    */
   listConversationKeys(): AsyncIterable<string>;
+  /**
+   * Atomically claim the boot-recovery slot for ONE specific pending retry
+   * (`claimToken` is `{conversationKey}:{itemId}:{retryCount}`). Returns true
+   * only for the FIRST caller. WHY load-bearing: in a multi-replica deploy on a
+   * SHARED Redis, every replica runs `recoverPendingRetries()` at boot and would
+   * otherwise each re-arm the SAME overdue retry and re-send the in-flight item
+   * (the per-process `runExclusive` lock is NOT distributed) — an N-replica
+   * double-send. This atomic SET NX lets exactly one replica recover each retry.
+   * Optional so a future store can opt out; the in-memory store is single-process
+   * and always returns true (no cross-replica race exists).
+   */
+  claimRecovery?(claimToken: string, ttlSeconds: number): Promise<boolean>;
   close?(): Promise<void>;
 }
 
@@ -123,5 +135,12 @@ export class InMemoryConversationStore implements ConversationStore {
 
   async *listConversationKeys(): AsyncIterable<string> {
     for (const key of this.conversations.keys()) yield key;
+  }
+
+  async claimRecovery(_claimToken: string, _ttlSeconds: number): Promise<boolean> {
+    // Single-process: there is no cross-replica boot race to guard against, so the
+    // sole process always wins the recovery claim. (In practice this store also
+    // loses all state on restart, so recoverPendingRetries finds nothing to claim.)
+    return true;
   }
 }
