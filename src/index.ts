@@ -201,10 +201,10 @@ export function buildRuntime(
   // must not block the listener from coming up.
   void agent
     .recoverPendingRetries()
-    .then(({ transientRetriesResumed, processingReset }) => {
-      if (transientRetriesResumed > 0 || processingReset > 0) {
+    .then(({ transientRetriesResumed, processingReset, deliveryTimeoutsRearmed }) => {
+      if (transientRetriesResumed > 0 || processingReset > 0 || deliveryTimeoutsRearmed > 0) {
         logger.info(
-          { transientRetriesResumed, processingReset },
+          { transientRetriesResumed, processingReset, deliveryTimeoutsRearmed },
           'recovered conversations from persisted state'
         );
       }

@@ -2896,6 +2896,55 @@ describe('ConversationAgent', () => {
       expect(claimSpy).toHaveBeenCalledWith('messenger:biz-1:fb-user:processing:nonce-abc', expect.any(Number));
       await agent.close();
     });
+
+    it('recoverPendingRetries: re-arms the WhatsApp delivery-timeout for a first-send-crash (advances, no re-send)', async () => {
+      // WhatsApp (on_status) `sending` record: item0 was SENT (channelMessageId +
+      // currentOutboundMessageId) but has NO retryCount/nextRetryAt — the in-memory
+      // delivery-timeout died with the (simulated) old process. Recovery re-arms it so
+      // the queue self-heals: the fallback ADVANCES past the already-sent item0 (no
+      // re-send → no double-send) and sends item1.
+      const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const agent = new ConversationAgent({
+        store,
+        scheduler: new InMemoryBufferScheduler(),
+        chatClient: makeChatClient([textResponse('unused')]),
+        adapters: { whatsapp: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+
+      await store.setConversation({
+        ...createIdleConversation({
+          key: 'whatsapp:biz-1:wa-user',
+          channel: 'whatsapp',
+          channelScopedUserId: 'wa-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'sending',
+        outboundQueue: [
+          { id: 'item-0', kind: 'message', text: 'first', channelMessageId: 'wamid.sent', sentAt: FIXED_NOW },
+          { id: 'item-1', kind: 'message', text: 'second' }
+        ],
+        currentOutboundIndex: 0,
+        currentOutboundMessageId: 'wamid.sent',
+        lastInboundMessageId: 'wamid.in'
+      });
+
+      const result = await agent.recoverPendingRetries();
+      expect(result.deliveryTimeoutsRearmed).toBe(1);
+      expect(adapter.sendText).not.toHaveBeenCalled(); // nothing re-sent on re-arm
+
+      // Fire the re-armed fallback → advance past item0 (NOT re-sent) → send item1.
+      await vi.advanceTimersByTimeAsync(makeConfig().conversation.outboundDeliveryTimeoutMs);
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(adapter.sendText).toHaveBeenCalledWith('wa-user', 'second');
+      await agent.close();
+    });
   });
 });
 

@@ -1500,11 +1500,18 @@ export class ConversationAgent {
    * Boot recovery for conversations stranded by a process restart. PUBLIC ENTRY
    * POINT — the runtime calls this once at boot. Each per-key scan runs under
    * {@link runExclusive} (it is an entry point) and is fail-soft so one bad record
-   * cannot sink recovery. Two cases:
+   * cannot sink recovery. Three cases:
    *
-   *  - `sending` mid-retry: an in-flight item with `nextRetryAt` + `retryCount > 0`
+   *  - `sending` mid-retry (B1): an in-flight item with `nextRetryAt` + `retryCount > 0`
    *    whose backoff timer (in-process) died with the old process. Re-arm it with
    *    the remaining delay.
+   *  - `sending` awaiting a WhatsApp delivery status (B2, the "first-send crash" gap):
+   *    an on_status item that was SENT (`currentOutboundMessageId` set) but whose
+   *    in-memory delivery-timeout fallback died with the process — the queue would sit
+   *    in `sending` until the next inbound. Re-arm the delivery timeout so it ADVANCES
+   *    past the already-sent item (no re-send → no double-send). Messenger/Instagram
+   *    (on_send) have no such timer and self-heal on the next inbound via
+   *    `interruptSending` — see KNOWN-GAPS.
    *  - `processing` stranded: the chat call was in flight when the process died, so
    *    the local batch snapshot is gone AND nothing will ever flush this record —
    *    `handleInbound`'s `processing` branch only stashes to `lateArrivals` and
@@ -1522,9 +1529,14 @@ export class ConversationAgent {
    * wins (and wipes state on restart anyway, so it yields nothing to recover and
    * returns all-zero counts). A store without `claimRecovery` falls back to true.
    */
-  async recoverPendingRetries(): Promise<{ transientRetriesResumed: number; processingReset: number }> {
+  async recoverPendingRetries(): Promise<{
+    transientRetriesResumed: number;
+    processingReset: number;
+    deliveryTimeoutsRearmed: number;
+  }> {
     let transientRetriesResumed = 0;
     let processingReset = 0;
+    let deliveryTimeoutsRearmed = 0;
     // CLAIM TTL is deliberately SHORT (not conversationTtlSeconds): the claim only
     // needs to survive the simultaneous-boot race window AND until the recovered
     // action (retry fire / un-wedge) completes. If the WINNING replica crashes
@@ -1536,7 +1548,7 @@ export class ConversationAgent {
       this.store.claimRecovery ? this.store.claimRecovery(token, ttlSeconds) : Promise.resolve(true);
     for await (const key of this.store.listConversationKeys()) {
       try {
-        const outcome = await this.runExclusive(key, async (): Promise<'sending' | 'processing' | 'none'> => {
+        const outcome = await this.runExclusive(key, async (): Promise<'sending' | 'processing' | 'delivery' | 'none'> => {
           const record = await this.store.getConversation(key);
           if (!record) return 'none';
 
@@ -1574,32 +1586,60 @@ export class ConversationAgent {
             return 'processing';
           }
 
-          // (B) `sending` mid-retry — re-arm the transient-retry timer (claim-guarded,
-          // scoped to THIS attempt {key}:{itemId}:{retryCount} so a later restart with
-          // a new attempt claims a fresh token).
           if (record.state !== 'sending') return 'none';
           const item = record.outboundQueue[record.currentOutboundIndex];
-          if (!item || item.nextRetryAt === undefined || (item.retryCount ?? 0) <= 0) return 'none';
-          // Compute remainingMs BEFORE the claim so it drives the claim TTL too:
-          // expire the claim shortly after the retry would have fired (+grace), so a
-          // crashed claimer doesn't block re-recovery for the conversation lifetime.
-          const remainingMs = Math.max(0, item.nextRetryAt - this.now());
-          const claimTtlSeconds = Math.max(
-            Math.ceil(remainingMs / 1000) + RECOVERY_CLAIM_GRACE_SECONDS,
-            RECOVERY_CLAIM_MIN_TTL_SECONDS
-          );
-          if (!(await claim(`${key}:${item.id}:${item.retryCount ?? 0}`, claimTtlSeconds))) return 'none';
-          // Re-arm with the remaining delay (clamped to >= 0 so an overdue retry fires promptly).
-          this.armTransientRetryTimer(key, item.id, item.retryCount ?? 0, remainingMs, record.traceId);
-          return 'sending';
+          if (!item) return 'none';
+
+          // (B1) `sending` mid-retry — re-arm the transient-retry timer (claim-guarded,
+          // scoped to THIS attempt {key}:{itemId}:{retryCount} so a later restart with
+          // a new attempt claims a fresh token).
+          if (item.nextRetryAt !== undefined && (item.retryCount ?? 0) > 0) {
+            // Compute remainingMs BEFORE the claim so it drives the claim TTL too:
+            // expire the claim shortly after the retry would have fired (+grace), so a
+            // crashed claimer doesn't block re-recovery for the conversation lifetime.
+            const remainingMs = Math.max(0, item.nextRetryAt - this.now());
+            const claimTtlSeconds = Math.max(
+              Math.ceil(remainingMs / 1000) + RECOVERY_CLAIM_GRACE_SECONDS,
+              RECOVERY_CLAIM_MIN_TTL_SECONDS
+            );
+            if (!(await claim(`${key}:${item.id}:${item.retryCount ?? 0}`, claimTtlSeconds))) return 'none';
+            // Re-arm with the remaining delay (clamped to >= 0 so an overdue retry fires promptly).
+            this.armTransientRetryTimer(key, item.id, item.retryCount ?? 0, remainingMs, record.traceId);
+            return 'sending';
+          }
+
+          // (B2) `sending` awaiting a WhatsApp (on_status) delivery status whose
+          // in-memory fallback timer DIED with the process — the "first-send crash"
+          // gap. Without the timer the queue would sit in `sending` until the next
+          // inbound triggers interruptSending. Re-arm the delivery-timeout fallback so
+          // the queue self-heals: when it fires, `onDeliveryTimeoutImpl` ADVANCES past
+          // the already-sent item (it does NOT re-send it — so no double-send) and
+          // drives the rest of the queue. Guarded by the current-index check + claim.
+          // Only meaningful when the item was actually sent (currentOutboundMessageId
+          // set) and the channel waits on a status. The durable outbound-handle mapping
+          // means a freshly-arriving status can still advance it too — both paths are
+          // idempotent via the index guard. Messenger/Instagram (on_send) have no such
+          // timer and self-heal on the next inbound (interruptSending) — see KNOWN-GAPS.
+          if (
+            advancementMode(record.channel) === 'on_status' &&
+            record.currentOutboundMessageId !== undefined
+          ) {
+            if (!(await claim(`${key}:delivery:${record.currentOutboundMessageId}`, RECOVERY_CLAIM_MIN_TTL_SECONDS))) {
+              return 'none';
+            }
+            this.startDeliveryTimeout(key, record.currentOutboundIndex, record.traceId);
+            return 'delivery';
+          }
+          return 'none';
         });
         if (outcome === 'sending') transientRetriesResumed += 1;
         else if (outcome === 'processing') processingReset += 1;
+        else if (outcome === 'delivery') deliveryTimeoutsRearmed += 1;
       } catch (error) {
         this.logger.warn({ err: error, conversationKey: key }, 'recoverPendingRetries: skipping bad record');
       }
     }
-    return { transientRetriesResumed, processingReset };
+    return { transientRetriesResumed, processingReset, deliveryTimeoutsRearmed };
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */

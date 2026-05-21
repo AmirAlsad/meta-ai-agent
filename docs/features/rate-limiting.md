@@ -224,6 +224,16 @@ claim TTL is deliberately SHORT — sized to the remaining retry delay plus a gr
 before its retry fires, the claim expires quickly and a subsequent restart can re-recover,
 rather than the conversation staying wedged in `sending` for the full TTL.
 
+**WhatsApp first-send crashes are recovered too.** A WhatsApp (`on_status`) `sending`
+item that was SENT but whose in-memory delivery-timeout fallback died with the process
+(no `retryCount`/`nextRetryAt` yet — the "first-send crash") would otherwise sit in
+`sending` until the next inbound. Recovery re-arms that delivery timeout (claim-guarded);
+when it fires, `onDeliveryTimeoutImpl` ADVANCES past the already-sent item (it does NOT
+re-send it — no double-send) and drives the rest of the queue. Messenger/Instagram
+(`on_send`) have no per-message timer, and re-driving their queue could double-send (no
+idempotency), so such a first-send crash there self-heals on the next inbound via
+`interruptSending` instead — see [Known gaps](../KNOWN-GAPS.md).
+
 **Stranded `processing` conversations are un-wedged too.** A conversation whose chat
 call was in flight when the process died sits in Redis as `state: 'processing'`. Nothing
 would ever flush it again (`handleInbound`'s `processing` branch only stashes to
