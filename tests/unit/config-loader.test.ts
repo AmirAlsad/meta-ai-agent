@@ -421,7 +421,7 @@ describe('loadConfig: limits section (Stage 10)', () => {
     expect(limits).toEqual({
       whatsappPerSecond: 80,
       messengerPerSecond: 40,
-      instagramPerSecond: 2,
+      instagramPerSecond: 10,
       transientRetryMaxAttempts: 3,
       transientRetryBaseMs: 1000,
       transientRetryMaxMs: 60000
@@ -434,7 +434,7 @@ describe('loadConfig: limits section (Stage 10)', () => {
     expect(a).toEqual({
       whatsappPerSecond: 80,
       messengerPerSecond: 40,
-      instagramPerSecond: 2,
+      instagramPerSecond: 10,
       transientRetryMaxAttempts: 3,
       transientRetryBaseMs: 1000,
       transientRetryMaxMs: 60000

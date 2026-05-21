@@ -132,10 +132,18 @@ export interface PersistenceConfig {
  * positive ints with a `base <= max` cross-field check.
  */
 export interface LimitsConfig {
-  /** Outbound pacing (messages/sec) per channel. 0 disables pacing for that channel. */
+  /**
+   * Outbound pacing (messages/sec) per channel. 0 disables pacing for that channel.
+   * Defaults are conservative and well under Meta's documented per-channel send
+   * caps (WhatsApp default throughput 80 mps → up to 1000; Messenger 300/s text;
+   * Instagram 100/s text, 10/s media). The Instagram default (10) matches both the
+   * IG media cap AND the InstagramClient's own ~10/s in-process pacer floor so the
+   * two layers stay aligned — note 2/s is the *general* Graph baseline, NOT the
+   * messaging limit, so it would over-throttle.
+   */
   whatsappPerSecond: number;   // default 80
   messengerPerSecond: number;  // default 40
-  instagramPerSecond: number;  // default 2
+  instagramPerSecond: number;  // default 10
   /** Max transient-retry attempts after the first send. Default 3. */
   transientRetryMaxAttempts: number;
   /** Base backoff (ms) for transient retry. Default 1000. */
@@ -467,7 +475,7 @@ function loadPersistenceConfig(env: ConfigEnv): PersistenceConfig {
 const LIMITS_DEFAULTS: LimitsConfig = {
   whatsappPerSecond: 80,
   messengerPerSecond: 40,
-  instagramPerSecond: 2,
+  instagramPerSecond: 10,
   transientRetryMaxAttempts: 3,
   transientRetryBaseMs: 1000,
   transientRetryMaxMs: 60000

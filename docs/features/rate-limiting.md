@@ -78,8 +78,17 @@ counter-store implementations:
   self-expire. The injected client is borrowed (no-op `close()`); the runtime owns the
   lifecycle (see [Persistence](./persistence.md#shared-client-lifecycle-borrowed-not-owned)).
 
-**Per-channel defaults:** WhatsApp 80/s, Messenger 40/s, Instagram 2/s — all
+**Per-channel defaults:** WhatsApp 80/s, Messenger 40/s, Instagram 10/s — all
 configurable; `0` disables pacing for that channel (and never touches the store).
+These sit well under Meta's documented per-channel send caps (WhatsApp default
+throughput 80 mps, upgradable to 1000; Messenger 300/s for text; Instagram 100/s
+text and 10/s media). The Instagram default of `10/s` matches the IG media cap and
+the `InstagramClient`'s own ~10/s in-process pacer floor so the two layers stay
+aligned — `2/s` (the *general* Graph API baseline, not the messaging limit) would
+over-throttle. WhatsApp tier-based daily caps (250/1K/10K/100K/unlimited
+business-initiated conversations) are NOT enforced client-side: Meta tracks and
+rejects those server-side, and the rejection rides the normal `classifyError` →
+skip/permanent path.
 
 **Fail-open (load-bearing):** `acquireSendSlot` never throws. A store failure
 (Redis down, etc.) is logged and the send proceeds as if the slot were free — a
