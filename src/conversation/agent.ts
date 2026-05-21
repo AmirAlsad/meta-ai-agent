@@ -27,6 +27,7 @@
  * `handle*` method.
  */
 
+import { randomUUID } from 'node:crypto';
 import type pino from 'pino';
 import type { ChatClient } from '../chat/client.js';
 import { ChatEndpointError } from '../chat/errors.js';
@@ -717,6 +718,12 @@ export class ConversationAgent {
         record.inboundBuffer = [];
         record.lateArrivals = [];
         record.state = 'processing';
+        // Stamp a fresh per-turn nonce so boot recovery's `processing` claim token
+        // is UNIQUE to THIS processing entry. Two replicas recovering the SAME
+        // crash read the same nonce (so exactly one wins); a LATER processing turn
+        // gets a new nonce, so its recovery is never blocked by a stale claim from
+        // an earlier turn (see recoverPendingRetries).
+        record.processingNonce = randomUUID();
         await this.store.setConversation(record);
 
         // COMMITTED FLUSH: once a turn has hit the reprocess cap, this flush MUST
@@ -1529,8 +1536,15 @@ export class ConversationAgent {
 
           // (A) `processing` stranded by a restart — un-wedge it (claim-guarded).
           // The un-wedge action is quick, so the min TTL (boot-race grace) suffices.
+          // The claim token carries the per-turn `processingNonce` so it is UNIQUE
+          // to this processing entry: concurrent recoveries of the same crash share
+          // the nonce (one wins), while a LATER processing turn gets a fresh nonce
+          // and is never blocked by a stale claim from an earlier turn. (A record
+          // written before this field existed has no nonce — fall back to a constant;
+          // such a record predates this code path and won't recur.)
           if (record.state === 'processing') {
-            if (!(await claim(`${key}:processing`, RECOVERY_CLAIM_MIN_TTL_SECONDS))) return 'none';
+            const procToken = `${key}:processing:${record.processingNonce ?? 'legacy'}`;
+            if (!(await claim(procToken, RECOVERY_CLAIM_MIN_TTL_SECONDS))) return 'none';
             this.clearDeliveryTimeout(key);
             this.clearTransientRetryTimer(key);
             this.pendingRequests.delete(key);

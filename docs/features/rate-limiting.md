@@ -227,7 +227,10 @@ would ever flush it again (`handleInbound`'s `processing` branch only stashes to
 `lateArrivals` and aborts a now-absent controller), so without recovery it would WEDGE
 until its TTL. Recovery (claim-guarded, so one replica acts) folds any persisted
 `lateArrivals` back into the buffer and reschedules a flush, or — if there are none —
-resets the record to `idle` so the next inbound starts fresh. It returns
+resets the record to `idle` so the next inbound starts fresh. The recovery is claim-guarded
+with a token carrying a per-turn `processingNonce` (stamped on the record when it enters
+`processing`), so concurrent recoveries of the SAME crash dedupe to one replica while a
+LATER processing turn (new nonce) is never blocked by a stale claim. It returns
 `{ transientRetriesResumed, processingReset }`. **Inherent limitation:** the original
 in-flight batch (snapshotted into a local var in `flushImpl` segment 1, never persisted)
 is lost on a hard crash mid-chat-call — an at-least-once tradeoff of the

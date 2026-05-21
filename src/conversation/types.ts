@@ -115,6 +115,16 @@ export interface ConversationRecord {
    * absent ⇒ false (no re-prompt has happened).
    */
   windowReprompted?: boolean;
+  /**
+   * Per-turn nonce stamped when the conversation enters `processing` (the chat
+   * call is in flight). Boot recovery uses it to build a UNIQUE claim token per
+   * processing entry so that, on a shared Redis, concurrent recoveries of the same
+   * crash dedupe (one replica wins) while a LATER processing turn — after the
+   * conversation has done more work — is never blocked by a stale claim from an
+   * earlier turn. Set in `flushImpl`; absent outside `processing`. See
+   * `ConversationAgent.recoverPendingRetries`.
+   */
+  processingNonce?: string;
 }
 
 /**

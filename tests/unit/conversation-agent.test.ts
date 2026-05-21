@@ -2855,6 +2855,40 @@ describe('ConversationAgent', () => {
       expect(record!.lateArrivals).toEqual([]);
       await agent.close();
     });
+
+    it('recoverPendingRetries: the `processing` claim token includes the per-turn processingNonce', async () => {
+      // The token must be unique per processing entry so a SECOND processing crash
+      // (a later turn, new nonce) is never blocked by a stale claim from an earlier
+      // turn. Concurrent recoveries of the SAME crash share the nonce → dedupe.
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const claimSpy = vi.fn(async () => true);
+      store.claimRecovery = claimSpy;
+      const agent = new ConversationAgent({
+        store,
+        scheduler: new InMemoryBufferScheduler(),
+        chatClient: makeChatClient([textResponse('unused')]),
+        adapters: { messenger: makeAdapter('messenger', messengerSupports) } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+      await store.setConversation({
+        ...createIdleConversation({
+          key: 'messenger:biz-1:fb-user',
+          channel: 'messenger',
+          channelScopedUserId: 'fb-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'processing',
+        processingNonce: 'nonce-abc'
+      });
+      await agent.recoverPendingRetries();
+      expect(claimSpy).toHaveBeenCalledWith('messenger:biz-1:fb-user:processing:nonce-abc', expect.any(Number));
+      await agent.close();
+    });
   });
 });
 
