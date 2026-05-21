@@ -64,6 +64,8 @@ function makeRecord(): ConversationRecord {
     channelScopedBusinessId: '1112223334',
     state: 'sending',
     inboundBuffer: [makeInbound()],
+    lateArrivals: [],
+    reprocessCount: 0,
     outboundQueue: [makeOutbound()],
     currentOutboundIndex: 0,
     currentOutboundMessageId: 'wamid.OUT1',

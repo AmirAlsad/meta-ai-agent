@@ -421,6 +421,16 @@ export interface MediaInfo {
   voice?: boolean;
   /** WhatsApp animated-sticker flag. */
   animated?: boolean;
+  /**
+   * A `data:<mime>;base64,<...>` URI for the media bytes, populated by inbound
+   * media hydration. Present ONLY when inbound media download is enabled
+   * (`config.conversation.inboundMediaDownload`) AND the download succeeded
+   * within the size cap — the raw `id` / `url` are left untouched either way.
+   * This is the easiest form for the chat endpoint to hand straight to an LLM
+   * (no token, no second fetch), at the cost of inflating the request body with
+   * base64. Absent when hydration is off, failed, timed out, or over the cap.
+   */
+  dataUrl?: string;
 }
 
 /** Reaction payload normalized across channels. */

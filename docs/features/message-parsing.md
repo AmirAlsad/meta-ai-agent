@@ -49,13 +49,20 @@ Note: `'read'` is intentionally NOT in this union — read receipts produce a `S
 | Field | Type | Semantics |
 | --- | --- | --- |
 | `text` | `string?` | Plain text body for `'text'`. Also populated from interactive titles (button/list reply), Flow `body`/`name`, WhatsApp location `name`, WhatsApp `system.body`. |
-| `media` | `MediaInfo?` | Attached for image/audio/video/document/sticker. `id` (Meta media id, WA download key), `url` (Messenger/IG direct URL), `mimeType`, `sha256` (WA only), `caption`, `filename` (WA documents only), `voice` (WA audio only), `animated` (WA stickers only). |
+| `media` | `MediaInfo?` | Attached for image/audio/video/document/sticker. `id` (Meta media id, WA download key), `url` (Messenger/IG direct URL), `mimeType`, `sha256` (WA only), `caption`, `filename` (WA documents only), `voice` (WA audio only), `animated` (WA stickers only). The parser does **not** set `dataUrl` — see the note below. |
 | `reaction` | `ReactionInfo?` | `{ emoji, targetMessageId, action? }`. WhatsApp encodes an unreact as `emoji: ''` (not omitted) — preserved verbatim. |
 | `postback` | `PostbackInfo?` | `{ payload, title? }`. WhatsApp template `button.payload` lands here too. |
 | `referral` | `ReferralInfo?` | `{ source, type, ref?, ctwaClid?, sourceUrl?, sourceId?, headline?, body? }`. WA CTWA fields (`ctwaClid` onward) are channel-specific. Messenger/IG referrals populate only `source` / `type` / `ref`. |
 | `replyTo` | `string?` | Channel-scoped id of the referenced message — WA `context.message_id`, Messenger/IG `reply_to.mid`. |
 | `storyReply` | `StoryReplyInfo?` | Instagram-only. User replied to a story you posted; `id` is the story id, `url` is the preview. |
 | `storyMention` | `StoryReplyInfo?` | Instagram-only. User mentioned the business in their story (an attachment with `type: 'story_mention'`). Distinct from `storyReply`. |
+
+> **`MediaInfo.dataUrl` is not set by the parser.** `MediaInfo` carries an
+> optional `dataUrl?` (a `data:<mime>;base64,...` URL), but the parser never
+> populates it — it only emits `id` / `url` / `mimeType` / etc. from the raw
+> payload. `dataUrl` is filled in *later* by the optional inbound media-hydration
+> step (when enabled), which downloads the media on the agent's flush path. See
+> [Inbound media hydration](./media-hydration.md).
 
 ### Flags
 

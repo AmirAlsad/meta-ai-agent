@@ -210,8 +210,8 @@ with the token attached.
 
 ### Messenger / Instagram — pre-signed, no token
 
-`downloadAttachmentUrl({ url })` fetches the **pre-signed CDN URL Meta already put
-in the webhook payload** with **no Authorization header**:
+`downloadAttachmentUrl({ url, maxBytes? })` fetches the **pre-signed CDN URL Meta
+already put in the webhook payload** with **no Authorization header**:
 
 - These URLs are already signed by Meta. Sending the app token is unnecessary and
   can be actively harmful — the CDN may reject a Bearer it didn't expect, and a
@@ -219,11 +219,32 @@ in the webhook payload** with **no Authorization header**:
 - A benign `User-Agent` **is** sent (a UA is not auth) for the same CDN-rejection
   reason as the WhatsApp hop.
 
+**Optional early size cap (`maxBytes`).** When `maxBytes` is supplied, the
+response's `Content-Length` header is checked **before** `response.arrayBuffer()`
+reads (and buffers) the body. An over-cap attachment is rejected with the exported
+`MEDIA_OVER_CAP` sentinel having read nothing — the unread body is cancelled
+(best-effort) to release the socket — so a huge blob is no longer fully buffered
+just to be discarded. This mirrors the WhatsApp path's `file_size` pre-flight.
+Fail-open: when the header is **absent** (or `maxBytes` is omitted) it falls back
+to the body read and the caller's post-download check enforces the cap, exactly as
+before. The return type is therefore `DownloadedMedia | typeof MEDIA_OVER_CAP`.
+`MEDIA_OVER_CAP` is a `Symbol`, distinct from a thrown error, so the caller (the
+fail-open hydrator) can treat it as a clean over-cap skip.
+
 ### Buffering
 
 Both download paths fully buffer the asset into a `Uint8Array` in memory (no
 streaming). Large files are a known limitation deferred to a later stage — see
 [Known gaps](../KNOWN-GAPS.md).
+
+### Backing inbound media hydration
+
+These same download helpers (`getWhatsAppMediaUrl`, `downloadWhatsAppMedia`,
+`downloadAttachmentUrl`) also back the **opt-in inbound media hydration** step,
+which downloads *inbound* user media on the agent's flush path and attaches it to
+the chat request as a base64 `data:` URL (`message.media.dataUrl`). The
+`downloadAttachmentUrl` `maxBytes` / `MEDIA_OVER_CAP` early reject above exists to
+serve that caller. See [Inbound media hydration](./media-hydration.md).
 
 ## Advancement + fail-soft
 
@@ -262,7 +283,8 @@ bug — see [Known gaps](../KNOWN-GAPS.md).
 
 Source:
 
-- [`src/meta/shared/media.ts`](../../src/meta/shared/media.ts) — `inferMediaKind`, `uploadWhatsAppMedia`, `getWhatsAppMediaUrl`, `downloadWhatsAppMedia`, `downloadAttachmentUrl`.
+- [`src/meta/shared/media.ts`](../../src/meta/shared/media.ts) — `inferMediaKind`, `uploadWhatsAppMedia`, `getWhatsAppMediaUrl`, `downloadWhatsAppMedia`, `downloadAttachmentUrl` (+ its `maxBytes` cap), `MEDIA_OVER_CAP`.
+- [`src/meta/shared/media-hydrator.ts`](../../src/meta/shared/media-hydrator.ts) — `HttpMediaHydrator` / `NoopMediaHydrator` (inbound media hydration; see [Inbound media hydration](./media-hydration.md)).
 - [`src/meta/shared/adapter.ts`](../../src/meta/shared/adapter.ts) — `MediaSendInput`, the `ChannelAdapter.sendMedia` method, `MediaKind`.
 - [`src/meta/whatsapp/client.ts`](../../src/meta/whatsapp/client.ts) — `sendImage` / `sendAudio` / `sendVideo` / `sendDocument` / `uploadMedia` / `sendMedia` (+ the `mediaRef` id-vs-URL switch and `deriveFilename`).
 - [`src/meta/messenger/client.ts`](../../src/meta/messenger/client.ts) — `sendImage` / `sendAudio` / `sendVideo` / `sendFile` / `sendMedia` (the private `sendAttachment` + `is_reusable`).
@@ -273,8 +295,9 @@ Source:
 
 Tests (see [Testing](../TESTING.md)):
 
-- [`tests/unit/media.test.ts`](../../tests/unit/media.test.ts) — `inferMediaKind`, upload (multipart FormData + Bearer + no manual Content-Type), the 2-step WhatsApp download (Bearer + User-Agent), the no-token FB/IG download, error/transport branches.
+- [`tests/unit/media.test.ts`](../../tests/unit/media.test.ts) — `inferMediaKind`, upload (multipart FormData + Bearer + no manual Content-Type), the 2-step WhatsApp download (Bearer + User-Agent), the no-token FB/IG download, the `maxBytes` / `MEDIA_OVER_CAP` early reject, error/transport branches.
+- [`tests/unit/media-hydrator.test.ts`](../../tests/unit/media-hydrator.test.ts) — the inbound `HttpMediaHydrator` / `NoopMediaHydrator` (see [Inbound media hydration](./media-hydration.md)).
 - [`tests/unit/whatsapp-client.test.ts`](../../tests/unit/whatsapp-client.test.ts), [`tests/unit/messenger-client.test.ts`](../../tests/unit/messenger-client.test.ts), [`tests/unit/instagram-client.test.ts`](../../tests/unit/instagram-client.test.ts) — the exact per-channel media send bodies.
 - [`tests/unit/conversation-agent.test.ts`](../../tests/unit/conversation-agent.test.ts) — the agent media dispatch (kind inference, `media:<kind>` metric, fail-soft skip).
 
-Related: [Outbound clients](./outbound-clients.md) · [WhatsApp templates](./templates.md) · [Rich chat actions](./rich-chat-actions.md) · [Ordered delivery](./ordered-delivery.md) · [Message parsing](./message-parsing.md) (the inbound media counterpart).
+Related: [Outbound clients](./outbound-clients.md) · [WhatsApp templates](./templates.md) · [Rich chat actions](./rich-chat-actions.md) · [Ordered delivery](./ordered-delivery.md) · [Message parsing](./message-parsing.md) (the inbound media counterpart) · [Inbound media hydration](./media-hydration.md).

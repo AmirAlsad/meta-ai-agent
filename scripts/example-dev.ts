@@ -18,10 +18,13 @@
  * override the loaded value before building the runtime — see step 3.
  *
  * WHY the showcase bot is NOT booted here: it's a separate npm package with its
- * own dependencies (`@anthropic-ai/sdk`) that the root package never installs,
- * so this runner can't import it in-process. To exercise it live, run it
- * separately (`cd examples/showcase-bot && npm install && npm start`) and point
- * CHAT_ENDPOINT_URL at it, then use `npm run dev:loop` / the agent directly.
+ * own dependencies (the Vercel AI SDK — `ai`, `@ai-sdk/anthropic`, ...) that the
+ * root package never installs, so this runner can't import it in-process. To
+ * exercise it live, run it separately (`cd examples/showcase-bot && npm install
+ * && npm start`) and point CHAT_ENDPOINT_URL at it, then start the agent with
+ * `npm run dev` (which reads CHAT_ENDPOINT_URL). NOT `npm run dev:loop` — that
+ * boots its own in-process keyword test endpoint and OVERRIDES CHAT_ENDPOINT_URL,
+ * so it would never route to the standalone showcase bot.
  *
  * This is the live-device sibling of `scripts/dev/loop.ts` (which wires the
  * keyword test endpoint); the bootstrap order — boot endpoint → override
@@ -41,14 +44,27 @@ import { startTunnel } from './lib/tunnel.js';
 import { registerAllWebhooks } from './setup/register-webhooks.js';
 import { createEchoChatEndpoint } from '../examples/minimal-chat-endpoint/index.js';
 import { createRouterChatEndpoint } from '../examples/multi-channel-router/index.js';
+import { createCatalogChatEndpoint } from '../examples/action-catalog/index.js';
+import { createScriptedFlowChatEndpoint } from '../examples/scripted-flow/index.js';
 import { info, success, warn, fail, divider, registerShutdown } from './lib/console.js';
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Example registry                                                           */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-/** The in-repo examples this runner can boot in-process. */
-const EXAMPLES = ['minimal-chat-endpoint', 'multi-channel-router'] as const;
+/**
+ * The in-repo CHAT-endpoint examples this runner can boot in-process. NOTE:
+ * `identity-lookup` is deliberately ABSENT — it implements the `USER_LOOKUP_URL`
+ * contract (returns a `Contact`), NOT the `CHAT_ENDPOINT_URL` contract, so it is
+ * not a valid target for this chat runner. Run it alongside a chat endpoint
+ * instead (see examples/identity-lookup/README.md).
+ */
+const EXAMPLES = [
+  'minimal-chat-endpoint',
+  'multi-channel-router',
+  'action-catalog',
+  'scripted-flow'
+] as const;
 type ExampleName = (typeof EXAMPLES)[number];
 
 const DEFAULT_EXAMPLE: ExampleName = 'minimal-chat-endpoint';
@@ -62,6 +78,16 @@ function buildExampleApp(name: ExampleName): { app: express.Express; description
       return {
         app: createRouterChatEndpoint(),
         description: 'channel-aware + capability-driven routing (greetings, reactions, WhatsApp templates)'
+      };
+    case 'action-catalog':
+      return {
+        app: createCatalogChatEndpoint(),
+        description: 'keyword-routed reference for every ChatAction shape (capability-gated)'
+      };
+    case 'scripted-flow':
+      return {
+        app: createScriptedFlowChatEndpoint(),
+        description: 'deterministic in-memory state machine (coffee-order arc, no LLM)'
       };
   }
 }
@@ -80,6 +106,13 @@ interface CliArgs {
   port?: number;
   /** Override the reserved ngrok domain. Defaults to config.ngrokDomain. */
   ngrokDomain?: string;
+  /**
+   * Point the agent at an EXTERNAL chat endpoint (e.g. the showcase-bot running
+   * as its own server) instead of booting an in-repo example in-process. When
+   * set, the positional example name is ignored and no in-process example is
+   * started — the agent's `chatEndpointUrl` is this URL.
+   */
+  chatEndpoint?: string;
   /** Skip the programmatic webhook subscription step. */
   skipWebhookRegistration: boolean;
   help: boolean;
@@ -100,6 +133,11 @@ function parseArgs(argv: readonly string[]): CliArgs {
   let examplePositionalSeen = false;
 
   for (const raw of argv) {
+    // A bare `--` is the npm/shell argument separator (the `example:dev` npm
+    // script ends with `--`, so it arrives here as a literal token). Skip it.
+    if (raw === '--') {
+      continue;
+    }
     if (raw === '--help' || raw === '-h') {
       out.help = true;
       continue;
@@ -123,6 +161,20 @@ function parseArgs(argv: readonly string[]): CliArgs {
         throw new Error('--ngrok-domain requires a value, e.g. --ngrok-domain=foo.ngrok-free.app');
       }
       out.ngrokDomain = value;
+      continue;
+    }
+    if (raw.startsWith('--chat-endpoint=')) {
+      const value = raw.slice('--chat-endpoint='.length).trim();
+      if (value === '') {
+        throw new Error('--chat-endpoint requires a value, e.g. --chat-endpoint=http://127.0.0.1:4055');
+      }
+      try {
+        // eslint-disable-next-line no-new
+        new URL(value);
+      } catch {
+        throw new Error(`--chat-endpoint: expected a parseable URL (got "${value}").`);
+      }
+      out.chatEndpoint = value;
       continue;
     }
     // A bare positional (not starting with `-`) is the example name.
@@ -161,21 +213,29 @@ function printHelp(): void {
       'no-Meta-account local REPL instead.',
       '',
       'Examples (booted in-process):',
-      `  minimal-chat-endpoint   echo bot (default).`,
+      '  minimal-chat-endpoint   echo bot (default).',
       '  multi-channel-router    channel-aware + capability-driven routing.',
+      '  action-catalog          reference for every ChatAction shape.',
+      '  scripted-flow           deterministic state machine (coffee-order arc).',
       '',
       'Options:',
       '  --port=<n>                   Local port for the agent webhook server.',
       '                               Default: PORT env / config.port.',
       '  --ngrok-domain=<domain>      Reserved ngrok domain (bare hostname).',
       '                               Default: NGROK_DOMAIN from .env.',
+      '  --chat-endpoint=<url>        Point the agent at an EXTERNAL chat endpoint',
+      '                               (e.g. the showcase-bot running standalone)',
+      '                               instead of booting an in-repo example. When',
+      '                               set, the [example] positional is ignored.',
       '  --no-webhook-registration    Skip programmatic webhook subscription',
       '                               (assume the Dashboard config is already done).',
       '  --help, -h                   Show this help.',
       '',
-      'Note: the LLM showcase bot is a SEPARATE package and is NOT booted here.',
-      'Run it standalone (cd examples/showcase-bot && npm install && npm start),',
-      'set CHAT_ENDPOINT_URL to it, then run `npm run dev:loop` / the agent.',
+      'LLM showcase bot: it is a SEPARATE package, so run it standalone first',
+      '(cd examples/showcase-bot && npm install && npm start), then point this',
+      'runner at it: `npm run example:dev -- --chat-endpoint=http://127.0.0.1:4055`.',
+      'That gives you the real Meta stack + ngrok + webhook registration aimed at',
+      'the showcase-bot, all in one command.',
       ''
     ].join('\n')
   );
@@ -272,26 +332,39 @@ async function main(): Promise<void> {
   };
 
   try {
-    // 2. Boot the chosen in-repo example endpoint in-process on an EPHEMERAL
-    // port. The factory returns the app WITHOUT listening (listener-guarded), so
-    // importing it here is side-effect-free; we create + listen ourselves.
-    const { app: exampleApp, description } = buildExampleApp(args.example);
-    exampleServer = await listen(exampleApp, 0);
-    const examplePort = boundPort(exampleServer, 0);
-    // The example endpoints expose `POST /`, and HttpChatClient POSTs to the URL
-    // as-given (no path appended). So the agent's chat endpoint is the example's
-    // root URL.
-    const exampleUrl = `http://127.0.0.1:${examplePort}/`;
-    success(`Example endpoint "${args.example}" listening at ${exampleUrl}`);
-    info(`  ${description}`);
-
-    // 3. Override the agent's chat endpoint to the in-process example. This is
-    // the load-bearing wiring: `buildRuntime` reads `config.chatEndpointUrl`
-    // when it constructs the HttpChatClient, so the override MUST happen BEFORE
-    // `buildRuntime` (next step). We mutate the loaded config object rather than
-    // process.env so the change is explicit and local to this run; the .env
-    // value only had to exist to satisfy `loadConfig`'s required-var check.
-    config.chatEndpointUrl = exampleUrl;
+    // 2 + 3. Resolve the agent's chat endpoint and (only for the in-repo
+    // examples) boot it in-process. Two modes:
+    //   - EXTERNAL (--chat-endpoint=<url>): the chat endpoint is a separate
+    //     server the developer runs themselves (e.g. the showcase-bot, which is
+    //     its own package with its own deps). We do NOT boot anything in-process;
+    //     the agent simply POSTs to that URL.
+    //   - IN-PROCESS (default): boot the chosen in-repo example on an ephemeral
+    //     port (the factory is listener-guarded, so importing it is side-effect-
+    //     free; we create + listen ourselves).
+    // Either way the override MUST happen BEFORE `buildRuntime` (next step),
+    // which reads `config.chatEndpointUrl` when it builds the HttpChatClient. We
+    // mutate the loaded config object (not process.env) so the change is explicit
+    // and local to this run; the .env value only had to exist to satisfy
+    // `loadConfig`'s required-var check.
+    let wiredLabel: string;
+    if (args.chatEndpoint) {
+      config.chatEndpointUrl = args.chatEndpoint;
+      wiredLabel = `external chat endpoint → ${args.chatEndpoint}`;
+      success(`Pointing the agent at the EXTERNAL chat endpoint: ${args.chatEndpoint}`);
+      info('  (no in-process example booted — run that chat endpoint server yourself, e.g. the showcase-bot)');
+    } else {
+      const { app: exampleApp, description } = buildExampleApp(args.example);
+      exampleServer = await listen(exampleApp, 0);
+      const examplePort = boundPort(exampleServer, 0);
+      // The example endpoints expose `POST /`, and HttpChatClient POSTs to the
+      // URL as-given (no path appended). So the agent's chat endpoint is the
+      // example's root URL.
+      const exampleUrl = `http://127.0.0.1:${examplePort}/`;
+      config.chatEndpointUrl = exampleUrl;
+      wiredLabel = `${args.example} (${description})`;
+      success(`Example endpoint "${args.example}" listening at ${exampleUrl}`);
+      info(`  ${description}`);
+    }
 
     // 4. Build the REAL runtime (shared Graph transport → per-channel adapters →
     // store/scheduler → chat client pointed at `exampleUrl` → agent → app). This
@@ -367,7 +440,7 @@ async function main(): Promise<void> {
       .join(', ');
     divider('ready');
     success('Live-device example runner is up.');
-    info(`Example wired:        ${args.example} (${description})`);
+    info(`Chat endpoint wired:  ${wiredLabel}`);
     info(`Public webhook URL:   ${callbackUrl}`);
     info(`Configured channels:  ${channels || '(none)'}`);
     divider();

@@ -75,8 +75,43 @@ The flush only fires once the user pauses for a full window.
 When the timer finally fires, `flushImpl` snapshots the entire buffer, clears it,
 and makes a single `chatClient.complete` call carrying the whole batch — so N
 rapid messages produce one chat call, not N. Snapshot-and-clear happens up front
-(before the async chat call) so any inbound that arrives mid-flight accumulates
-cleanly for the *next* flush rather than being re-sent or lost.
+(before the async chat call) so any inbound that arrives mid-flight is captured by
+the interrupt/rebatch flow below rather than being re-sent or lost.
+
+## Interrupt and rebatch: a message that arrives mid-flush
+
+The buffer is snapshotted and cleared the moment a flush starts (state
+`processing`), so a message that arrives *during* the chat call can't land in the
+already-snapshotted batch. Instead `handleInboundImpl`'s `processing` branch
+pushes it onto `record.lateArrivals` and aborts the in-flight chat call (the flush
+registered an `AbortController` for the key). The flush, on re-acquiring the lock,
+sees the abort, folds `[...batch, ...inboundBuffer, ...lateArrivals]` back into
+`inboundBuffer`, increments `reprocessCount`, returns to `buffering`, and arms a
+fresh flush. The combined input then produces **one** chat call and **one**
+response — the late inbound no longer produces a second flush.
+
+This relies on releasing the per-key lock during the chat call (the *segmented
+locking* model). The full mechanism, the race-free argument, and the state
+transitions it introduces (`processing → buffering`, `sending → buffering`) are
+documented in
+[Conversation state](./conversation-state.md#segmented-locking-the-batching-fix).
+
+### The reprocess cap (`MAX_REPROCESS`)
+
+A user typing a relentless stream could abort the turn on every chat call and
+starve it forever. `MAX_REPROCESS` (5) bounds how many times one logical turn may
+be deferred + rebatched. Once `reprocessCount` reaches the cap, the next flush is
+**committed**: it registers no `AbortController`, so a late arrival can't interrupt
+it — it queues to `lateArrivals` instead, and the committed flush runs to
+completion and sends. Messages that arrived during a committed flush become a
+fresh follow-up turn (via `finalizeTurn`), so nothing is dropped. `reprocessCount`
+resets to 0 on every clean turn completion. A message arriving while the
+conversation is `sending` (mid-delivery) is handled differently — see
+[Ordered delivery](./ordered-delivery.md#interrupting-an-in-flight-send).
+
+The interrupt/rebatch, the cap, and the committed-flush behavior are proven by the
+`interrupt / rebatch (narrowed lock)` tests in
+[`tests/unit/conversation-agent.test.ts`](../../tests/unit/conversation-agent.test.ts).
 
 ### `message` string vs `messages[]` array
 
@@ -128,11 +163,12 @@ Behavior of the in-memory scheduler:
 **inline** (synchronously, awaited)" rather than via `setTimeout`. That path is a
 foot-gun for the conversation lock.
 
-The scheduler's flush handler is registered to acquire the per-key serialization
-lock (`runExclusive`) before running the flush body. `handleInboundImpl` calls
-`scheduler.schedule` **while holding that same key's lock.** If `schedule` fired
-the handler inline, the handler would immediately try to acquire a lock the
-current call already holds — a self-deadlock that wedges the conversation.
+`handleInboundImpl` (and `flushImpl`'s locked segments and `finalizeTurn`) call
+`scheduler.schedule` **while holding that same key's lock.** The scheduler's flush
+handler runs `flushImpl`, which re-acquires that key's lock for its segments. If
+`schedule` fired the handler inline, the handler would immediately try to acquire
+a lock the current call already holds — a self-deadlock that wedges the
+conversation.
 
 The safety net is that `calculateBufferTimeout` never returns `<= 0` for a valid
 config: `bufferBaseTimeoutMs` is a positive integer, and the jitter clamp floors

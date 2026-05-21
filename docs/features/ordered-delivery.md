@@ -32,7 +32,9 @@ On the record, the queue is `outboundQueue` and the cursor is
 `currentOutboundIndex = 0`, then calls `sendNext`, which drives the loop: send the
 item at the cursor, then either advance immediately or wait for a status, and
 recurse to the next item after each advance. When `isQueueComplete` is true,
-`sendNext` returns the conversation to `idle`.
+`sendNext` calls `finalizeTurn`, which returns the conversation to `idle` — or, if
+messages arrived during the turn (`lateArrivals`), spawns a follow-up `buffering`
+turn instead of going idle (see [Completing the queue](#completing-the-queue)).
 
 ## Advancement mode per channel
 
@@ -123,6 +125,45 @@ before the actual send. WhatsApp's typing indicator is anchored to an inbound
 — the stored id of the most recent inbound (see
 [Conversation state](./conversation-state.md#the-conversationrecord)). Typing
 injection is best-effort: a failure here is logged and never aborts the real send.
+
+## Interrupting an in-flight send
+
+A message can arrive while the conversation is still draining a previous turn's
+outbound queue (state `sending`). Continuing to send the rest of a now-stale reply
+and then sending a second reply produces an incoherent exchange, so
+`handleInboundImpl`'s `sending` branch calls `interruptSending` to roll the turn
+back and rebatch ([`src/conversation/agent.ts`](../../src/conversation/agent.ts)).
+Under the per-key lock it:
+
+- clears the delivery-timeout fallback for the key (the abandoned queue's timer
+  must not fire against a stale index);
+- deletes the in-flight outbound-handle mapping (`currentOutboundMessageId`), so a
+  late status for the abandoned item can't advance the new turn;
+- resets the outbound queue and cursor (`outboundQueue = []`,
+  `currentOutboundIndex = 0`, clears `currentOutboundMessageId`) — **unsent queue
+  items are dropped**; the chat endpoint re-decides the whole reply from the
+  combined buffer on the next flush;
+- resets `reprocessCount`, pushes the new message into `inboundBuffer`, returns to
+  `buffering`, and arms a fresh flush.
+
+This is a full interrupt rather than a deferral because once we are `sending` the
+old turn's chat call has already returned — there is no in-flight chat to abort,
+and continuing to drain the queue would only deliver stale replies. (The
+`processing`-state interrupt, where there *is* an in-flight chat to abort and
+rebatch, is covered in [Message buffering](./message-buffering.md) and
+[Conversation state](./conversation-state.md#segmented-locking-the-batching-fix).)
+
+## Completing the queue
+
+When `isQueueComplete(state)` is true, `sendNext` calls `finalizeTurn` — which
+replaced the old inline transition-to-idle. `finalizeTurn` clears the delivery
+timeout, resets `reprocessCount` to 0, and then either returns the conversation to
+`idle`, or — if messages arrived during the turn (`lateArrivals`, e.g. during a
+committed flush that couldn't be interrupted) — moves them into `inboundBuffer`,
+drops back to `buffering`, and schedules a follow-up flush so they get their own
+response. See
+[Conversation state](./conversation-state.md#the-state-machine) for the full
+transition table.
 
 ## Fail-soft sends
 

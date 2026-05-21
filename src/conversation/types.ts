@@ -58,6 +58,23 @@ export interface ConversationRecord {
   state: ConversationStateName;
   /** Inbound messages buffered awaiting flush to the chat endpoint. */
   inboundBuffer: IncomingMessage[];
+  /**
+   * Inbound messages that arrived WHILE a flush's chat call was in flight
+   * (state `processing`) — see the interrupt/rebatch flow in
+   * `ConversationAgent.handleInboundImpl` / `flushImpl`. They are NOT added to
+   * `inboundBuffer` (which was already snapshotted + cleared by the flush);
+   * instead they accumulate here and the flush, after its chat call returns,
+   * folds `[...batch, ...lateArrivals]` back into `inboundBuffer` and reschedules
+   * so the COMBINED input becomes ONE response instead of two.
+   */
+  lateArrivals: IncomingMessage[];
+  /**
+   * How many times the current turn has been deferred + rebatched because a late
+   * arrival interrupted its in-flight chat call. Bounded by `MAX_REPROCESS` in
+   * the agent so a steady stream of messages eventually gets a response rather
+   * than reprocessing forever. Reset to 0 on a clean turn completion.
+   */
+  reprocessCount: number;
   /** Ordered outbound work produced from the chat response. */
   outboundQueue: OutboundItem[];
   /** Index of the in-flight outbound item within `outboundQueue`. */
@@ -119,6 +136,8 @@ export function createIdleConversation(input: {
     channelScopedBusinessId: input.channelScopedBusinessId,
     state: 'idle',
     inboundBuffer: [],
+    lateArrivals: [],
+    reprocessCount: 0,
     outboundQueue: [],
     currentOutboundIndex: 0,
     deliveredMessageIds: [],

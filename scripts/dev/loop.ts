@@ -33,23 +33,34 @@ const KEYWORD_CHEATSHEET = [
 
 interface CliArgs {
   chatPort: number;
+  /**
+   * When set, point the agent at this EXTERNAL chat endpoint URL instead of
+   * booting the in-process keyword test endpoint. Used to run the live stack
+   * against a standalone endpoint (e.g. the showcase-bot on http://localhost:4055).
+   */
+  chatEndpoint?: string;
   help: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
   let chatPort = 4000;
+  let chatEndpoint: string | undefined;
   let help = false;
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
     if (arg === '--help' || arg === '-h') help = true;
     else if (arg.startsWith('--chat-port=')) chatPort = Number.parseInt(arg.slice('--chat-port='.length), 10);
     else if (arg === '--chat-port') {
-      const idx = argv.indexOf(arg);
-      const next = argv[idx + 1];
+      const next = argv[i + 1];
       if (next) chatPort = Number.parseInt(next, 10);
+    } else if (arg.startsWith('--chat-endpoint=')) chatEndpoint = arg.slice('--chat-endpoint='.length).trim();
+    else if (arg === '--chat-endpoint') {
+      const next = argv[i + 1];
+      if (next) chatEndpoint = next.trim();
     }
   }
   if (!Number.isFinite(chatPort) || chatPort < 1 || chatPort > 65535) chatPort = 4000;
-  return { chatPort, help };
+  return { chatPort, chatEndpoint: chatEndpoint || undefined, help };
 }
 
 function printHelp(): void {
@@ -62,10 +73,14 @@ function printHelp(): void {
       'devices and watch the Stage 5 loop.',
       '',
       'Options:',
-      '  --chat-port=<n>  Port for the in-process test chat endpoint (default 4000).',
-      '  --help, -h       Show this help.',
+      '  --chat-port=<n>       Port for the in-process test chat endpoint (default 4000).',
+      '  --chat-endpoint=<url> Point the agent at an EXTERNAL chat endpoint instead of',
+      '                        the in-process test endpoint (e.g. the showcase-bot:',
+      '                        --chat-endpoint=http://localhost:4055). Start that',
+      '                        endpoint separately first.',
+      '  --help, -h            Show this help.',
       '',
-      'Keywords:',
+      'Keywords (in-process test endpoint only; ignored with --chat-endpoint):',
       ...KEYWORD_CHEATSHEET,
       ''
     ].join('\n')
@@ -86,15 +101,26 @@ async function main(): Promise<void> {
 
   divider('meta-ai-agent: full-stack dev loop');
 
-  // 1. Start the in-process test chat endpoint first so we know its URL.
-  const chat = await startTestChatEndpoint({ port: args.chatPort, logger });
-  success(`Test chat endpoint: ${chat.url}`);
+  // 1. Resolve the chat endpoint. By default we boot the in-process keyword
+  // test endpoint; with --chat-endpoint=<url> we instead point the agent at an
+  // EXTERNAL standalone endpoint (e.g. the showcase-bot) the developer started
+  // separately, and do NOT boot the test endpoint.
+  let chat: { url: string; close: () => Promise<void> } | undefined;
+  let chatUrl: string;
+  if (args.chatEndpoint) {
+    chatUrl = args.chatEndpoint;
+    success(`External chat endpoint: ${chatUrl} (the in-process test endpoint is NOT booted)`);
+  } else {
+    chat = await startTestChatEndpoint({ port: args.chatPort, logger });
+    chatUrl = chat.url;
+    success(`Test chat endpoint: ${chatUrl}`);
+  }
 
-  // 2. Point the agent's HttpChatClient at the in-process test endpoint
-  // regardless of what's in .env. `import 'dotenv/config'` already ran at import
-  // time, but reassigning here still wins because `loadConfig()` reads
-  // `process.env` live (below).
-  process.env.CHAT_ENDPOINT_URL = chat.url;
+  // 2. Point the agent's HttpChatClient at the resolved endpoint regardless of
+  // what's in .env. `import 'dotenv/config'` already ran at import time, but
+  // reassigning here still wins because `loadConfig()` reads `process.env` live
+  // (below).
+  process.env.CHAT_ENDPOINT_URL = chatUrl;
 
   // 3. Load config + build the runtime (real adapters + agent).
   let config: Config;
@@ -103,7 +129,7 @@ async function main(): Promise<void> {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     fail(`Configuration error: ${msg}`);
-    await chat.close();
+    await chat?.close();
     process.exitCode = 1;
     return;
   }
@@ -161,10 +187,14 @@ async function main(): Promise<void> {
   divider('ready');
   success('Full-stack loop is up.');
   info(`Tunnel URL:        ${tunnel.url}`);
-  info(`Chat endpoint:     ${chat.url}`);
+  info(`Chat endpoint:     ${chatUrl}${chat ? '' : ' (external)'}`);
   info(`Configured channels: ${channels || '(none)'}`);
-  info('Keywords:');
-  for (const line of KEYWORD_CHEATSHEET) info(line);
+  if (chat) {
+    info('Keywords:');
+    for (const line of KEYWORD_CHEATSHEET) info(line);
+  } else {
+    info('Using an external chat endpoint — its own logic decides the replies.');
+  }
   divider();
   info('Message the bot from any configured channel and watch the loop here.');
   info('Press Ctrl-C to stop.');
@@ -175,7 +205,7 @@ async function main(): Promise<void> {
   registerShutdown(async () => {
     await agent.close().catch(err => logger.error({ err }, 'agent close failed'));
     await new Promise<void>(resolve => server.close(() => resolve()));
-    await chat.close();
+    await chat?.close();
     await tunnel.close();
   });
 }

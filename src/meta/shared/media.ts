@@ -220,7 +220,6 @@ export async function downloadWhatsAppMedia(input: {
   graph: GraphClient;
   fetchImpl?: typeof fetch;
 }): Promise<DownloadedMedia> {
-  const fetchImpl = input.fetchImpl ?? globalThis.fetch;
   // Step 1 — resolve URL + metadata (throws MetaApiError 'whatsapp.getMediaUrl'
   // on failure; we let that propagate so the operation label is accurate).
   const meta = await getWhatsAppMediaUrl({
@@ -229,7 +228,40 @@ export async function downloadWhatsAppMedia(input: {
     graph: input.graph
   });
 
-  // Step 2 — fetch the actual bytes WITH the token (required by WhatsApp's CDN).
+  // Step 2 — fetch the bytes from the resolved URL. Delegated to
+  // {@link downloadWhatsAppMediaFromUrl} so a caller that ALREADY resolved the
+  // metadata (e.g. the media hydrator's `file_size` pre-flight) can skip the
+  // redundant `GET /{mediaId}` and download straight from `meta.url`.
+  return downloadWhatsAppMediaFromUrl({
+    url: meta.url,
+    accessToken: input.accessToken,
+    ...(meta.mimeType !== undefined ? { mimeType: meta.mimeType } : {}),
+    ...(input.fetchImpl !== undefined ? { fetchImpl: input.fetchImpl } : {})
+  });
+}
+
+/**
+ * Fetch WhatsApp media bytes from an ALREADY-RESOLVED CDN URL (the second hop of
+ * the two-step download). Carries the auth/redirect safety of
+ * {@link downloadWhatsAppMedia} but skips the `GET /{mediaId}` metadata resolve,
+ * so a caller that already has the metadata (e.g. the inbound media hydrator,
+ * which resolves it once for its `file_size` pre-flight) does NOT pay for a
+ * second authenticated Graph round-trip per attachment.
+ *
+ * The optional `mimeType` is the authoritative metadata MIME from
+ * {@link getWhatsAppMediaUrl}; when present it is preferred over the binary
+ * response's Content-Type (mirroring {@link downloadWhatsAppMedia}).
+ */
+export async function downloadWhatsAppMediaFromUrl(input: {
+  url: string;
+  accessToken: string;
+  mimeType?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<DownloadedMedia> {
+  const fetchImpl = input.fetchImpl ?? globalThis.fetch;
+  const meta = { url: input.url, mimeType: input.mimeType };
+
+  // Fetch the actual bytes WITH the token (required by WhatsApp's CDN).
   //
   // WHY a User-Agent header: the lookaside CDN can reject requests bearing a
   // default `node`/`curl` (or absent) UA — see MEDIA_DOWNLOAD_USER_AGENT.
@@ -304,6 +336,14 @@ export async function downloadWhatsAppMedia(input: {
 }
 
 /**
+ * Sentinel returned by {@link downloadAttachmentUrl} when an EARLY size-cap
+ * pre-flight rejects the download: the response's `Content-Length` already
+ * exceeded `maxBytes`, so we never read the body. Distinct from a thrown error so
+ * the caller (the fail-open hydrator) can treat it as a clean over-cap skip.
+ */
+export const MEDIA_OVER_CAP = Symbol('media-over-cap');
+
+/**
  * Download a Messenger / Instagram attachment from the pre-signed CDN URL Meta
  * put in the webhook payload.
  *
@@ -311,11 +351,22 @@ export async function downloadWhatsAppMedia(input: {
  * the app token is unnecessary and can be actively harmful — the CDN may reject
  * a Bearer it didn't expect, and a redirect to a third-party origin would leak
  * the token cross-origin. So this GET carries NO auth.
+ *
+ * EARLY SIZE CAP (`maxBytes`): when supplied, the `Content-Length` response
+ * header is checked BEFORE `response.arrayBuffer()` reads (and buffers) the body.
+ * An over-cap attachment is rejected with the {@link MEDIA_OVER_CAP} sentinel
+ * having read nothing — so a huge blob is no longer fully buffered just to be
+ * discarded. This mirrors the WhatsApp path's `file_size` pre-flight intent.
+ * FAIL-OPEN: when the header is ABSENT (or `maxBytes` is omitted) we fall back to
+ * the body read and let the caller's post-download check enforce the cap, exactly
+ * as before.
  */
 export async function downloadAttachmentUrl(input: {
   url: string;
   fetchImpl?: typeof fetch;
-}): Promise<DownloadedMedia> {
+  /** Optional hard byte cap, checked against `Content-Length` before reading the body. */
+  maxBytes?: number;
+}): Promise<DownloadedMedia | typeof MEDIA_OVER_CAP> {
   const fetchImpl = input.fetchImpl ?? globalThis.fetch;
 
   let response: Response;
@@ -341,6 +392,21 @@ export async function downloadAttachmentUrl(input: {
   if (!response.ok) {
     const rawText = await safeText(response);
     throw buildHttpError('media.downloadAttachment', response.status, tryParseJson(rawText), rawText);
+  }
+
+  // EARLY REJECT: when we both know a cap and the server told us the size up
+  // front, bail BEFORE reading the body so an over-cap blob is never buffered.
+  // Cancel the body to release the socket promptly (best-effort).
+  if (input.maxBytes !== undefined) {
+    const contentLength = parseContentLength(response.headers.get('content-length'));
+    if (contentLength !== undefined && contentLength > input.maxBytes) {
+      try {
+        await response.body?.cancel();
+      } catch {
+        /* best-effort: cancelling the unread body must not throw. */
+      }
+      return MEDIA_OVER_CAP;
+    }
   }
 
   const data = new Uint8Array(await response.arrayBuffer());

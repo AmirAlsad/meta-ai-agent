@@ -5,6 +5,8 @@ import pino from 'pino';
 import { loadConfig, type Config } from './config/loader.js';
 import { createApp, PACKAGE_VERSION } from './http/app.js';
 import { GraphClient } from './meta/shared/graph-client.js';
+import { HttpMediaHydrator } from './meta/shared/media-hydrator.js';
+import type { InboundMediaHydrator } from './meta/shared/media-hydrator.js';
 import { WhatsAppClient } from './meta/whatsapp/client.js';
 import { MessengerClient } from './meta/messenger/client.js';
 import { InstagramClient } from './meta/instagram/client.js';
@@ -100,6 +102,21 @@ export function buildRuntime(
   // Delivery-status history sink (feeds GET /admin/status/:messageId + metrics).
   const statusTracker = new InMemoryStatusTracker();
 
+  // OPT-IN inbound media hydration. Constructed ONLY when
+  // INBOUND_MEDIA_DOWNLOAD is true: the chat endpoint can't fetch WhatsApp media
+  // (it holds no access token), so the transport downloads it here and rides the
+  // bytes into the chat request as a base64 data URL. Off by default to avoid
+  // base64-inflating every media-bearing request. When disabled we pass
+  // `undefined` (not a Noop) — the agent simply skips hydration.
+  const mediaHydrator: InboundMediaHydrator | undefined = config.conversation.inboundMediaDownload
+    ? new HttpMediaHydrator({
+        graph,
+        ...(config.whatsapp ? { whatsAppAccessToken: config.whatsapp.accessToken } : {}),
+        maxBytes: config.conversation.inboundMediaMaxBytes,
+        logger
+      })
+    : undefined;
+
   const agent = new ConversationAgent({
     store,
     scheduler,
@@ -109,7 +126,8 @@ export function buildRuntime(
     logger,
     metrics,
     identityResolver,
-    statusTracker
+    statusTracker,
+    ...(mediaHydrator ? { mediaHydrator } : {})
   });
 
   const app = createApp({

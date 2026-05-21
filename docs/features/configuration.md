@@ -86,6 +86,8 @@ The Messenger OAuth script also reads `META_APP_ID` and `META_APP_SECRET` — un
 | `PORT` | `3000` | Express listen port. Must be an integer between 1 and 65535. |
 | `USER_LOOKUP_URL` | unset | Optional Stage 6 identity-enrichment endpoint. The resolver POSTs `{ channel, channelScopedUserId, channelScopedBusinessId }` and shapes the JSON response into a `Contact` that rides on the `ChatRequest`. When unset, a no-op resolver runs and conversations proceed without enrichment. When set it must parse as a URL (validated at load, like `CHAT_ENDPOINT_URL`). Enrichment is fail-open. See [Identity resolution](./identity-resolution.md). |
 | `USER_LOOKUP_TIMEOUT_MS` | `5000` | Per-call timeout for the `USER_LOOKUP_URL` request (positive integer). A timeout drops enrichment rather than blocking the turn (fail-open). Loaded onto `config.conversation.userLookupTimeoutMs`, alongside `CHAT_ENDPOINT_TIMEOUT_MS`. Only consulted when `USER_LOOKUP_URL` is set. |
+| `INBOUND_MEDIA_DOWNLOAD` | `false` | Opt-in inbound media hydration. When `true`, the transport downloads inbound media on the flush path (it holds the WhatsApp access token the chat endpoint lacks) and attaches it to the chat request as a base64 `data:` URL on `message.media.dataUrl`. Off by default: base64 inflates each media-bearing request body by ~33% over the raw bytes. Boolean (`1`/`0`/`true`/`false`), loaded onto `config.conversation.inboundMediaDownload`. See [Inbound media hydration](./media-hydration.md). |
+| `INBOUND_MEDIA_MAX_BYTES` | `5242880` | Hard cap (bytes) on a single inbound attachment to hydrate (positive integer; 5 MiB). Media larger than this is left as `id`/`url` (not base64-attached) and logged. Loaded onto `config.conversation.inboundMediaMaxBytes`. Only consulted when `INBOUND_MEDIA_DOWNLOAD` is `true`. |
 | `REDIS_URL` | unset | Reserved for Stage 10 (Redis-backed conversation store, dedupe, BullMQ buffer timers). As of Stage 6 it is surfaced in `GET /ready` as `configured` vs `not_configured` (presence-only — the real ping lands in Stage 10). |
 | `ADMIN_API_TOKEN` | unset | Stage 6: gates the PII-bearing operational routes `GET /metrics`, `GET /admin/conversations/:key`, and `GET /admin/status/:messageId` (constant-time `Authorization: Bearer` / `x-admin-api-token` check). When **unset**, those routes are not mounted at all (a request 404s, not 401s — never advertise an admin surface a deploy hasn't configured a token for). When **set**, it must be at least **16 characters** (a high-entropy secret of **≥32** is recommended) — `loadConfig` throws otherwise. `/health` and `/ready` are unaffected (always on, unauthenticated). See [Operational visibility](./operational-visibility.md). |
 | `PUBLIC_BASE_URL` | unset | Used by the webhook-registration and capture scripts to compute the callback URL. Not consumed by the running app. |
@@ -119,6 +121,7 @@ None of these are consumed by the running agent; they are read by the setup/capt
 - All three channels unset.
 - `PORT` not an integer in `[1, 65535]`.
 - `AGENT_AUTOSTART` set to a value other than `1`, `0`, `true`, `false`.
+- `INBOUND_MEDIA_MAX_BYTES` not a positive integer (when set).
 
 ## Known limitations
 
