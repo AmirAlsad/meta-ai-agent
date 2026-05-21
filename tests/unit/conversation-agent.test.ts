@@ -2771,6 +2771,90 @@ describe('ConversationAgent', () => {
       expect(adapter.sendText).not.toHaveBeenCalled();
       await agent.close();
     });
+
+    it('recoverPendingRetries: un-wedges a `processing` record stranded by a restart (resets to idle)', async () => {
+      // A `processing` record (chat call was in flight at crash) with both arrays
+      // empty would otherwise wedge forever (no flush is ever scheduled). Recovery
+      // resets it to idle so the NEXT inbound starts a fresh turn.
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const scheduler = new InMemoryBufferScheduler();
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: makeChatClient([textResponse('fresh reply')]),
+        adapters: { messenger: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+
+      const stranded: ConversationRecord = {
+        ...createIdleConversation({
+          key: 'messenger:biz-1:fb-user',
+          channel: 'messenger',
+          channelScopedUserId: 'fb-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'processing'
+      };
+      await store.setConversation(stranded);
+
+      const result = await agent.recoverPendingRetries();
+      expect(result.processingReset).toBe(1);
+      expect((await store.getConversation('messenger:biz-1:fb-user'))!.state).toBe('idle');
+
+      // The conversation is no longer wedged: a fresh inbound flushes normally.
+      await agent.handleInbound(inbound({ channel: 'messenger', channelMessageId: 'm_fresh', channelScopedUserId: 'fb-user' }));
+      await flushBuffer();
+      expect(adapter.sendText).toHaveBeenCalledWith('fb-user', 'fresh reply');
+      await agent.close();
+    });
+
+    it('recoverPendingRetries: a `processing` record with stashed lateArrivals re-buffers + flushes them', async () => {
+      // If messages arrived during the dead chat call (persisted to lateArrivals),
+      // recovery preserves them: fold into the buffer, drop to buffering, flush.
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const scheduler = new InMemoryBufferScheduler();
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: makeChatClient([textResponse('answer to late msg')]),
+        adapters: { messenger: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+
+      const stranded: ConversationRecord = {
+        ...createIdleConversation({
+          key: 'messenger:biz-1:fb-user',
+          channel: 'messenger',
+          channelScopedUserId: 'fb-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'processing',
+        lateArrivals: [inbound({ channel: 'messenger', channelMessageId: 'm_late', channelScopedUserId: 'fb-user', text: 'you there?' })]
+      };
+      await store.setConversation(stranded);
+
+      const result = await agent.recoverPendingRetries();
+      expect(result.processingReset).toBe(1);
+      // The recovery scheduled a flush; let it fire and process the late arrival.
+      await flushBuffer();
+      expect(adapter.sendText).toHaveBeenCalledWith('fb-user', 'answer to late msg');
+      const record = await store.getConversation('messenger:biz-1:fb-user');
+      expect(record!.state).toBe('idle');
+      expect(record!.lateArrivals).toEqual([]);
+      await agent.close();
+    });
   });
 });
 

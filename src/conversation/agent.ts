@@ -1472,50 +1472,88 @@ export class ConversationAgent {
   /* ──────────────────────────────────────────────────────────────────────── */
 
   /**
-   * Re-arm transient-retry timers for any `sending` conversation whose in-flight
-   * item was mid-retry when the process restarted. PUBLIC ENTRY POINT — the
-   * runtime calls this once at boot. Each per-key scan runs under
+   * Boot recovery for conversations stranded by a process restart. PUBLIC ENTRY
+   * POINT — the runtime calls this once at boot. Each per-key scan runs under
    * {@link runExclusive} (it is an entry point) and is fail-soft so one bad record
-   * cannot sink recovery.
+   * cannot sink recovery. Two cases:
    *
-   * NOTE: the in-memory store wipes all state on restart, so its
-   * `listConversationKeys()` yields nothing after a restart and this returns
-   * `{ transientRetriesResumed: 0 }`. It does real work only against a durable
-   * (Redis) store, which lands in Stage 10.
+   *  - `sending` mid-retry: an in-flight item with `nextRetryAt` + `retryCount > 0`
+   *    whose backoff timer (in-process) died with the old process. Re-arm it with
+   *    the remaining delay.
+   *  - `processing` stranded: the chat call was in flight when the process died, so
+   *    the local batch snapshot is gone AND nothing will ever flush this record —
+   *    `handleInbound`'s `processing` branch only stashes to `lateArrivals` and
+   *    aborts a now-absent controller, so the conversation would WEDGE until TTL.
+   *    Un-wedge it: fold any `lateArrivals` (messages that arrived during the dead
+   *    chat call and WERE persisted) back into the buffer and reschedule a flush;
+   *    if there are none, reset to `idle` so the next inbound starts fresh. The
+   *    original (snapshotted, never-persisted) chat-call batch is lost — an inherent
+   *    at-least-once limitation of the snapshot-clears-buffer design; see KNOWN-GAPS.
+   *
+   * MULTI-REPLICA DOUBLE-SEND/DOUBLE-RECOVERY GUARD: on a shared Redis every replica
+   * runs this at boot and the per-process `runExclusive` lock is NOT distributed, so
+   * each recovery action is gated behind an atomic `store.claimRecovery(token, ttl)`
+   * — exactly one replica acts. The in-memory store is single-process and always
+   * wins (and wipes state on restart anyway, so it yields nothing to recover and
+   * returns all-zero counts). A store without `claimRecovery` falls back to true.
    */
-  async recoverPendingRetries(): Promise<{ transientRetriesResumed: number }> {
+  async recoverPendingRetries(): Promise<{ transientRetriesResumed: number; processingReset: number }> {
     let transientRetriesResumed = 0;
+    let processingReset = 0;
+    const ttl = this.config.persistence.conversationTtlSeconds;
+    const claim = (token: string): Promise<boolean> =>
+      this.store.claimRecovery ? this.store.claimRecovery(token, ttl) : Promise.resolve(true);
     for await (const key of this.store.listConversationKeys()) {
       try {
-        const resumed = await this.runExclusive(key, async () => {
+        const outcome = await this.runExclusive(key, async (): Promise<'sending' | 'processing' | 'none'> => {
           const record = await this.store.getConversation(key);
-          if (!record || record.state !== 'sending') return false;
+          if (!record) return 'none';
+
+          // (A) `processing` stranded by a restart — un-wedge it (claim-guarded).
+          if (record.state === 'processing') {
+            if (!(await claim(`${key}:processing`))) return 'none';
+            this.clearDeliveryTimeout(key);
+            this.clearTransientRetryTimer(key);
+            this.pendingRequests.delete(key);
+            delete record.currentOutboundMessageId;
+            record.reprocessCount = 0;
+            record.outboundQueue = [];
+            record.currentOutboundIndex = 0;
+            if (record.lateArrivals.length > 0) {
+              record.inboundBuffer = [...record.inboundBuffer, ...record.lateArrivals];
+              record.lateArrivals = [];
+              record.state = 'buffering';
+              record.lastActivity = this.now();
+              await this.store.setConversation(record);
+              const delayMs = calculateBufferTimeout(record.inboundBuffer.length, this.config.conversation, this.random);
+              await this.scheduler.schedule(key, delayMs, record.traceId !== undefined ? { traceId: record.traceId } : undefined);
+            } else {
+              record.state = 'idle';
+              record.lastActivity = this.now();
+              await this.store.setConversation(record);
+            }
+            return 'processing';
+          }
+
+          // (B) `sending` mid-retry — re-arm the transient-retry timer (claim-guarded,
+          // scoped to THIS attempt {key}:{itemId}:{retryCount} so a later restart with
+          // a new attempt claims a fresh token).
+          if (record.state !== 'sending') return 'none';
           const item = record.outboundQueue[record.currentOutboundIndex];
-          if (!item || item.nextRetryAt === undefined || (item.retryCount ?? 0) <= 0) return false;
-          // MULTI-REPLICA DOUBLE-SEND GUARD: on a shared Redis, every replica runs
-          // this at boot and would each re-arm + re-send this same overdue retry
-          // (the per-process lock is not distributed). An atomic store claim, scoped
-          // to THIS attempt ({key}:{itemId}:{retryCount}), lets exactly one replica
-          // re-arm it. The in-memory store is single-process and always wins. A
-          // store without claimRecovery falls back to the prior single-replica
-          // behavior (true).
-          const claimToken = `${key}:${item.id}:${item.retryCount ?? 0}`;
-          const won = this.store.claimRecovery
-            ? await this.store.claimRecovery(claimToken, this.config.persistence.conversationTtlSeconds)
-            : true;
-          if (!won) return false;
-          // Re-arm the SAME retry mechanism with the remaining delay (clamped to
-          // >= 0 so an overdue retry fires promptly).
+          if (!item || item.nextRetryAt === undefined || (item.retryCount ?? 0) <= 0) return 'none';
+          if (!(await claim(`${key}:${item.id}:${item.retryCount ?? 0}`))) return 'none';
+          // Re-arm with the remaining delay (clamped to >= 0 so an overdue retry fires promptly).
           const remainingMs = Math.max(0, item.nextRetryAt - this.now());
           this.armTransientRetryTimer(key, item.id, item.retryCount ?? 0, remainingMs, record.traceId);
-          return true;
+          return 'sending';
         });
-        if (resumed) transientRetriesResumed += 1;
+        if (outcome === 'sending') transientRetriesResumed += 1;
+        else if (outcome === 'processing') processingReset += 1;
       } catch (error) {
         this.logger.warn({ err: error, conversationKey: key }, 'recoverPendingRetries: skipping bad record');
       }
     }
-    return { transientRetriesResumed };
+    return { transientRetriesResumed, processingReset };
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */

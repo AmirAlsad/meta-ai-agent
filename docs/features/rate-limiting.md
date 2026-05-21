@@ -217,12 +217,24 @@ the `RedisConversationStore` implements it as `SET NX EX` so exactly ONE replica
 re-arms; the rest skip. The token is attempt-unique, so a *later* restart with a new retry
 attempt claims a fresh key. The in-memory store is single-process and always wins.
 
+**Stranded `processing` conversations are un-wedged too.** A conversation whose chat
+call was in flight when the process died sits in Redis as `state: 'processing'`. Nothing
+would ever flush it again (`handleInbound`'s `processing` branch only stashes to
+`lateArrivals` and aborts a now-absent controller), so without recovery it would WEDGE
+until its TTL. Recovery (claim-guarded, so one replica acts) folds any persisted
+`lateArrivals` back into the buffer and reschedules a flush, or — if there are none —
+resets the record to `idle` so the next inbound starts fresh. It returns
+`{ transientRetriesResumed, processingReset }`. **Inherent limitation:** the original
+in-flight batch (snapshotted into a local var in `flushImpl` segment 1, never persisted)
+is lost on a hard crash mid-chat-call — an at-least-once tradeoff of the
+snapshot-clears-buffer design; see [Known gaps](../KNOWN-GAPS.md).
+
 **It does real work only against a durable (Redis) store.** The in-memory store wipes
 all state on restart, so `listConversationKeys()` yields nothing and the call returns
-`{ transientRetriesResumed: 0 }`. Recovery covers transient retries only — not in-flight
-window re-prompts (the `pendingRequests` map is in-memory and lost on restart) and not
-buffer-flush timers (those are durable in their own right via the BullMQ scheduler — see
-[Persistence](./persistence.md#the-bullmq-buffer-scheduler)).
+all-zero counts. Recovery covers transient retries + stranded `processing` records — not
+in-flight window re-prompts (the `pendingRequests` map is in-memory and lost on restart)
+and not buffer-flush timers (those are durable in their own right via the BullMQ
+scheduler — see [Persistence](./persistence.md#the-bullmq-buffer-scheduler)).
 
 ## Configuration
 
