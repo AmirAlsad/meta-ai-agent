@@ -39,7 +39,15 @@ export interface BufferScheduler {
   setHandler(handler: BufferHandler): void;
   /**
    * (Re)arm the flush timer for `conversationKey`, cancelling any existing one.
-   * A `delayMs <= 0` fires the handler immediately (awaited).
+   *
+   * `delayMs <= 0` handling is IMPLEMENTATION-SPECIFIC and callers MUST NOT rely on
+   * it: the in-memory impl fires the handler immediately + inline (awaited), whereas
+   * the BullMQ impl enqueues a job with `delay: max(0, delayMs)` that the worker
+   * picks up asynchronously (never inline). This deliberate divergence is safe
+   * because the only caller — the conversation agent — NEVER passes `delayMs <= 0`
+   * (`calculateBufferTimeout` always returns a positive delay; an inline fire while
+   * the agent holds the per-key lock would self-deadlock). Pass a strictly-positive
+   * delay.
    */
   schedule(conversationKey: string, delayMs: number, options?: { traceId?: string }): Promise<void>;
   /** Cancel a pending flush for `conversationKey` (no-op if none). */
