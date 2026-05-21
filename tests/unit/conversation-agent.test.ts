@@ -1662,6 +1662,195 @@ describe('ConversationAgent', () => {
     });
   });
 
+  describe('interrupt BETWEEN flush segments 2 and 3 (FINDING 1 + FINDING 2)', () => {
+    /**
+     * Build an interrupt harness whose store fires a one-shot concurrent
+     * `handleInbound` the moment the flush persists `state = 'sending'` (segment
+     * 2). Because that `setConversation` runs INSIDE segment 2's held lock, the
+     * injected `handleInbound` chains onto the per-key lock AFTER segment 2 and
+     * BEFORE segment 3 (`sendNext`) — deterministically reproducing the
+     * "interrupt between segments 2 and 3" race the findings describe.
+     */
+    function makeSegmentRaceHarness(
+      responseFor: (request: ChatRequest, callIndex: number) => NormalizedChatResponse
+    ): {
+      agent: ConversationAgent;
+      store: InMemoryConversationStore;
+      adapter: FakeAdapter;
+      chat: ReturnType<typeof makeControllableChatClient>;
+      key: string;
+      /** Arm a one-shot interrupt fired exactly when the record enters `sending`. */
+      armInterruptOnSending: (message: IncomingMessage) => void;
+    } {
+      const config = makeConfig();
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
+      const scheduler = new InMemoryBufferScheduler();
+      const adapter = makeAdapter('messenger', messengerSupports); // on_send
+      const chat = makeControllableChatClient(responseFor);
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: chat,
+        adapters: { messenger: adapter },
+        config,
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+
+      let pendingInterrupt: IncomingMessage | undefined;
+      const realSet = store.setConversation.bind(store);
+      store.setConversation = async (record): Promise<void> => {
+        await realSet(record);
+        // Fire the armed interrupt exactly once, when the turn enters `sending`
+        // (segment 2). The injected handleInbound is a floating promise: it
+        // chains onto the per-key lock held by segment 2, so it runs before
+        // segment 3's sendNext.
+        if (record.state === 'sending' && pendingInterrupt !== undefined) {
+          const msg = pendingInterrupt;
+          pendingInterrupt = undefined;
+          void agent.handleInbound(msg);
+        }
+      };
+
+      return {
+        agent,
+        store,
+        adapter,
+        chat,
+        key: 'messenger:biz-1:fb-user',
+        armInterruptOnSending: (message: IncomingMessage) => {
+          pendingInterrupt = message;
+        }
+      };
+    }
+
+    const mkInbound = (id: string, text: string): IncomingMessage =>
+      inbound({ channel: 'messenger', channelScopedUserId: 'fb-user', channelMessageId: id, text });
+
+    it('FINDING 2: interrupt at `sending` never leaves the record idle with a non-empty inboundBuffer', async () => {
+      // A normal flush completes and segment 2 sets `sending`. Between segments 2
+      // and 3 an inbound interrupts (interruptSending → re-buffers + schedules a
+      // flush). Segment 3's sendNext then runs finalizeTurn on the re-buffered
+      // record. The state machine must NOT be left `idle` while `inboundBuffer` is
+      // non-empty: it must be `buffering` with a pending flush (or drained by it).
+      const h = makeSegmentRaceHarness((_req, i) => textResponse(`reply-${i}`));
+
+      // m_a → flush → chat #0 parks in-flight (interruptible).
+      await h.agent.handleInbound(mkInbound('m_a', 'first'));
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(h.chat.complete).toHaveBeenCalledTimes(1);
+
+      // Arm the interrupt to fire when this turn enters `sending`, then release
+      // the chat call so segment 2 proceeds and trips the hook.
+      h.armInterruptOnSending(mkInbound('m_b', 'second'));
+      h.chat.release(0);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // INVARIANT: never idle while the buffer is non-empty.
+      const afterRace = await h.store.getConversation(h.key);
+      expect(afterRace).toBeDefined();
+      if (afterRace!.inboundBuffer.length > 0) {
+        expect(afterRace!.state).toBe('buffering');
+      }
+      // The interrupted-in message is buffered for a fresh follow-up turn and a
+      // flush is scheduled — draining it must reach the chat endpoint.
+      expect(afterRace!.state).toBe('buffering');
+      expect(afterRace!.inboundBuffer.map(m => m.channelMessageId)).toEqual(['m_b']);
+
+      // The scheduled follow-up flush drains the buffer to idle (proving the
+      // pending flush really owns the turn — no stuck buffer).
+      await vi.advanceTimersByTimeAsync(20_000);
+      const followUp = h.chat.calls.length - 1;
+      expect(h.chat.calls[followUp]!.messages.map(m => m.channelMessageId)).toEqual(['m_b']);
+      h.chat.release(followUp);
+      await vi.advanceTimersByTimeAsync(0);
+      const done = await h.store.getConversation(h.key);
+      expect(done!.state).toBe('idle');
+      expect(done!.inboundBuffer).toEqual([]);
+      await h.agent.close();
+    });
+
+    it('FINDING 1: lateArrivals stashed during a committed flush are NOT dropped by an interrupt at `sending`', async () => {
+      // BLOCKING message-drop regression. Drive reprocessCount to MAX_REPROCESS so
+      // the next flush is COMMITTED (registers no AbortController). A message that
+      // arrives DURING the committed flush queues to `lateArrivals` (it can't
+      // abort). When the committed flush completes, segment 2 attaches the queue,
+      // sets `sending`, and LEAVES the lateArrivals on the record. Between segments
+      // 2 and 3 a NEW inbound interrupts (interruptSending). Pre-FINDING-1 fix,
+      // interruptSending cleared lateArrivals unconditionally → the message that
+      // arrived during the committed flush was permanently DROPPED. With the fix it
+      // is folded into the buffer and ultimately reaches the chat endpoint.
+      const MAX_REPROCESS = 5;
+      const h = makeSegmentRaceHarness((_req, i) => textResponse(`reply-${i}`));
+      let nextId = 0;
+
+      // Turn 1: m_0 → flush → chat #0 parks in-flight (interruptible).
+      await h.agent.handleInbound(mkInbound(`m_${nextId++}`, 'msg'));
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      // Drive reprocessCount to MAX_REPROCESS via successive aborts (each late
+      // arrival aborts the in-flight interruptible flush → rebatch, count++).
+      for (let i = 0; i < MAX_REPROCESS; i++) {
+        await h.agent.handleInbound(mkInbound(`m_${nextId++}`, 'more'));
+        await vi.advanceTimersByTimeAsync(20_000);
+      }
+      const atCap = await h.store.getConversation(h.key);
+      expect(atCap!.reprocessCount).toBe(MAX_REPROCESS);
+      expect(atCap!.state).toBe('processing'); // the committed flush is in-flight
+      const committedCallIndex = h.chat.calls.length - 1;
+
+      // A message arrives DURING the committed flush → stashes in lateArrivals
+      // (no AbortController to abort the committed flush).
+      const stashedId = `m_${nextId++}`;
+      await h.agent.handleInbound(mkInbound(stashedId, 'during-committed'));
+      await vi.advanceTimersByTimeAsync(0);
+      const duringCommitted = await h.store.getConversation(h.key);
+      expect(duringCommitted!.lateArrivals.map(m => m.channelMessageId)).toEqual([stashedId]);
+
+      // Arm an interrupt to fire when the committed flush enters `sending`
+      // (segment 2), then release the committed flush. The interrupt's
+      // interruptSending runs between segments 2 and 3.
+      const interruptId = `m_${nextId++}`;
+      h.armInterruptOnSending(mkInbound(interruptId, 'mid-delivery'));
+      h.chat.release(committedCallIndex);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The record is now re-buffered by the interrupt. (The interrupt lands at
+      // `sending` BEFORE segment 3's sendNext, so by interruptSending's design the
+      // committed turn's unsent queue items are dropped and re-decided from the
+      // combined buffer on the next flush — what matters for FINDING 1 is that no
+      // INPUT message is lost, which the buffer assertions below prove.)
+      const reBuffered = await h.store.getConversation(h.key);
+      expect(reBuffered!.state).toBe('buffering');
+      // BOTH the stashed late arrival AND the interrupting message are buffered —
+      // nothing dropped (pre-fix `stashedId` would be MISSING here).
+      expect(reBuffered!.inboundBuffer.map(m => m.channelMessageId)).toContain(stashedId);
+      expect(reBuffered!.inboundBuffer.map(m => m.channelMessageId)).toContain(interruptId);
+      expect(reBuffered!.lateArrivals).toEqual([]);
+
+      // Drain the follow-up flush → its chat request carries BOTH messages, so
+      // both reach the chat endpoint (the drop is fully fixed).
+      await vi.advanceTimersByTimeAsync(20_000);
+      const followUp = h.chat.calls.length - 1;
+      const followUpIds = h.chat.calls[followUp]!.messages.map(m => m.channelMessageId);
+      expect(followUpIds).toContain(stashedId);
+      expect(followUpIds).toContain(interruptId);
+      h.chat.release(followUp);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Every message that was ever accepted reached SOME chat request.
+      const everySentId = new Set(h.chat.calls.flatMap(c => c.messages.map(m => m.channelMessageId)));
+      for (let i = 0; i < nextId; i++) {
+        expect(everySentId.has(`m_${i}`)).toBe(true);
+      }
+      const done = await h.store.getConversation(h.key);
+      expect(done!.state).toBe('idle');
+      await h.agent.close();
+    });
+  });
+
   it('handleStatus concurrent with an in-flight send does not double-advance (exactly-once)', async () => {
     // WhatsApp lifecycle: the queue waits on a delivery status. Fire the status
     // for the in-flight item TWICE concurrently (a status webhook can be

@@ -220,7 +220,6 @@ export async function downloadWhatsAppMedia(input: {
   graph: GraphClient;
   fetchImpl?: typeof fetch;
 }): Promise<DownloadedMedia> {
-  const fetchImpl = input.fetchImpl ?? globalThis.fetch;
   // Step 1 — resolve URL + metadata (throws MetaApiError 'whatsapp.getMediaUrl'
   // on failure; we let that propagate so the operation label is accurate).
   const meta = await getWhatsAppMediaUrl({
@@ -229,7 +228,40 @@ export async function downloadWhatsAppMedia(input: {
     graph: input.graph
   });
 
-  // Step 2 — fetch the actual bytes WITH the token (required by WhatsApp's CDN).
+  // Step 2 — fetch the bytes from the resolved URL. Delegated to
+  // {@link downloadWhatsAppMediaFromUrl} so a caller that ALREADY resolved the
+  // metadata (e.g. the media hydrator's `file_size` pre-flight) can skip the
+  // redundant `GET /{mediaId}` and download straight from `meta.url`.
+  return downloadWhatsAppMediaFromUrl({
+    url: meta.url,
+    accessToken: input.accessToken,
+    ...(meta.mimeType !== undefined ? { mimeType: meta.mimeType } : {}),
+    ...(input.fetchImpl !== undefined ? { fetchImpl: input.fetchImpl } : {})
+  });
+}
+
+/**
+ * Fetch WhatsApp media bytes from an ALREADY-RESOLVED CDN URL (the second hop of
+ * the two-step download). Carries the auth/redirect safety of
+ * {@link downloadWhatsAppMedia} but skips the `GET /{mediaId}` metadata resolve,
+ * so a caller that already has the metadata (e.g. the inbound media hydrator,
+ * which resolves it once for its `file_size` pre-flight) does NOT pay for a
+ * second authenticated Graph round-trip per attachment.
+ *
+ * The optional `mimeType` is the authoritative metadata MIME from
+ * {@link getWhatsAppMediaUrl}; when present it is preferred over the binary
+ * response's Content-Type (mirroring {@link downloadWhatsAppMedia}).
+ */
+export async function downloadWhatsAppMediaFromUrl(input: {
+  url: string;
+  accessToken: string;
+  mimeType?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<DownloadedMedia> {
+  const fetchImpl = input.fetchImpl ?? globalThis.fetch;
+  const meta = { url: input.url, mimeType: input.mimeType };
+
+  // Fetch the actual bytes WITH the token (required by WhatsApp's CDN).
   //
   // WHY a User-Agent header: the lookaside CDN can reject requests bearing a
   // default `node`/`curl` (or absent) UA — see MEDIA_DOWNLOAD_USER_AGENT.

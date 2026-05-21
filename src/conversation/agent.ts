@@ -545,7 +545,16 @@ export class ConversationAgent {
       await this.store.deleteOutboundHandleMapping(record.currentOutboundMessageId);
     }
 
-    record.inboundBuffer.push(message);
+    // FINDING 1 (message-drop fix): fold any STASHED `lateArrivals` into the
+    // buffer BEFORE clearing them, in order. A committed flush registers no
+    // AbortController, so inbounds that land while its chat call is in flight sit
+    // in `lateArrivals` (not aborting). Segment 2 then preserves those on the
+    // record and transitions to `sending`; between segments 2 and 3 a NEW inbound
+    // can see `sending` and call `interruptSending`. Clearing `lateArrivals`
+    // unconditionally here would permanently drop those stashed messages,
+    // violating the "nothing dropped during a committed flush" guarantee. Order:
+    // existing buffer, then the stashed late arrivals, then the new message.
+    record.inboundBuffer = [...record.inboundBuffer, ...record.lateArrivals, message];
     record.lateArrivals = [];
     record.outboundQueue = [];
     record.currentOutboundIndex = 0;
@@ -1449,6 +1458,20 @@ export class ConversationAgent {
       await this.store.setConversation(record);
       const delayMs = calculateBufferTimeout(record.inboundBuffer.length, this.config.conversation, this.random);
       await this.scheduler.schedule(key, delayMs, traceId !== undefined ? { traceId } : undefined);
+      return;
+    }
+
+    // FINDING 2 (interrupt-between-segments race): an `interruptSending` can run
+    // BETWEEN segment 2 (which set `sending`) and segment 3's `sendNext` — it
+    // re-buffers the record (`state = 'buffering'`, appends to `inboundBuffer`,
+    // resets the queue) and schedules a fresh flush. Segment 3 then loads that
+    // re-buffered record, finds an empty queue, and reaches `finalizeTurn` with
+    // no `lateArrivals`. Forcing `idle` here would clobber the in-progress
+    // `buffering` turn, leaving the invalid `idle + non-empty inboundBuffer`
+    // state (with a flush already scheduled). So: if the record has already been
+    // re-buffered (it is `buffering` with a non-empty `inboundBuffer`, i.e. a
+    // flush is pending), leave it untouched — the scheduled flush owns the turn.
+    if (record.state === 'buffering' && record.inboundBuffer.length > 0) {
       return;
     }
     record.state = 'idle';

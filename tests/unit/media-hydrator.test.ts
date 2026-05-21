@@ -81,10 +81,11 @@ describe('HttpMediaHydrator — WhatsApp (2-hop authenticated download)', () => 
     const fetchImpl = vi.fn();
     const metaResponse = (): Response =>
       jsonResponse(200, { url: WA_MEDIA_URL, mime_type: 'image/jpeg', file_size: IMAGE_BYTES.byteLength });
-    // The hydrator resolves metadata once for the size pre-flight, then
-    // downloadWhatsAppMedia re-resolves it internally, then fetches the binary.
-    fetchImpl.mockResolvedValueOnce(metaResponse()); // pre-flight metadata
-    fetchImpl.mockResolvedValueOnce(metaResponse()); // downloadWhatsAppMedia metadata
+    // FINDING 3: the hydrator resolves metadata ONCE (for the size pre-flight),
+    // then downloads straight from the resolved url via
+    // downloadWhatsAppMediaFromUrl — NO second metadata resolve. So the sequence
+    // is: metadata JSON, then the binary GET.
+    fetchImpl.mockResolvedValueOnce(metaResponse()); // pre-flight metadata (only resolve)
     fetchImpl.mockResolvedValueOnce(binaryResponse(IMAGE_BYTES, { 'content-type': 'image/jpeg' })); // binary
 
     const graph = makeGraph(fetchImpl);
@@ -108,6 +109,38 @@ describe('HttpMediaHydrator — WhatsApp (2-hop authenticated download)', () => 
     expect(String(binUrl)).toBe(WA_MEDIA_URL);
     const binHeaders = (binInit.headers ?? {}) as Record<string, string>;
     expect(binHeaders['authorization']).toBe(`Bearer ${WA_TOKEN}`);
+  });
+
+  it('FINDING 3: under-cap hydrate resolves the /{media_id} metadata endpoint EXACTLY ONCE', async () => {
+    // Before the fix the under-cap path resolved metadata twice: once for the
+    // hydrator's file_size pre-flight and again inside downloadWhatsAppMedia. The
+    // fix downloads from the already-resolved url, so the authenticated
+    // `GET /{media_id}` Graph hop happens only once. We count the metadata GETs by
+    // matching the media id in the requested URL and asserting exactly one.
+    const fetchImpl = vi.fn();
+    fetchImpl.mockResolvedValueOnce(
+      jsonResponse(200, { url: WA_MEDIA_URL, mime_type: 'image/jpeg', file_size: IMAGE_BYTES.byteLength })
+    ); // metadata resolve (must be the ONLY one)
+    fetchImpl.mockResolvedValueOnce(binaryResponse(IMAGE_BYTES, { 'content-type': 'image/jpeg' })); // binary
+
+    const hydrator = new HttpMediaHydrator({
+      graph: makeGraph(fetchImpl),
+      whatsAppAccessToken: WA_TOKEN,
+      maxBytes: 1_000_000,
+      fetchImpl: fetchImpl as unknown as typeof fetch
+    });
+
+    const dataUrl = await hydrator.hydrate(whatsAppImage());
+    expect(dataUrl).toBeDefined(); // the under-cap path completed the download
+
+    // Count fetches whose URL targets the `/{media_id}` metadata endpoint. The
+    // binary hop targets the resolved CDN url (WA_MEDIA_URL), not the media id.
+    const metadataGets = fetchImpl.mock.calls.filter(([url]) =>
+      String(url).includes(MEDIA_ID)
+    );
+    expect(metadataGets).toHaveLength(1);
+    // Total of two fetches: one metadata resolve + one binary GET (no redundant hop).
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
   it('returns undefined (no download) when no WhatsApp access token is configured', async () => {
@@ -271,9 +304,8 @@ describe('HttpMediaHydrator — generic behaviors', () => {
   it('falls back to the descriptor mimeType when the download supplies none', async () => {
     const fetchImpl = vi.fn();
     // No content-type on the binary hop; metadata also omits mime_type.
-    // Two metadata resolves (pre-flight + downloadWhatsAppMedia) then the binary.
+    // FINDING 3: ONE metadata resolve (pre-flight) then the binary — no second resolve.
     const noMimeMeta = (): Response => jsonResponse(200, { url: WA_MEDIA_URL, file_size: IMAGE_BYTES.byteLength });
-    fetchImpl.mockResolvedValueOnce(noMimeMeta());
     fetchImpl.mockResolvedValueOnce(noMimeMeta());
     fetchImpl.mockResolvedValueOnce(binaryResponse(IMAGE_BYTES));
 

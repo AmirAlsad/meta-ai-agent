@@ -27,7 +27,7 @@ import type { GraphClient } from './graph-client.js';
 import type { IncomingMessage } from '../types.js';
 import {
   downloadAttachmentUrl,
-  downloadWhatsAppMedia,
+  downloadWhatsAppMediaFromUrl,
   getWhatsAppMediaUrl,
   MEDIA_OVER_CAP,
   type DownloadedMedia
@@ -122,11 +122,12 @@ export class HttpMediaHydrator implements InboundMediaHydrator {
       }
       // Pre-flight the size cap from the media metadata BEFORE pulling bytes:
       // WhatsApp's `GET /{mediaId}` reports `file_size`, so an over-cap blob is
-      // skipped without ever downloading the (potentially large) binary. The
-      // cost is one extra cheap JSON GET on the UNDER-cap path —
-      // `downloadWhatsAppMedia` re-resolves the URL internally — which we accept
-      // to reuse its token-leak-on-redirect safety rather than reimplementing the
-      // authenticated binary hop here. The OVER-cap path does just this one GET.
+      // skipped without ever downloading the (potentially large) binary. We
+      // resolve the metadata ONCE here and then download straight from the
+      // resolved `meta.url` via `downloadWhatsAppMediaFromUrl` — which keeps the
+      // token-leak-on-redirect safety of the binary hop WITHOUT re-issuing the
+      // authenticated `GET /{mediaId}` (FINDING 3: previously the under-cap path
+      // hit the metadata endpoint twice). The OVER-cap path does just this one GET.
       const meta = await getWhatsAppMediaUrl({
         mediaId: media.id,
         accessToken: this.whatsAppAccessToken,
@@ -136,10 +137,10 @@ export class HttpMediaHydrator implements InboundMediaHydrator {
         this.logCapSkip(message.channel, meta.fileSizeBytes);
         return undefined;
       }
-      downloaded = await downloadWhatsAppMedia({
-        mediaId: media.id,
+      downloaded = await downloadWhatsAppMediaFromUrl({
+        url: meta.url,
         accessToken: this.whatsAppAccessToken,
-        graph: this.graph,
+        ...(meta.mimeType !== undefined ? { mimeType: meta.mimeType } : {}),
         fetchImpl: this.fetchImpl
       });
     } else if (media.url !== undefined) {
