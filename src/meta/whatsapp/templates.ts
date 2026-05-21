@@ -61,13 +61,16 @@ export interface BuildTemplateComponentsInput {
 export function buildTemplateComponents(input: BuildTemplateComponentsInput): TemplateComponent[] {
   const components: TemplateComponent[] = [];
 
-  // Header — emitted only when header params are supplied.
-  if (input.headerParameters !== undefined) {
+  // Header — emitted only when header params are supplied AND non-empty. Meta
+  // rejects a template component whose `parameters` array is empty (400 at send
+  // time), so an empty array is treated as a clean no-op rather than emitted.
+  if (input.headerParameters !== undefined && input.headerParameters.length > 0) {
     components.push({ type: 'header', parameters: input.headerParameters });
   }
 
-  // Body — emitted only when body params are supplied.
-  if (input.bodyParameters !== undefined) {
+  // Body — emitted only when body params are supplied AND non-empty (same
+  // empty-array rejection rule as the header above).
+  if (input.bodyParameters !== undefined && input.bodyParameters.length > 0) {
     components.push({ type: 'body', parameters: input.bodyParameters });
   }
 

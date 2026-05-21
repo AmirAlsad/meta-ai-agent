@@ -399,8 +399,13 @@ function buildResponse(message: Anthropic.Message): ChatResponse {
   // Rich path: text bubble(s) first (unless the text was delivered AS a reply
   // action), then the actions, in order. The agent's normalizer treats a
   // non-empty `actions[]` as authoritative.
+  // Only suppress the text bubbles when a reply action IS the text delivery —
+  // i.e. the model emitted a reply_to_message tool call and no independent text.
+  // If the model produced BOTH a text block and a reply action, keep both;
+  // dropping all bubbles on any reply action would silently lose that text.
   const ordered: ChatAction[] = [];
-  if (!hasReplyAction) {
+  const suppressBubbles = hasReplyAction && bubbles.length === 0;
+  if (!suppressBubbles) {
     for (const text of bubbles) ordered.push({ type: 'message', text });
   }
   ordered.push(...actions);

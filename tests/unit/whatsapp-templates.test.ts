@@ -116,9 +116,14 @@ describe('buildTemplateComponents', () => {
     expect(components).toEqual([{ type: 'body', parameters: [currency] }]);
   });
 
-  it('preserves an empty parameters array for a section (does not drop it)', () => {
-    // Supplying an explicit empty list is distinct from omitting the section.
-    const components = buildTemplateComponents({ bodyParameters: [] });
-    expect(components).toEqual([{ type: 'body', parameters: [] }]);
+  it('drops a section whose parameters array is empty (Meta rejects empty parameters)', () => {
+    // An explicit empty list is treated as a clean no-op, NOT emitted: Meta
+    // returns a 400 for a template component with an empty `parameters` array.
+    expect(buildTemplateComponents({ bodyParameters: [] })).toEqual([]);
+    expect(buildTemplateComponents({ headerParameters: [] })).toEqual([]);
+    // A non-empty section alongside an empty one still emits only the non-empty.
+    expect(
+      buildTemplateComponents({ headerParameters: [], bodyParameters: [textParameter('hi')] })
+    ).toEqual([{ type: 'body', parameters: [{ type: 'text', text: 'hi' }] }]);
   });
 });

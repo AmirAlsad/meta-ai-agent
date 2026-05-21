@@ -235,15 +235,16 @@ export async function downloadWhatsAppMedia(input: {
   // default `node`/`curl` (or absent) UA — see MEDIA_DOWNLOAD_USER_AGENT.
   //
   // TOKEN-LEAK-ON-REDIRECT: the URL `getWhatsAppMediaUrl` resolved is the
-  // terminal lookaside URL; we do NOT expect a cross-origin 3xx here. Even if the
-  // CDN ever did redirect cross-origin, `fetch`/undici strips the `Authorization`
-  // header on a cross-origin redirect, so the Bearer is not leaked to a foreign
-  // origin (verified to hold in current undici). If that strip behavior ever
-  // changes, switch this GET to `redirect: 'manual'` and re-resolve rather than
-  // auto-following with the token attached.
+  // terminal lookaside URL; we do NOT expect a 3xx here. We use
+  // `redirect: 'manual'` so the Bearer token is NEVER auto-forwarded across a
+  // redirect — rather than relying on undici's (non-standard, version-dependent)
+  // cross-origin `Authorization`-strip behavior. If the CDN ever does redirect,
+  // we follow the Location ONCE WITHOUT the token (the target is a pre-signed URL
+  // that doesn't need it), fully closing the leak.
   let response: Response;
   try {
     response = await fetchImpl(meta.url, {
+      redirect: 'manual',
       headers: {
         authorization: `Bearer ${input.accessToken}`,
         'user-agent': MEDIA_DOWNLOAD_USER_AGENT
@@ -258,6 +259,35 @@ export async function downloadWhatsAppMedia(input: {
       message: `Meta Graph API whatsapp.downloadMedia failed before response: ${causeMessage}`,
       cause: err
     });
+  }
+
+  // Manual-redirect safety: follow at most one hop, and WITHOUT the Authorization
+  // header, so the access token is never sent to a redirect target.
+  if (response.status >= 300 && response.status < 400) {
+    const location = response.headers.get('location');
+    if (!location) {
+      throw new MetaApiError({
+        operation: 'whatsapp.downloadMedia',
+        httpStatus: response.status,
+        responseBody: 'redirect response without a Location header',
+        message: 'Meta Graph API whatsapp.downloadMedia got a redirect with no Location header'
+      });
+    }
+    try {
+      response = await fetchImpl(location, {
+        redirect: 'manual',
+        headers: { 'user-agent': MEDIA_DOWNLOAD_USER_AGENT }
+      });
+    } catch (err) {
+      const causeMessage = err instanceof Error ? err.message : String(err);
+      throw new MetaApiError({
+        operation: 'whatsapp.downloadMedia',
+        httpStatus: 0,
+        responseBody: causeMessage,
+        message: `Meta Graph API whatsapp.downloadMedia failed following media redirect: ${causeMessage}`,
+        cause: err
+      });
+    }
   }
 
   if (!response.ok) {

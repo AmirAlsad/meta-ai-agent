@@ -436,7 +436,8 @@ export class InstagramClient implements ChannelAdapter {
    * NOTE: this PRIVATE helper is distinct from the public {@link
    * InstagramClient.sendMedia} (the {@link ChannelAdapter} entry point) — this one
    * builds the per-type attachment body; the public one routes a uniform
-   * {@link MediaSendInput} to the per-kind method (and throws for `document`).
+   * {@link MediaSendInput} to the per-kind method (including `document`, which
+   * maps to {@link InstagramClient.sendDocument} / `type: 'file'`).
    */
   private async sendAttachment(
     recipientId: string,

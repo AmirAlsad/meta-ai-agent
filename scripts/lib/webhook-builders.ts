@@ -39,7 +39,7 @@ import type {
 
 /** URL-safe base64 of `n` random bytes — the alphabet Meta's ids use. */
 function randomToken(n: number): string {
-  return randomBytes(n).toString('base64').replace(/\+/g, 'A').replace(/\//g, 'B').replace(/=+$/, '');
+  return randomBytes(n).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 /** A `wamid.*`-shaped WhatsApp message id (base64-ish tail, like the fixtures). */

@@ -317,6 +317,59 @@ describe('downloadWhatsAppMedia', () => {
     expect(binHeaders['user-agent']).toBeTruthy();
   });
 
+  it('uses redirect:manual on the authed GET and follows a 3xx Location WITHOUT the token', async () => {
+    const REDIRECT_URL = 'https://cdn.example.com/signed/blob';
+    const bytes = new Uint8Array([7, 8, 9]);
+    const fetchImpl = vi
+      .fn()
+      // Step 1: metadata (via GraphClient).
+      .mockResolvedValueOnce(jsonResponse(200, { url: MEDIA_URL, mime_type: 'image/jpeg' }))
+      // Step 2: the authed binary GET returns a redirect (NOT auto-followed).
+      .mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: REDIRECT_URL } }))
+      // Step 3: the followed Location returns the bytes.
+      .mockResolvedValueOnce(binaryResponse(200, bytes, { 'content-type': 'image/jpeg' }));
+    const graph = makeGraph(fetchImpl);
+
+    const result = await downloadWhatsAppMedia({
+      mediaId: MEDIA_ID,
+      accessToken: ACCESS_TOKEN,
+      graph,
+      fetchImpl: fetchImpl as unknown as typeof fetch
+    });
+
+    expect(Array.from(result.data)).toEqual([7, 8, 9]);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+
+    // The authed binary GET set redirect:'manual' so the token is never
+    // auto-forwarded across a redirect; it still carries the Bearer.
+    const [, binInit] = fetchImpl.mock.calls[1] as [string, RequestInit];
+    expect(binInit.redirect).toBe('manual');
+    expect(headersOf(binInit)['authorization']).toBe(`Bearer ${ACCESS_TOKEN}`);
+
+    // The followed Location carried NO Authorization header (token not leaked to
+    // the redirect target), only the User-Agent.
+    const [redirUrl, redirInit] = fetchImpl.mock.calls[2] as [string, RequestInit];
+    expect(String(redirUrl)).toBe(REDIRECT_URL);
+    expect(headersOf(redirInit)['authorization']).toBeUndefined();
+    expect(headersOf(redirInit)['user-agent']).toBeTruthy();
+  });
+
+  it('errors on a redirect with no Location header (does not hang or leak)', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(200, { url: MEDIA_URL }))
+      .mockResolvedValueOnce(new Response(null, { status: 302 }));
+    const graph = makeGraph(fetchImpl);
+    await expect(
+      downloadWhatsAppMedia({
+        mediaId: MEDIA_ID,
+        accessToken: ACCESS_TOKEN,
+        graph,
+        fetchImpl: fetchImpl as unknown as typeof fetch
+      })
+    ).rejects.toThrow(/Location/i);
+  });
+
   it('falls back to the response Content-Type when metadata has no mime_type', async () => {
     const bytes = new Uint8Array([1, 2, 3]);
     const fetchImpl = vi
