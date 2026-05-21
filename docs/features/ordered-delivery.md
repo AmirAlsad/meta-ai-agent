@@ -143,8 +143,9 @@ Under the per-key lock it:
   `currentOutboundIndex = 0`, clears `currentOutboundMessageId`) — **unsent queue
   items are dropped**; the chat endpoint re-decides the whole reply from the
   combined buffer on the next flush;
-- resets `reprocessCount`, pushes the new message into `inboundBuffer`, returns to
-  `buffering`, and arms a fresh flush.
+- resets `reprocessCount`, folds any stashed `lateArrivals` plus the new message
+  into `inboundBuffer` (preserving order), returns to `buffering`, and arms a fresh
+  flush.
 
 This is a full interrupt rather than a deferral because once we are `sending` the
 old turn's chat call has already returned — there is no in-flight chat to abort,

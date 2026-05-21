@@ -81,16 +81,18 @@ if (this.mediaHydrator) {
 `HttpMediaHydrator.hydrate` mirrors the auth model in
 [`media.ts`](../../src/meta/shared/media.ts):
 
-- **WhatsApp** (a `media.id` with no `url`): the authenticated 2-hop path.
+- **WhatsApp** (a `media.id` with no `url`): the authenticated path, with a
+  SINGLE metadata resolve.
   1. **Size pre-flight**: `getWhatsAppMediaUrl` resolves the media metadata
-     (`GET /{mediaId}`), which reports `file_size`. If `fileSizeBytes` exceeds
-     the cap, the binary is **never downloaded** — it's logged and skipped. The
-     cost on the under-cap path is one extra cheap JSON GET (the actual
-     `downloadWhatsAppMedia` re-resolves the URL internally), accepted to reuse
-     that helper's token-leak-on-redirect safety.
-  2. **Download**: `downloadWhatsAppMedia` fetches the bytes with the Bearer
-     token. Requires `whatsAppAccessToken` — absent ⇒ WhatsApp media is not
-     hydrated (logged at `debug`, returns `undefined`).
+     (`GET /{mediaId}`) ONCE, which reports both `file_size` and the short-lived
+     CDN `url`. If `fileSizeBytes` exceeds the cap, the binary is **never
+     downloaded** — it's logged and skipped.
+  2. **Download**: `downloadWhatsAppMediaFromUrl` fetches the bytes from the
+     already-resolved `url` with the Bearer token, so the under-cap path makes
+     **no second Graph call** (the binary GET uses `redirect: 'manual'` so the
+     token is never auto-followed cross-origin). Requires `whatsAppAccessToken` —
+     absent ⇒ WhatsApp media is not hydrated (logged at `debug`, returns
+     `undefined`).
 - **Messenger / Instagram** (any channel that already carries a fetchable
   `media.url`): `downloadAttachmentUrl` fetches the pre-signed CDN URL
   **token-free**, passing `maxBytes` so the download early-rejects via the
@@ -194,7 +196,7 @@ interface InboundMediaHydrator {
 Source:
 
 - [`src/meta/shared/media-hydrator.ts`](../../src/meta/shared/media-hydrator.ts) — `InboundMediaHydrator`, `HttpMediaHydrator`, `NoopMediaHydrator`.
-- [`src/meta/shared/media.ts`](../../src/meta/shared/media.ts) — `getWhatsAppMediaUrl`, `downloadWhatsAppMedia`, `downloadAttachmentUrl` (+ `maxBytes` / `MEDIA_OVER_CAP`).
+- [`src/meta/shared/media.ts`](../../src/meta/shared/media.ts) — `getWhatsAppMediaUrl`, `downloadWhatsAppMediaFromUrl`, `downloadWhatsAppMedia`, `downloadAttachmentUrl` (+ `maxBytes` / `MEDIA_OVER_CAP`).
 - [`src/conversation/agent.ts`](../../src/conversation/agent.ts) — the `flushImpl` hydration call site (unlocked, post-snapshot, pre-chat-call) and the optional `mediaHydrator` dep.
 - [`src/meta/types.ts`](../../src/meta/types.ts) — `MediaInfo.dataUrl`.
 - [`src/config/loader.ts`](../../src/config/loader.ts) — `inboundMediaDownload` / `inboundMediaMaxBytes`.

@@ -8,7 +8,7 @@ Run:
 npm test
 ```
 
-This runs **1092 tests** (1042 unit + 50 integration) across:
+This runs **1098 tests** (1048 unit + 50 integration) across:
 
 - `tests/unit/` — pure-logic tests that import a module directly and assert against its exports.
   - `tests/unit/config-loader.test.ts` (106 tests) — `loadConfig` validation: required-field errors, per-channel pair partial-config rejection, `META_GRAPH_API_VERSION` regex, `NGROK_DOMAIN` bare-hostname check, `PORT` / `AGENT_AUTOSTART` parsing, and the Stage 5 `conversation` section (buffer base/growth/max/noise, typing, delivery/chat timeouts, dedupe TTL, the `bufferMaxTimeoutMs >= bufferBaseTimeoutMs` cross-check, `defaultConversationConfig`, and the inbound-media-hydration knobs `INBOUND_MEDIA_DOWNLOAD` (default `false`) / `INBOUND_MEDIA_MAX_BYTES` (default `5242880` = 5 MiB)).

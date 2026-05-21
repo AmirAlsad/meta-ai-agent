@@ -145,11 +145,15 @@ Warnings are non-fatal `ChatContractWarning`s. The HTTP client logs them at
 
 ## The HTTP client
 
-`HttpChatClient.complete(request)`
+`HttpChatClient.complete(request, signal?)`
 ([`src/chat/client.ts`](../../src/chat/client.ts)) POSTs the `ChatRequest` to
 `CHAT_ENDPOINT_URL`, enforces a hard timeout via an `AbortController`
 (`CHAT_ENDPOINT_TIMEOUT_MS`, default 30000), and returns an already-normalized
-response. Every failure mode — non-2xx, network error, abort/timeout, JSON parse
+response. The optional external `signal` is combined with the internal timeout on
+one controller (and short-circuits if already aborted): the agent passes its
+per-conversation abort signal so a message arriving mid-flush can cancel the
+in-flight chat call and rebatch both messages into one reply (see
+[Conversation state](./conversation-state.md)). Every failure mode — non-2xx, network error, abort/timeout, JSON parse
 error, malformed payload — surfaces as a single `ChatEndpointError`
 ([`src/chat/errors.ts`](../../src/chat/errors.ts)), with the original failure on
 `cause` for wrapped cases. The agent therefore catches one type instead of

@@ -80,10 +80,6 @@ These cover the Stage 9 example/dev surface. None affect the runtime package —
   - **Where**: [`src/meta/instagram/client.ts`](../src/meta/instagram/client.ts) `sendDocument`. Documented in [Media send](./features/media.md) and [Outbound clients](./features/outbound-clients.md).
   - **When**: Live-verify during a Stage 9 (examples / device testing) IG session.
 
-- **WhatsApp media-download token-on-redirect relies on undici stripping `Authorization` cross-origin** — `downloadWhatsAppMedia`'s binary GET sends the Bearer token (WhatsApp's CDN requires it). The resolved lookaside URL is terminal and we do not expect a cross-origin 3xx, but the safety against leaking the token to a foreign origin on an unexpected redirect rests on `fetch`/undici stripping the `Authorization` header on a cross-origin redirect (verified to hold in current undici; recorded in a load-bearing comment). If that strip behavior ever changes, switch the GET to `redirect: 'manual'` and re-resolve rather than auto-follow with the token attached.
-  - **Where**: [`src/meta/shared/media.ts`](../src/meta/shared/media.ts) `downloadWhatsAppMedia` (the TOKEN-LEAK-ON-REDIRECT comment). Documented in [Media send](./features/media.md).
-  - **When**: No action today; revisit if a Node/undici upgrade changes cross-origin redirect header handling.
-
 ### Out-of-window templates
 
 - **Out-of-window WhatsApp template enforcement is deferred** — Stage 7 ships `WhatsAppClient.sendTemplate` + `buildTemplateComponents`, and the chat request already carries `context.windowOpen` (and `context.windowExpiresAt` when known), so the endpoint can *choose* a template when the window is closed. But the agent does NOT require a template when the window is closed — it does not block an out-of-window plain send or force a template fallback. A reply attempted after the window closes simply fails at the Meta API and is skipped fail-soft. (This is the template-side view of the "24h messaging window is tracked but not enforced" Stage 5 gap below.)
