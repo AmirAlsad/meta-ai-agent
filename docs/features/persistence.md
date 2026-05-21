@@ -110,7 +110,7 @@ A few load-bearing details:
 [`src/conversation/scheduler.ts`](../../src/conversation/scheduler.ts) implements the
 same `BufferScheduler` interface as `InMemoryBufferScheduler` — one outstanding
 flush per conversation, re-scheduling replaces the prior timer — but as a BullMQ
-delayed job. Four load-bearing design choices:
+delayed job. Five load-bearing design choices:
 
 1. **Two SEPARATE connections.** The Worker uses blocking Redis commands
    (`BRPOPLPUSH` etc.) to wait for jobs and so monopolizes its connection; it cannot
@@ -132,6 +132,16 @@ delayed job. Four load-bearing design choices:
    re-schedule REPLACES the prior job (one outstanding flush per conversation). The
    human-readable conversation key rides in `job.data`. **Do not** switch the id back
    to the raw `buffer:{key}` form — it will throw on the first schedule.
+5. **Worker `concurrency` defaults to 10 (NOT 1).** The flush handler `await`s the
+   slow chat-endpoint call, so `concurrency: 1` would serialize EVERY conversation's
+   flush behind one in-flight chat call — losing the parity with the in-memory
+   scheduler, whose independent `setTimeout`s interleave flushes across conversations.
+   Parallel flushes are safe because each acquires only its per-conversation key lock.
+   Tunable via `BUFFER_WORKER_CONCURRENCY` (`config.persistence.bufferWorkerConcurrency`).
+   `cancel()` also tolerates BullMQ throwing when a job has just gone ACTIVE (a
+   worker picked it up in the gap before re-schedule) — the remove failure is
+   swallowed; the flush proceeds on the existing schedule and the message is already
+   buffered, so the conversation still makes forward progress.
 
 `getStats()` reports `delayed` (the count of scheduled-with-future-delay jobs) for
 the `/ready` introspection. A worker-level error or a failed job is logged, never

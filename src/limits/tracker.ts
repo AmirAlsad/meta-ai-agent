@@ -14,15 +14,16 @@
  *  3. RETRY MATH — `retryDelayMs` / `transientRetryMaxAttempts` expose the
  *     backoff schedule from config.
  *
- * DOUBLE-SEND SAFETY drives the transient set: every send is a POST and Meta has
- * NO idempotency key for the messages endpoint, so we re-send ONLY when Meta is
- * known NOT to have processed the request — a pre-response network failure
- * (`httpStatus 0`), HTTP 429, or a Meta rate-limit error CODE (which surface as a
- * 4xx-with-code, not HTTP 429). 5xx is classified `permanent` (NOT retried): a 5xx
- * after a POST may mean Meta already accepted + delivered, so re-sending could
- * double-send. This mirrors the runtime {@link "../meta/shared/graph-client.js".GraphClient}'s
- * own 5xx-no-retry-for-POST rule — the agent layer has no more information than the
- * GraphClient about whether the POST took effect, so it must not override it. See
+ * DOUBLE-SEND SAFETY drives the transient set. The transient set is limited to:
+ * network failures (`httpStatus 0`, never reached Meta) and HTTP `429` / Meta
+ * rate-limit error codes ({@link META_RATE_LIMIT_ERROR_CODES}) — cases where Meta
+ * is KNOWN to have rejected the request before processing it. `5xx` is explicitly
+ * EXCLUDED (classified `permanent`): a 5xx after a POST is ambiguous (Meta may have
+ * already accepted and delivered), so re-sending risks a double-send, and Meta has
+ * NO idempotency key for the messages endpoint. The runtime
+ * {@link "../meta/shared/graph-client.js".GraphClient} applies the same rule; this
+ * tracker mirrors it (the agent layer has no more information than the GraphClient
+ * about whether the POST took effect, so it must not override it). See
  * `classifyError` for the exact code sets.
  */
 import type pino from 'pino';

@@ -122,6 +122,16 @@ export interface PersistenceConfig {
   conversationTtlSeconds: number;
   /** BullMQ queue name for the buffer-flush scheduler. Default 'meta-ai-buffer-timers'. */
   bufferQueueName: string;
+  /**
+   * BullMQ Worker concurrency for buffer-flush jobs. Default 10. WHY > 1: the
+   * flush handler awaits the (slow) chat-endpoint call, and a concurrency of 1
+   * would serialize EVERY conversation's flush behind one in-flight chat call —
+   * unlike the in-memory scheduler, whose independent setTimeouts interleave
+   * flushes across conversations. Parallel flushes are safe because each acquires
+   * only its per-conversation key lock. Tune up for higher concurrent-conversation
+   * throughput.
+   */
+  bufferWorkerConcurrency: number;
   /** Timeout (ms) for the GET /ready Redis ping. Default 2000. */
   readyRedisTimeoutMs: number;
 }
@@ -446,6 +456,7 @@ function loadConversationConfig(env: ConfigEnv): ConversationConfig {
 const PERSISTENCE_DEFAULTS: PersistenceConfig = {
   conversationTtlSeconds: 86400, // 1 day
   bufferQueueName: 'meta-ai-buffer-timers',
+  bufferWorkerConcurrency: 10,
   readyRedisTimeoutMs: 2000
 };
 
@@ -463,6 +474,7 @@ function loadPersistenceConfig(env: ConfigEnv): PersistenceConfig {
   return {
     conversationTtlSeconds: loadPositiveInt(env, 'CONVERSATION_TTL_SECONDS', d.conversationTtlSeconds),
     bufferQueueName: trimmed(env, 'BUFFER_QUEUE_NAME') ?? d.bufferQueueName,
+    bufferWorkerConcurrency: loadPositiveInt(env, 'BUFFER_WORKER_CONCURRENCY', d.bufferWorkerConcurrency),
     readyRedisTimeoutMs: loadPositiveInt(env, 'READY_REDIS_TIMEOUT_MS', d.readyRedisTimeoutMs)
   };
 }

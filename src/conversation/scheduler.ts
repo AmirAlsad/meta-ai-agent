@@ -171,11 +171,18 @@ export class BullMqBufferScheduler implements BufferScheduler {
   private workerConnection: Redis | undefined;
   private worker: Worker<BufferJobPayload> | undefined;
   private handler: BufferHandler | undefined;
+  /** Worker concurrency — see {@link PersistenceConfig.bufferWorkerConcurrency}. */
+  private readonly workerConcurrency: number;
 
-  constructor(opts: { redisUrl: string; queueName: string; logger?: pino.Logger }) {
+  constructor(opts: { redisUrl: string; queueName: string; workerConcurrency?: number; logger?: pino.Logger }) {
     this.queueName = opts.queueName;
     this.redisUrl = opts.redisUrl;
     this.logger = opts.logger;
+    // Default 10 (NOT 1): the flush handler awaits the slow chat call, so a
+    // concurrency of 1 would serialize EVERY conversation's flush behind one
+    // in-flight chat call — unlike the in-memory scheduler's independent timers.
+    // Parallel flushes are safe (each takes only its per-conversation key lock).
+    this.workerConcurrency = opts.workerConcurrency ?? 10;
     // Construct our own connection (rather than passing `{ url }`) so the
     // lifecycle is explicit and closeable; `maxRetriesPerRequest: null` is
     // mandatory for BullMQ.
@@ -209,7 +216,7 @@ export class BullMqBufferScheduler implements BufferScheduler {
         const options = job.data.traceId ? { traceId: job.data.traceId } : undefined;
         await this.handler?.(job.data.conversationKey, options);
       },
-      { connection: this.workerConnection as ConnectionOptions, concurrency: 1 }
+      { connection: this.workerConnection as ConnectionOptions, concurrency: this.workerConcurrency }
     );
     // A worker-level error (connection blip, processor throw) must never become
     // an unhandled rejection that crashes the process.

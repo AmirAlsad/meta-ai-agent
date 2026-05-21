@@ -363,6 +363,7 @@ describe('loadConfig: persistence section (Stage 10)', () => {
     expect(persistence).toEqual({
       conversationTtlSeconds: 86400,
       bufferQueueName: 'meta-ai-buffer-timers',
+      bufferWorkerConcurrency: 10,
       readyRedisTimeoutMs: 2000
     });
   });
@@ -373,6 +374,7 @@ describe('loadConfig: persistence section (Stage 10)', () => {
     expect(a).toEqual({
       conversationTtlSeconds: 86400,
       bufferQueueName: 'meta-ai-buffer-timers',
+      bufferWorkerConcurrency: 10,
       readyRedisTimeoutMs: 2000
     });
     expect(a).not.toBe(b); // fresh copy each call
@@ -400,6 +402,12 @@ describe('loadConfig: persistence section (Stage 10)', () => {
     expect(loadConfig(baseEnv({ BUFFER_QUEUE_NAME: '   ' })).persistence.bufferQueueName).toBe(
       'meta-ai-buffer-timers'
     );
+  });
+
+  it('honors BUFFER_WORKER_CONCURRENCY', () => {
+    expect(
+      loadConfig(baseEnv({ BUFFER_WORKER_CONCURRENCY: '25' })).persistence.bufferWorkerConcurrency
+    ).toBe(25);
   });
 
   it('honors READY_REDIS_TIMEOUT_MS', () => {

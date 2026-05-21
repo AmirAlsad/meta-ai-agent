@@ -114,6 +114,7 @@ export function buildRuntime(
     scheduler = new BullMqBufferScheduler({
       redisUrl: config.redisUrl,
       queueName: config.persistence.bufferQueueName,
+      workerConcurrency: config.persistence.bufferWorkerConcurrency,
       logger
     });
     limitCounterStore = new RedisLimitCounterStore({ redis, logger });
