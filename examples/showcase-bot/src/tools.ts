@@ -180,10 +180,12 @@ export function createActionTools(collector: ActionCollector, capabilities: Chan
   // Always available — silence is channel-independent.
   tools.stay_silent = tool({
     description:
-      'Send absolutely nothing — no text, no reaction, no media. Use only when the inbound ' +
-      'clearly does not need a response (e.g. an automated "thanks" you already reacted to). ' +
-      'Do NOT call this if you have called react_to_message in the same turn — a reaction alone ' +
-      'IS the response. Calling stay_silent cancels every other queued action.',
+      'Signal that you intend to send absolutely nothing — no text, no reaction, no media. Use ' +
+      'only when the inbound clearly does not need a response (e.g. an automated "thanks" you ' +
+      'already reacted to). This signal is honored ONLY if no other action is produced in the ' +
+      'same turn: if you ALSO call a content tool (e.g. send_message or react_to_message), that ' +
+      'action still goes out and the silence is ignored. So do NOT pair stay_silent with another ' +
+      'tool expecting it to cancel that tool — just call stay_silent alone when you mean to be silent.',
     inputSchema: z.object({
       reason: z.string().optional().describe('Optional internal note for logs; not sent to the customer.')
     }),

@@ -1851,6 +1851,114 @@ describe('ConversationAgent', () => {
     });
   });
 
+  describe('FINDING B: on_send mid-delivery inbound is NOT dropped (delivered as a follow-up turn)', () => {
+    // SCOPE confirmation for FINDING B. For an `on_send` channel
+    // (Messenger/Instagram) segment 3 drains the WHOLE outbound queue under one
+    // runExclusive — there is no per-item delivery-status wait that releases the
+    // lock, so a message arriving mid-delivery cannot acquire the lock to reach
+    // the `sending`-state interrupt branch. It QUEUES behind the delivery loop
+    // and, once the turn completes and the record returns to `idle`, runs as a
+    // normal buffered NEXT turn. The mid-delivery rebatch is therefore an
+    // on_status-only (WhatsApp) behaviour — but the on_send message must STILL be
+    // delivered (no loss), just as a subsequent turn rather than rebatched.
+    it('an inbound during an on_send delivery loop is buffered + delivered as its own next turn (no loss)', async () => {
+      const config = makeConfig();
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
+      const scheduler = new InMemoryBufferScheduler();
+
+      // A controllable Messenger (on_send) adapter: the FIRST sendText call parks
+      // on a deferred so the delivery loop is provably IN PROGRESS (and holding
+      // the per-key lock) when the second inbound arrives. Releasing it lets the
+      // rest of the queue drain.
+      let firstSendGate: (() => void) | undefined;
+      let sendCount = 0;
+      const adapter = makeAdapter('messenger', messengerSupports);
+      adapter.sendText = vi.fn((recipientId: string) => {
+        const idx = sendCount++;
+        const result: SendResult = {
+          channel: 'messenger',
+          messageId: `messenger-msg-${idx}`,
+          recipientId,
+          timestamp: FIXED_NOW
+        };
+        if (idx === 0) {
+          return new Promise<SendResult>(resolve => {
+            firstSendGate = () => resolve(result);
+          });
+        }
+        return Promise.resolve(result);
+      });
+
+      // Two-message first turn, single-message follow-up turn.
+      const chat = makeChatClient([
+        { actions: [{ type: 'message', text: 'one' }, { type: 'message', text: 'two' }] },
+        { actions: [{ type: 'message', text: 'reply-to-mid' }] }
+      ]);
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: chat,
+        adapters: { messenger: adapter },
+        config,
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+      const key = 'messenger:biz-1:fb-user';
+      const mk = (id: string, text: string): IncomingMessage =>
+        inbound({ channel: 'messenger', channelScopedUserId: 'fb-user', channelMessageId: id, text });
+
+      // Turn 1: m_a → flush → delivery loop starts, parks on the FIRST send while
+      // holding the per-key lock (state `sending`).
+      await agent.handleInbound(mk('m_a', 'first'));
+      await flushBuffer();
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      const sending = await store.getConversation(key);
+      expect(sending!.state).toBe('sending');
+
+      // m_b arrives mid-delivery. handleInbound chains onto the per-key lock held
+      // by the (parked) delivery loop — it does NOT abort or interrupt anything;
+      // it simply waits. Float it; it resolves after the loop releases the lock.
+      const midDelivery = agent.handleInbound(mk('m_b', 'mid-delivery'));
+
+      // The interrupt path must NOT have run: the queue is untouched, no rollback
+      // to `buffering`, m_b is not yet visible on the record (lock still held).
+      const stillSending = await store.getConversation(key);
+      expect(stillSending!.state).toBe('sending');
+      expect(stillSending!.outboundQueue.length).toBe(2);
+
+      // Release the parked first send → the rest of the on_send queue drains
+      // atomically, the turn finalizes, the lock releases, and the queued m_b
+      // handleInbound now runs and buffers m_b as a fresh turn.
+      firstSendGate!();
+      await midDelivery;
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Turn 1 fully delivered BOTH messages (no loss on the in-flight turn).
+      expect(adapter.sendText).toHaveBeenNthCalledWith(1, 'fb-user', 'one');
+      expect(adapter.sendText).toHaveBeenNthCalledWith(2, 'fb-user', 'two');
+
+      // m_b was buffered (NOT dropped, NOT rebatched into turn 1) and is awaiting
+      // its own flush.
+      const buffered = await store.getConversation(key);
+      expect(buffered!.state).toBe('buffering');
+      expect(buffered!.inboundBuffer.map(m => m.channelMessageId)).toEqual(['m_b']);
+
+      // Drain the follow-up flush → m_b becomes its OWN turn with its own reply.
+      await flushBuffer();
+      expect(chat.calls.length).toBe(2);
+      expect(chat.calls[1]!.messages.map(m => m.channelMessageId)).toEqual(['m_b']);
+      expect(adapter.sendText).toHaveBeenCalledTimes(3);
+      expect(adapter.sendText).toHaveBeenNthCalledWith(3, 'fb-user', 'reply-to-mid');
+
+      const done = await store.getConversation(key);
+      expect(done!.state).toBe('idle');
+      expect(done!.inboundBuffer).toEqual([]);
+      await agent.close();
+    });
+  });
+
   it('handleStatus concurrent with an in-flight send does not double-advance (exactly-once)', async () => {
     // WhatsApp lifecycle: the queue waits on a delivery status. Fire the status
     // for the in-flight item TWICE concurrently (a status webhook can be

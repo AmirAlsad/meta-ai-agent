@@ -478,6 +478,27 @@ export class ConversationAgent {
           // the new message so the user gets ONE coherent follow-up that accounts
           // for what they just said, rather than the rest of a now-stale reply
           // followed by a second reply. Mirrors the reference's interruptSending.
+          //
+          // SCOPE — mid-delivery rebatch is observable only on `on_status` channels:
+          // WhatsApp (on_status) AWAITS a per-message delivery-status callback
+          // between queue items (sendNext returns after each send and resumes via
+          // handleStatus), so the per-key lock is RELEASED between items. A new
+          // inbound landing in that gap can therefore acquire the lock, observe the
+          // `sending` state, and reach this branch to interrupt + rebatch.
+          //
+          // `on_send` channels (Messenger/Instagram) have no per-message delivery
+          // webhook, so segment 3 drains the WHOLE queue synchronously under ONE
+          // runExclusive (sendNext → advanceAndContinue → sendNext, no external
+          // awaits that yield the lock — the send loop is fast). An inbound arriving
+          // mid-delivery cannot acquire the lock; it queues BEHIND segment 3 and runs
+          // only after the queue drains and finalizeTurn has moved the record to
+          // `idle` (or `buffering` if `lateArrivals` existed). By then state is no
+          // longer `sending`, so this branch is not hit — the message is buffered as
+          // a normal NEXT turn (the `idle`/`buffering` case above) and gets its own
+          // response. That is correct and lossless: an on_send message is never
+          // dropped, it is simply delivered as a subsequent turn rather than rebatched
+          // into the in-flight one. See the on_send no-drop regression test in
+          // `tests/unit/conversation-agent.test.ts`.
           await this.interruptSending(record, message, traceId);
           break;
         }
@@ -757,36 +778,29 @@ export class ConversationAgent {
         // `[...batch, ...lateArrivals]` back into the buffer (the batch was cleared
         // in segment 1, so re-add it from the local snapshot) and reschedule a fresh
         // flush so the COMBINED input becomes ONE response. The just-computed `resp`
-        // is stale/aborted, so discard it and RETURN. Bounded by MAX_REPROCESS so a
-        // never-ending stream can't starve: at the cap the NEXT flush is committed
-        // (un-abortable) and always sends — see the committed-flush handling below
-        // and in segment 1.
+        // is stale/aborted, so discard it and RETURN.
+        //
+        // WHY the `< MAX_REPROCESS` guard is the ONLY abort case that can run here:
+        // `aborted` is true only when segment 1 armed a signal, which it does only
+        // when `committed === false`, i.e. `reprocessCount < MAX_REPROCESS` at the
+        // start of this flush. The sole writer that INCREMENTS `reprocessCount` is
+        // this very line below (`+= 1`), which runs strictly AFTER this guard; every
+        // other writer (interruptSending, normal-completion, finalizeTurn) only ever
+        // RESETS it to 0, and none of them can run for this key while we hold no lock
+        // here (they touch the record under their own locked segments and this key is
+        // in `processing`/`sending`, not a state that re-enters segment 2). So the
+        // re-read at the top of this segment still sees the same `reprocessCount`
+        // segment 1 saw — which was `< MAX_REPROCESS`. There is therefore NO reachable
+        // "aborted AT the cap" case to handle here: the cap is enforced entirely by
+        // segment 1, which marks the NEXT flush committed (un-abortable) once this
+        // line pushes the count to MAX_REPROCESS. That committed flush runs to
+        // completion and SENDS — that is the lost-turn fix, and it lives in segment 1,
+        // not here. (A prior `if (aborted)` cap-branch sat below this block; it was
+        // provably unreachable for the reason above and has been removed.)
         if (aborted && record.reprocessCount < MAX_REPROCESS) {
           record.inboundBuffer = [...prep.batch, ...record.inboundBuffer, ...record.lateArrivals];
           record.lateArrivals = [];
           record.reprocessCount += 1;
-          record.state = 'buffering';
-          record.lastActivity = this.now();
-          await this.store.setConversation(record);
-          const delayMs = calculateBufferTimeout(record.inboundBuffer.length, this.config.conversation, this.random);
-          await this.scheduler.schedule(key, delayMs, traceId !== undefined ? { traceId } : undefined);
-          return undefined;
-        }
-
-        if (aborted) {
-          // Aborted AT the cap (an interruptible flush that hit MAX_REPROCESS). We
-          // do NOT send this aborted/stale `resp`; instead fold everything we have
-          // (this turn's batch + buffer + the late arrivals) back into the buffer
-          // and reschedule. The next flush will be COMMITTED (segment 1 sees
-          // reprocessCount >= MAX_REPROCESS, registers no AbortController) and is
-          // therefore un-abortable — it WILL produce + send a response. This is the
-          // BLOCKING-bug fix: the cap-triggering abort no longer drops the turn.
-          logger.warn(
-            { conversationKey: key, reprocessCount: record.reprocessCount },
-            'reprocess cap reached; next flush is committed and will send without further deferral'
-          );
-          record.inboundBuffer = [...prep.batch, ...record.inboundBuffer, ...record.lateArrivals];
-          record.lateArrivals = [];
           record.state = 'buffering';
           record.lastActivity = this.now();
           await this.store.setConversation(record);
