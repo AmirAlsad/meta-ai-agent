@@ -76,9 +76,13 @@ export function buildTemplateComponents(input: BuildTemplateComponentsInput): Te
 
   // Buttons — one component per entry. WHY each carries `sub_type` + `index`:
   // Meta keys a dynamic button by its kind and 0-based position, unlike the
-  // header/body components which are singletons.
+  // header/body components which are singletons. Skip any button whose
+  // `parameters` array is empty — Meta rejects an empty `parameters` (a
+  // quick_reply button always needs its payload parameter), same rule as the
+  // header/body guards above.
   if (input.buttonParameters !== undefined) {
     for (const button of input.buttonParameters) {
+      if (button.parameters.length === 0) continue;
       components.push({
         type: 'button',
         sub_type: button.subType,

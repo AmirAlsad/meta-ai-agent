@@ -461,9 +461,22 @@ export async function handleChat(client: Anthropic, req: ChatRequest): Promise<C
       messages: history
     });
 
-    // Persist the assistant turn (full content, so tool_use blocks are preserved
-    // for multi-turn coherence) before mapping it to the response shape.
-    history.push({ role: 'assistant', content: message.content });
+    // Persist ONLY the assistant's TEXT for multi-turn coherence — deliberately
+    // DROPPING any `tool_use` blocks. This bot translates tool calls directly into
+    // ChatActions (no execute-and-continue loop), so it never produces the
+    // `tool_result` user turn the Anthropic API requires after a `tool_use`.
+    // Storing the tool_use verbatim would leave a dangling block that makes the
+    // API reject every subsequent turn, permanently breaking the conversation.
+    // A tool-only turn (no text) gets a short placeholder so the stored content is
+    // never empty (which the API also rejects).
+    const assistantTextParts: string[] = [];
+    for (const block of message.content) {
+      if (block.type === 'text' && block.text.trim().length > 0) {
+        assistantTextParts.push(block.text);
+      }
+    }
+    const assistantText = assistantTextParts.join('\n').trim();
+    history.push({ role: 'assistant', content: assistantText.length > 0 ? assistantText : '(took an action)' });
 
     return buildResponse(message);
   } catch (err) {

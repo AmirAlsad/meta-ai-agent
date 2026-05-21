@@ -48,6 +48,27 @@ describe('buildTemplateComponents', () => {
     expect(buildTemplateComponents({})).toEqual([]);
   });
 
+  it('skips a button whose parameters array is empty (Meta rejects empty parameters)', () => {
+    // An empty-parameters button (e.g. a quick_reply with no payload) would 400
+    // at send time, same class as the header/body empty-array guard.
+    expect(
+      buildTemplateComponents({
+        buttonParameters: [{ subType: 'quick_reply', index: 0, parameters: [] }]
+      })
+    ).toEqual([]);
+    // A populated button alongside an empty one emits only the populated one.
+    expect(
+      buildTemplateComponents({
+        buttonParameters: [
+          { subType: 'quick_reply', index: 0, parameters: [] },
+          { subType: 'quick_reply', index: 1, parameters: [payloadParameter('YES')] }
+        ]
+      })
+    ).toEqual([
+      { type: 'button', sub_type: 'quick_reply', index: 1, parameters: [{ type: 'payload', payload: 'YES' }] }
+    ]);
+  });
+
   it('builds header + body + button components in order with the exact shape', () => {
     const components = buildTemplateComponents({
       headerParameters: [textParameter('Header')],
