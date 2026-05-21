@@ -755,7 +755,43 @@ export class ConversationAgent {
             logger.error({ err: error, conversationKey: key }, 'unexpected error calling chat endpoint');
           }
           this.inFlightChatAborts.delete(key);
-          await this.runExclusive(key, () => this.transitionToIdle(key));
+          // FINDING (message-drop fix): the FAILED batch is dropped (fail-soft —
+          // no retry until Stage 10), but any `lateArrivals` that landed WHILE
+          // this chat call was in flight are NEW unprocessed inbound, not part of
+          // the failed turn. A plain `transitionToIdle` only sets `state = 'idle'`
+          // and never touches `lateArrivals`, leaving them orphaned on an idle
+          // record with NO flush scheduled — and segment 1's unconditional
+          // `record.lateArrivals = []` on the next flush would silently discard
+          // them. So mirror `interruptSending`/`finalizeTurn`: under the per-key
+          // lock, fold any `lateArrivals` back into `inboundBuffer` (preserving
+          // order: existing buffer, then late arrivals), clear them, drop to
+          // `buffering`, and reschedule a flush so they still reach the chat
+          // endpoint. With no `lateArrivals`, keep the existing idle behavior.
+          // Done inside the lock that owns the record write so a concurrent
+          // inbound can't interleave and re-orphan the queue.
+          await this.runExclusive(key, async () => {
+            const record = await this.store.getConversation(key);
+            if (record && record.lateArrivals.length > 0) {
+              this.clearDeliveryTimeout(key);
+              record.inboundBuffer = [...record.inboundBuffer, ...record.lateArrivals];
+              record.lateArrivals = [];
+              delete record.currentOutboundMessageId;
+              // Invariant: never `idle` with a non-empty `inboundBuffer`. We are
+              // re-buffering unprocessed inbound, so `buffering` + a scheduled
+              // flush is the correct resting state.
+              record.state = 'buffering';
+              record.lastActivity = this.now();
+              await this.store.setConversation(record);
+              const delayMs = calculateBufferTimeout(
+                record.inboundBuffer.length,
+                this.config.conversation,
+                this.random
+              );
+              await this.scheduler.schedule(key, delayMs, traceId !== undefined ? { traceId } : undefined);
+              return;
+            }
+            await this.transitionToIdle(key);
+          });
           return;
         }
       } finally {

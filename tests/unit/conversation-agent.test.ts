@@ -1662,6 +1662,168 @@ describe('ConversationAgent', () => {
     });
   });
 
+  describe('chat-endpoint ERROR with stashed lateArrivals (message-drop fix)', () => {
+    /**
+     * A controllable {@link ChatClient} whose `complete` parks until you either
+     * `release(i)` it (resolves with a canned response) or `fail(i, err)` it
+     * (REJECTS with a genuine non-abort error). Like {@link
+     * makeControllableChatClient} it also rejects with an AbortError when the
+     * external abort signal fires — but the point of this variant is the
+     * non-abort `fail` path that drives flushImpl's chat-error catch block.
+     */
+    function makeFailableChatClient(): ChatClient & {
+      complete: ReturnType<typeof vi.fn>;
+      calls: ChatRequest[];
+      release: (callIndex: number, resp: NormalizedChatResponse) => void;
+      fail: (callIndex: number, err: Error) => void;
+    } {
+      const calls: ChatRequest[] = [];
+      const resolvers: Array<(resp: NormalizedChatResponse) => void> = [];
+      const rejecters: Array<(err: Error) => void> = [];
+      const complete = vi.fn((request: ChatRequest, signal?: AbortSignal) => {
+        const callIndex = calls.length;
+        calls.push(request);
+        return new Promise<NormalizedChatResponse>((resolve, reject) => {
+          resolvers[callIndex] = resolve;
+          rejecters[callIndex] = reject;
+          signal?.addEventListener('abort', () =>
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          );
+        });
+      });
+      return {
+        complete,
+        calls,
+        release: (callIndex, resp) => resolvers[callIndex]?.(resp),
+        fail: (callIndex, err) => rejecters[callIndex]?.(err)
+      };
+    }
+
+    function makeHarness(chat: ReturnType<typeof makeFailableChatClient>): {
+      agent: ConversationAgent;
+      store: InMemoryConversationStore;
+      adapter: FakeAdapter;
+      key: string;
+    } {
+      const config = makeConfig();
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
+      const scheduler = new InMemoryBufferScheduler();
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: chat,
+        adapters: { messenger: adapter },
+        config,
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+      return { agent, store, adapter, key: 'messenger:biz-1:fb-user' };
+    }
+
+    const mkInbound = (id: string, text: string): IncomingMessage =>
+      inbound({ channel: 'messenger', channelScopedUserId: 'fb-user', channelMessageId: id, text });
+
+    it('lateArrivals during a failing chat call are re-buffered + reach the chat endpoint (NOT dropped)', async () => {
+      // BLOCKING message-drop regression for the chat-error path. To get a message
+      // into `lateArrivals` WITHOUT aborting the in-flight call (an abort routes to
+      // the reprocess path, not the error path), drive the turn to a COMMITTED
+      // flush: at MAX_REPROCESS no AbortController is registered, so a message
+      // arriving DURING that flush queues to `lateArrivals` instead of aborting.
+      // Then FAIL that committed call with a genuine (non-abort) error. Pre-fix the
+      // error path called `transitionToIdle`, which left the stashed message
+      // orphaned on an idle record with no flush scheduled — and the next flush's
+      // `record.lateArrivals = []` silently discarded it. With the fix it is folded
+      // back into `inboundBuffer`, the record drops to `buffering`, a flush is
+      // scheduled, and the message ultimately reaches the chat endpoint.
+      const MAX_REPROCESS = 5;
+      const chat = makeFailableChatClient();
+      const h = makeHarness(chat);
+      let nextId = 0;
+
+      // Turn 1: kick off the first flush (interruptible, reprocessCount 0).
+      await h.agent.handleInbound(mkInbound(`m_${nextId++}`, 'msg'));
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      // Drive reprocessCount up to MAX_REPROCESS via successive aborts: each late
+      // arrival aborts the in-flight interruptible flush → rebatch (count++), then
+      // the rescheduled flush parks again.
+      for (let i = 0; i < MAX_REPROCESS; i++) {
+        await h.agent.handleInbound(mkInbound(`m_${nextId++}`, 'more'));
+        await vi.advanceTimersByTimeAsync(20_000);
+      }
+      const atCap = await h.store.getConversation(h.key);
+      expect(atCap!.reprocessCount).toBe(MAX_REPROCESS);
+      expect(atCap!.state).toBe('processing'); // the committed flush is in-flight
+      const committedCallIndex = chat.calls.length - 1;
+
+      // A message arrives DURING the committed flush → stashes in lateArrivals (no
+      // AbortController to abort a committed flush).
+      const stashedId = `m_${nextId++}`;
+      await h.agent.handleInbound(mkInbound(stashedId, 'during-failing-call'));
+      await vi.advanceTimersByTimeAsync(0);
+      const duringCommitted = await h.store.getConversation(h.key);
+      expect(duringCommitted!.lateArrivals.map(m => m.channelMessageId)).toEqual([stashedId]);
+
+      // FAIL the committed chat call with a genuine endpoint error → the chat-error
+      // catch block runs. The FAILED batch is dropped (fail-soft), but the stashed
+      // lateArrival must be preserved.
+      chat.fail(committedCallIndex, new ChatEndpointError('boom'));
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The stashed message is NOT orphaned: it is re-buffered (pre-fix this record
+      // was `idle` with `lateArrivals = [stashedId]` and NO flush scheduled).
+      const afterError = await h.store.getConversation(h.key);
+      expect(afterError!.state).toBe('buffering'); // never idle with a non-empty buffer
+      expect(afterError!.inboundBuffer.map(m => m.channelMessageId)).toEqual([stashedId]);
+      expect(afterError!.lateArrivals).toEqual([]);
+      // The failed batch was NOT retried — only the stashed late arrival remains.
+      expect(afterError!.inboundBuffer.length).toBe(1);
+
+      // The rescheduled flush fires → a NEW chat call carries the stashed message,
+      // so it reaches the chat endpoint (the drop is fixed). Release it cleanly.
+      await vi.advanceTimersByTimeAsync(20_000);
+      const followUp = chat.calls.length - 1;
+      expect(followUp).toBeGreaterThan(committedCallIndex);
+      expect(chat.calls[followUp]!.messages.map(m => m.channelMessageId)).toEqual([stashedId]);
+
+      chat.release(followUp, textResponse('reply to stashed'));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(h.adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(h.adapter.sendText).toHaveBeenCalledWith('fb-user', 'reply to stashed');
+      const done = await h.store.getConversation(h.key);
+      expect(done!.state).toBe('idle');
+      expect(done!.reprocessCount).toBe(0);
+      await h.agent.close();
+    });
+
+    it('chat error with NO lateArrivals still goes idle (unchanged fail-soft behavior)', async () => {
+      // Guards the no-lateArrivals branch: a plain chat failure with nothing
+      // stashed must keep the existing behavior — no send, no reschedule, idle.
+      const chat = makeFailableChatClient();
+      const h = makeHarness(chat);
+
+      await h.agent.handleInbound(mkInbound('m_solo', 'hi'));
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(chat.calls.length).toBe(1);
+
+      chat.fail(0, new ChatEndpointError('boom'));
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      // No re-buffer, no follow-up flush, no send — exactly one (failed) chat call.
+      expect(chat.calls.length).toBe(1);
+      expect(h.adapter.sendText).not.toHaveBeenCalled();
+      const done = await h.store.getConversation(h.key);
+      expect(done!.state).toBe('idle');
+      expect(done!.inboundBuffer).toEqual([]);
+      expect(done!.lateArrivals).toEqual([]);
+      await h.agent.close();
+    });
+  });
+
   describe('interrupt BETWEEN flush segments 2 and 3 (FINDING 1 + FINDING 2)', () => {
     /**
      * Build an interrupt harness whose store fires a one-shot concurrent
