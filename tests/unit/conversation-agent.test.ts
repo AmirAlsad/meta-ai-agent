@@ -2451,14 +2451,20 @@ describe('ConversationAgent', () => {
   /* Stage 10: pacing, transient retry, WhatsApp out-of-window, recovery      */
   /* ────────────────────────────────────────────────────────────────────── */
   describe('Stage 10 limits (pacing / retry / window / recovery)', () => {
-    it('pacing: acquireSendSlot is called before a message send, NOT for a reaction', async () => {
+    it('pacing: acquireSendSlot is called before message AND reaction sends, NOT for typing', async () => {
       const limitTracker = makeLimitTracker();
-      // One message (paced) + one reaction (fire-and-forget; NOT paced). Use
-      // Messenger so the whole queue drains on_send under one lock (no status
-      // round-trip needed to reach the second item).
+      // A message + a reaction (both real Graph sends → paced) + an explicit typing
+      // item (best-effort UX side-effect → NOT paced). Use Messenger so the whole
+      // queue drains on_send under one lock (no status round-trip between items).
       const h = makeHarness({
         responses: [
-          { actions: [{ type: 'message', text: 'one' }, { type: 'reaction', emoji: '👍', targetMessageId: 'm_x' }] }
+          {
+            actions: [
+              { type: 'message', text: 'one' },
+              { type: 'reaction', emoji: '👍', targetMessageId: 'm_x' },
+              { type: 'typing' }
+            ]
+          }
         ],
         adapters: { messenger: makeAdapter('messenger', messengerSupports) },
         limitTracker
@@ -2467,8 +2473,9 @@ describe('ConversationAgent', () => {
       await h.agent.handleInbound(inbound({ channel: 'messenger', channelMessageId: 'm_p1', channelScopedUserId: 'fb-user' }));
       await flushBuffer();
 
-      // The message send was paced; the reaction was not.
-      expect(limitTracker.acquireSendSlot).toHaveBeenCalledTimes(1);
+      // Both the message and the reaction were paced (each consumes a slot); the
+      // typing item was not.
+      expect(limitTracker.acquireSendSlot).toHaveBeenCalledTimes(2);
       expect(limitTracker.acquireSendSlot).toHaveBeenCalledWith('messenger', 'biz-1');
       expect(h.adapters.messenger!.sendText).toHaveBeenCalledTimes(1);
       expect(h.adapters.messenger!.sendReaction).toHaveBeenCalledTimes(1);

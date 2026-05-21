@@ -1048,17 +1048,23 @@ export class ConversationAgent {
     // (e.g. `media:image`) so the per-kind send is visible; everything else uses
     // the bare item kind.
     let operation: string = item.kind;
-    // PRE-SEND PACING (Stage 10): for outbound-MESSAGE kinds only, reserve a
-    // per-line pacing slot before sending so we stay under Meta's per-channel
-    // rate. NOT for reaction/typing/silence (fire-and-forget side-effects, not
-    // user-facing messages — pacing them would only delay the queue). The lock is
-    // HELD while acquireSendSlot awaits its internal pacing sleep — that delays
-    // ONLY this conversation (the lock is per-key), exactly like the typing-delay
-    // sleep above. acquireSendSlot is contractually fail-open (never throws), so
-    // no try/catch is needed here.
+    // PRE-SEND PACING (Stage 10): reserve a per-line pacing slot before any item
+    // that makes a real Graph API send — `message`/`reply`/`template`/`media` AND
+    // `reaction` (a reaction is a Graph call too: it counts toward Meta's per-channel
+    // rate, so a reaction-heavy turn left unpaced could contribute to app-level 429s).
+    // EXCLUDED: `typing` (a best-effort UX side-effect already spaced by its own
+    // pre-message delay; pacing it would only push back the real message) and
+    // `silence` (no send). The lock is HELD while acquireSendSlot awaits its internal
+    // pacing sleep — that delays ONLY this conversation (the lock is per-key), exactly
+    // like the typing-delay sleep above. acquireSendSlot is contractually fail-open
+    // (never throws), so no try/catch is needed here.
     if (
       this.limitTracker &&
-      (item.kind === 'message' || item.kind === 'reply' || item.kind === 'template' || item.kind === 'media')
+      (item.kind === 'message' ||
+        item.kind === 'reply' ||
+        item.kind === 'template' ||
+        item.kind === 'media' ||
+        item.kind === 'reaction')
     ) {
       await this.limitTracker.acquireSendSlot(record.channel, record.channelScopedBusinessId);
     }

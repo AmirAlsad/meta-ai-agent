@@ -87,15 +87,18 @@ export function buildRuntime(
   }
 
   // Persistence trio (store + buffer scheduler + limit-counter store), selected
-  // on REDIS_URL — see the function doc. The Redis path shares ONE ioredis
-  // client across the conversation store + limit-counter store;
-  // `maxRetriesPerRequest: null` is required because the same client class is
-  // reused with BullMQ-style long-running-connection semantics elsewhere and a
-  // finite retry budget would let long-lived blocking calls error out. The
-  // BullMQ scheduler owns its OWN connections (it needs a blocking one for the
-  // worker), so it takes the URL rather than this client. `redis` is `undefined`
-  // on the in-memory path; it is threaded into createApp (for the /ready ping)
-  // and disconnected by the aggregate `close` below.
+  // on REDIS_URL — see the function doc. The Redis path shares ONE ioredis client
+  // across the conversation store + limit-counter store. We DELIBERATELY do NOT set
+  // `maxRetriesPerRequest: null` on this DATA client: that option (which makes a
+  // command retry forever) is a BullMQ-connection requirement, NOT a data-path one.
+  // These stores issue only ordinary (non-blocking) commands on the inbound/flush
+  // hot path, so we keep ioredis's bounded default — during a Redis outage a command
+  // FAILS FAST after the retry budget (caught by the agent's fail-soft handlers)
+  // rather than hanging the flush indefinitely. The BullMQ scheduler owns its OWN
+  // connections (it needs a blocking one for the worker, with `maxRetriesPerRequest:
+  // null`), so it takes the URL rather than this client. `redis` is `undefined` on
+  // the in-memory path; it is threaded into createApp (for the /ready ping) and
+  // disconnected by the aggregate `close` below.
   //
   // The Stage 6 metrics collector, status tracker, and contact-store cache
   // further down stay in-memory in both paths (their Redis swaps are separate).
@@ -104,7 +107,7 @@ export function buildRuntime(
   let scheduler: BufferScheduler;
   let limitCounterStore: LimitCounterStore;
   if (config.redisUrl) {
-    redis = new Redis(config.redisUrl, { maxRetriesPerRequest: null });
+    redis = new Redis(config.redisUrl);
     store = new RedisConversationStore({
       redis,
       dedupeTtlSeconds: config.conversation.dedupeTtlSeconds,

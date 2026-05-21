@@ -51,10 +51,13 @@ is treated as `permanent` — the original skip-and-advance behavior.
 
 ## Pre-send pacing
 
-`sendNext` calls `limitTracker.acquireSendSlot(channel, businessId)` before every
-outbound-MESSAGE send — that is `message`, `reply`, `template`, and `media`. It is
-deliberately NOT applied to `reaction` / `typing` (fire-and-forget side effects, not
-user-facing messages — pacing them would only delay the queue).
+`sendNext` calls `limitTracker.acquireSendSlot(channel, businessId)` before every item
+that makes a real Graph API send — `message`, `reply`, `template`, `media`, AND
+`reaction`. A reaction is a Graph call too (it counts toward Meta's per-channel rate),
+so a reaction-heavy turn left unpaced could contribute to app-level 429s; it is paced
+like any other send. Pacing is deliberately NOT applied to `typing` (a best-effort UX
+side-effect, already spaced by its own pre-message delay — pacing it would only push
+back the real message) or `silence` (no send).
 
 `acquireSendSlot` reserves a slot on a **virtual-clock token bucket** keyed by the
 `{channel}:{businessId}` line (the smallest unit Meta rate-limits independently — each
