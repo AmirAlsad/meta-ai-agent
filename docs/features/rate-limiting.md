@@ -215,7 +215,11 @@ Meta has no idempotency key). Before re-arming, recovery makes an atomic
 `store.claimRecovery(claimToken, ttl)` call (`claimToken = {key}:{itemId}:{retryCount}`):
 the `RedisConversationStore` implements it as `SET NX EX` so exactly ONE replica wins and
 re-arms; the rest skip. The token is attempt-unique, so a *later* restart with a new retry
-attempt claims a fresh key. The in-memory store is single-process and always wins.
+attempt claims a fresh key. The in-memory store is single-process and always wins. The
+claim TTL is deliberately SHORT — sized to the remaining retry delay plus a grace period
+(min 120 s), NOT the 24 h conversation lifetime — so that if the *winning* replica crashes
+before its retry fires, the claim expires quickly and a subsequent restart can re-recover,
+rather than the conversation staying wedged in `sending` for the full TTL.
 
 **Stranded `processing` conversations are un-wedged too.** A conversation whose chat
 call was in flight when the process died sits in Redis as `state: 'processing'`. Nothing

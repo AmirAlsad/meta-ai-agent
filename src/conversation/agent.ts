@@ -123,6 +123,18 @@ const MAX_EXPLICIT_TYPING_DURATION_MS = 10_000;
  */
 const MAX_REPROCESS = 5;
 
+/**
+ * Floor for the boot-recovery claim TTL (seconds) — covers the simultaneous-boot
+ * race window across replicas plus the quick un-wedge action. Kept SHORT (not the
+ * conversation lifetime) so a claimer that crashes before completing recovery
+ * doesn't block every other replica from re-recovering for hours; see
+ * {@link ConversationAgent.recoverPendingRetries}.
+ */
+const RECOVERY_CLAIM_MIN_TTL_SECONDS = 120;
+
+/** Grace added past a transient retry's remaining delay when sizing its claim TTL. */
+const RECOVERY_CLAIM_GRACE_SECONDS = 60;
+
 export interface ConversationAgentDeps {
   store: ConversationStore;
   scheduler: BufferScheduler;
@@ -1500,9 +1512,15 @@ export class ConversationAgent {
   async recoverPendingRetries(): Promise<{ transientRetriesResumed: number; processingReset: number }> {
     let transientRetriesResumed = 0;
     let processingReset = 0;
-    const ttl = this.config.persistence.conversationTtlSeconds;
-    const claim = (token: string): Promise<boolean> =>
-      this.store.claimRecovery ? this.store.claimRecovery(token, ttl) : Promise.resolve(true);
+    // CLAIM TTL is deliberately SHORT (not conversationTtlSeconds): the claim only
+    // needs to survive the simultaneous-boot race window AND until the recovered
+    // action (retry fire / un-wedge) completes. If the WINNING replica crashes
+    // before then, a long TTL would block every other replica from re-recovering
+    // for 24h — re-wedging the conversation. A short TTL bounds that orphan window
+    // so a later restart can re-claim. RECOVERY_CLAIM_MIN_TTL_SECONDS covers the
+    // boot race; the `sending` branch extends it to cover the remaining retry delay.
+    const claim = (token: string, ttlSeconds: number): Promise<boolean> =>
+      this.store.claimRecovery ? this.store.claimRecovery(token, ttlSeconds) : Promise.resolve(true);
     for await (const key of this.store.listConversationKeys()) {
       try {
         const outcome = await this.runExclusive(key, async (): Promise<'sending' | 'processing' | 'none'> => {
@@ -1510,8 +1528,9 @@ export class ConversationAgent {
           if (!record) return 'none';
 
           // (A) `processing` stranded by a restart — un-wedge it (claim-guarded).
+          // The un-wedge action is quick, so the min TTL (boot-race grace) suffices.
           if (record.state === 'processing') {
-            if (!(await claim(`${key}:processing`))) return 'none';
+            if (!(await claim(`${key}:processing`, RECOVERY_CLAIM_MIN_TTL_SECONDS))) return 'none';
             this.clearDeliveryTimeout(key);
             this.clearTransientRetryTimer(key);
             this.pendingRequests.delete(key);
@@ -1541,9 +1560,16 @@ export class ConversationAgent {
           if (record.state !== 'sending') return 'none';
           const item = record.outboundQueue[record.currentOutboundIndex];
           if (!item || item.nextRetryAt === undefined || (item.retryCount ?? 0) <= 0) return 'none';
-          if (!(await claim(`${key}:${item.id}:${item.retryCount ?? 0}`))) return 'none';
-          // Re-arm with the remaining delay (clamped to >= 0 so an overdue retry fires promptly).
+          // Compute remainingMs BEFORE the claim so it drives the claim TTL too:
+          // expire the claim shortly after the retry would have fired (+grace), so a
+          // crashed claimer doesn't block re-recovery for the conversation lifetime.
           const remainingMs = Math.max(0, item.nextRetryAt - this.now());
+          const claimTtlSeconds = Math.max(
+            Math.ceil(remainingMs / 1000) + RECOVERY_CLAIM_GRACE_SECONDS,
+            RECOVERY_CLAIM_MIN_TTL_SECONDS
+          );
+          if (!(await claim(`${key}:${item.id}:${item.retryCount ?? 0}`, claimTtlSeconds))) return 'none';
+          // Re-arm with the remaining delay (clamped to >= 0 so an overdue retry fires promptly).
           this.armTransientRetryTimer(key, item.id, item.retryCount ?? 0, remainingMs, record.traceId);
           return 'sending';
         });
