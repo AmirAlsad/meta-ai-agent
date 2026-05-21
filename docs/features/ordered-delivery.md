@@ -168,13 +168,19 @@ transition table.
 
 ## Fail-soft sends
 
-A send that throws (`MetaApiError` or anything else) does not wedge the queue:
-`sendNext` calls `markSkippedAndAdvance`, which stamps `skippedAt`/`skipReason` on
-the item and advances past it. One bad send never blocks the rest of the queue.
-Proper retry of a failed send is Stage 10. The capability filtering that decides
-which actions become items (e.g. template WhatsApp-only, reply→message downgrade,
-media gated on `media_send`) happens earlier in `buildOutboundItems` —
-see [Rich chat actions](./rich-chat-actions.md).
+A send that throws (`MetaApiError` or anything else) does not wedge the queue. When
+a `LimitTracker` is wired (Stage 10), `sendNext` first classifies the error: a
+known-safe transient failure (network / 429 / Meta rate-limit code) is retried with
+exponential backoff up to a cap (the item stays in place), a WhatsApp closed-window
+failure re-prompts the chat endpoint once for a template, and everything else (any
+5xx — double-send safety — deterministic 4xx, or an exhausted retry) falls through
+to `markSkippedAndAdvance`, which stamps `skippedAt`/`skipReason` on the item and
+advances past it. Without a tracker every error is `permanent` (the original
+skip-and-advance). One bad send never blocks the rest of the queue. See
+[Rate limiting](./rate-limiting.md). The capability filtering that decides which
+actions become items (e.g. template WhatsApp-only, reply→message downgrade, media
+gated on `media_send`) happens earlier in `buildOutboundItems` — see
+[Rich chat actions](./rich-chat-actions.md).
 
 ## Testing
 
@@ -189,8 +195,11 @@ and the WhatsApp send path is proven end-to-end in
 
 ## Known limitations
 
-- No retry on a failed send — the item is skipped and the queue advances
-  (Stage 10).
-- Out-of-window enforcement / WhatsApp template fallback is Stage 10.
+- Transient-failure retry + WhatsApp out-of-window template re-prompt landed in
+  Stage 10 (see [Rate limiting](./rate-limiting.md)); a `permanent` failure (incl.
+  any 5xx — double-send safety) is still skipped + advanced, and Messenger/Instagram
+  have no out-of-window mechanism to enforce.
+- Pre-send pacing is per-second only (no per-hour/per-day caps) — see
+  [Rate limiting](./rate-limiting.md).
 
 See [Known gaps](../KNOWN-GAPS.md) and [Architecture](../ARCHITECTURE.md).

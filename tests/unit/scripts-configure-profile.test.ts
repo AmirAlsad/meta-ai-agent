@@ -21,7 +21,7 @@ import {
   type ProfileConfig
 } from '../../scripts/setup/configure-profile.js';
 import type { Config } from '../../src/config/loader.js';
-import { defaultConversationConfig } from '../../src/config/loader.js';
+import { defaultConversationConfig, defaultLimitsConfig, defaultPersistenceConfig } from '../../src/config/loader.js';
 import { MetaApiError } from '../../src/meta/shared/errors.js';
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -36,6 +36,8 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     instagram: { userId: 'ig-1', accessToken: 'ig-token' },
     channels: { whatsapp: false, messenger: true, instagram: true },
     conversation: defaultConversationConfig(),
+    persistence: defaultPersistenceConfig(),
+    limits: defaultLimitsConfig(),
     chatEndpointUrl: 'https://chat.example.com',
     ngrokDomain: 'test.ngrok-free.dev',
     agentAutostart: false,

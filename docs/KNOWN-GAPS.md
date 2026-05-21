@@ -2,6 +2,30 @@
 
 A running list of items surfaced during code review or implementation that were intentionally deferred to a later stage. Recording them here keeps the institutional memory from getting lost between stages — if you are working on the stage listed, treat the entry as a TODO.
 
+## Open as of Stage 10 (production hardening)
+
+Stage 10 landed Redis persistence (`RedisConversationStore` + `BullMqBufferScheduler` + `RedisLimitCounterStore`, selected on `REDIS_URL`), per-channel pacing + transient retry + WhatsApp out-of-window enforcement (`src/limits/*`), boot-time `recoverPendingRetries`, the real `/ready` Redis ping, and config hardening. These gaps remain after that pass. See [Persistence](./features/persistence.md) and [Rate limiting](./features/rate-limiting.md).
+
+- **No per-hour / per-day hard caps — pacing is per-second only** — `LimitTracker.acquireSendSlot` is a per-`{channel}:{businessId}`-line virtual-clock token bucket that enforces only a per-SECOND rate (defaults WhatsApp 80/s, Messenger 40/s, IG 2/s). Meta's daily messaging-tier limits (e.g. WhatsApp's 250/1k/10k/100k/unlimited tiers) and Instagram's hourly throughput cap (`200 × messageable-users`) are NOT modeled or enforced here — they are tracked by Meta, which rejects an over-cap send (then caught fail-soft). A per-hour/per-day accounting layer is deferred.
+  - **Where**: [`src/limits/tracker.ts`](../src/limits/tracker.ts), [`src/limits/store.ts`](../src/limits/store.ts).
+  - **When**: Deferred — add a longer-window counter if a deploy needs proactive daily/hourly throttling rather than reactive Meta rejection.
+
+- **The Instagram client's own ~100ms in-process pacer still runs IN ADDITION to the `LimitTracker` (double-paced)** — `InstagramClient` retains its coarse per-process 100ms inter-call floor (`DEFAULT_MIN_CALL_SPACING_MS`) from Stage 4, and Stage 10 layered the `LimitTracker` pacing on top (default IG 2/s = 500ms). So an IG line is paced by BOTH — the effective spacing is the stricter of the two. Both are conservative floors, so this only ever slows IG sends slightly (never speeds them past a limit); it is harmless but worth knowing when reasoning about IG send timing. Collapsing to a single pacer (dropping the client-level floor now that the `LimitTracker` exists) is optional cleanup.
+  - **Where**: [`src/meta/instagram/client.ts`](../src/meta/instagram/client.ts) (`pace` / `DEFAULT_MIN_CALL_SPACING_MS`), [`src/conversation/agent.ts`](../src/conversation/agent.ts) (`sendNext` `acquireSendSlot`).
+  - **When**: Optional cleanup — no functional defect; the two floors compose safely.
+
+- **Token-format checks are advisory WARNINGS, not hard rejects (deviation from the plan)** — the implementation plan called for `loadConfig` to THROW on an invalid Meta access-token format. We instead WARN: Meta token formats vary (and evolve), so a false reject would break a working deploy. `loadConfig` stays pure/fail-fast; the exported pure `tokenFormatWarnings(config)` helper produces advisory warnings (Messenger Page token usually `EAA…`, Instagram token usually `IGQ…`, WhatsApp token ≥20 chars) that `createApp` logs at startup. A genuinely malformed token therefore boots and fails later at the Graph API, not at config load. (`REDIS_URL`, by contrast, IS hard-validated by `loadRedisUrl`.)
+  - **Where**: [`src/config/loader.ts`](../src/config/loader.ts) (`tokenFormatWarnings`, the doc comment recording the deviation), [`src/http/app.ts`](../src/http/app.ts) (logs them). Documented in [Persistence](./features/persistence.md) and [Rate limiting](./features/rate-limiting.md).
+  - **When**: No change planned — the soft-warn is the deliberate design; revisit only if Meta publishes stable, guaranteed token prefixes worth hard-enforcing.
+
+- **Redis store / limits / status / contact: TTL-evicted Redis vs. unbounded in-memory maps** — On the Redis path the conversation store (`conversation:{key}` / `outbound:{id}` at `conversationTtlSeconds`, `dedupe:inbound:{id}` at `dedupeTtlSeconds`) and the limits counter store (per-line slot keys with a PX TTL) self-evict. But the Stage 6 metrics collector, status tracker, and contact cache stay **in-memory in BOTH paths** — per-process, lost on restart, and unbounded apart from the metrics cardinality cap. Their Redis-backed swaps with TTL eviction are still deferred (the prior Stage 6 entry below is superseded by this one for the store/scheduler/limits parts).
+  - **Where**: [`src/metrics/collector.ts`](../src/metrics/collector.ts), [`src/status/tracker.ts`](../src/status/tracker.ts), [`src/identity/contact-store.ts`](../src/identity/contact-store.ts).
+  - **When**: Deferred — Redis-backed status tracker (TTL) + shared/bounded contact cache; the metrics export model is TBD (likely a scrape-time export rather than a persisted store).
+
+- **Boot recovery covers transient retries, stranded `processing` records, and WhatsApp first-send crashes; the in-flight chat batch is lost and Messenger/IG first-send crashes self-heal only on the next inbound** — `ConversationAgent.recoverPendingRetries()` (claim-guarded so exactly one replica acts on a shared Redis; real work only against a durable store) re-arms persisted transient-retry timers for `sending` conversations, un-wedges `processing` conversations (chat call in flight at crash) by re-buffering any persisted `lateArrivals` or resetting to `idle`, AND re-arms the delivery-timeout fallback for a WhatsApp (`on_status`) `sending` item that was sent but whose in-memory timer died (the "first-send crash" — the fallback then ADVANCES past the already-sent item, no re-send). **Remaining gap:** a Messenger/Instagram (`on_send`) `sending` conversation stranded at a first-send crash has no per-message timer to re-arm; re-driving its queue could double-send (no idempotency), so recovery leaves it to self-heal on the next inbound via `interruptSending` (it is NOT permanently wedged, but its partial reply stalls until then). **Inherent limitation:** the original in-flight batch of a `processing` turn is a local snapshot (`flushImpl` segment 1 clears `inboundBuffer` before the chat call and never persists the snapshot), so a hard crash mid-chat-call LOSES that turn's input — an at-least-once tradeoff of the snapshot-clears-buffer design. Persisting the in-flight batch for lossless replay is a possible future enhancement. Recovery also does NOT restore an in-flight WhatsApp window re-prompt — the original `ChatRequest` lives in the in-memory `pendingRequests` map (lost on restart), so a `window_closed` send interrupted by a restart skips+advances rather than re-prompting. Buffer-flush timers ARE durable in their own right (the BullMQ scheduler), so they survive independently.
+  - **Where**: [`src/conversation/agent.ts`](../src/conversation/agent.ts) (`recoverPendingRetries`, the `pendingRequests` map).
+  - **When**: Deferred — persisting the pending re-prompt request would let window re-prompts survive a restart; low priority (a rare edge of a rare edge).
+
 ## Open as of Stage 9 (examples, local REPL)
 
 These cover the Stage 9 example/dev surface. None affect the runtime package — they are deliberate scoping choices for reference/dev tooling. See [`examples/README.md`](../examples/README.md) and [Architecture → Examples & local development](./ARCHITECTURE.md#examples--local-development-stage-9).
@@ -82,9 +106,9 @@ These cover the Stage 9 example/dev surface. None affect the runtime package —
 
 ### Out-of-window templates
 
-- **Out-of-window WhatsApp template enforcement is deferred** — Stage 7 ships `WhatsAppClient.sendTemplate` + `buildTemplateComponents`, and the chat request already carries `context.windowOpen` (and `context.windowExpiresAt` when known), so the endpoint can *choose* a template when the window is closed. But the agent does NOT require a template when the window is closed — it does not block an out-of-window plain send or force a template fallback. A reply attempted after the window closes simply fails at the Meta API and is skipped fail-soft. (This is the template-side view of the "24h messaging window is tracked but not enforced" Stage 5 gap below.)
-  - **Where**: [`src/meta/whatsapp/templates.ts`](../src/meta/whatsapp/templates.ts), [`src/meta/whatsapp/client.ts`](../src/meta/whatsapp/client.ts) `sendTemplate`, [`src/conversation/agent.ts`](../src/conversation/agent.ts) (window stamped on inbound, surfaced on the request). Documented in [WhatsApp templates](./features/templates.md).
-  - **When**: Stage 10 (rate limiting + WhatsApp messaging-window awareness — require-template-when-closed enforcement).
+- **Out-of-window WhatsApp template enforcement (RESOLVED in Stage 10)** — Stage 7 shipped `WhatsAppClient.sendTemplate` + `buildTemplateComponents` and surfaced `context.windowOpen`. Stage 10 added active enforcement: a WhatsApp send that fails with the 24h re-engagement error re-prompts the chat endpoint once with `requiresTemplate: true` + `windowOpen: false` (`handleWindowClosed`), then sends whatever it returns (ideally a template), replacing the failed item. NOT A GAP — recorded here to close out the Stage 7 note. (Template-side view of the now-resolved "24h messaging window" Stage 5 gap below.)
+  - **Where**: [`src/conversation/agent.ts`](../src/conversation/agent.ts) `handleWindowClosed`, [`src/limits/tracker.ts`](../src/limits/tracker.ts) `classifyError`. Documented in [Rate limiting](./features/rate-limiting.md) and [WhatsApp templates](./features/templates.md).
+  - **When**: Done (Stage 10).
 
 ## Open as of Stage 6 (status tracking, identity, operational visibility)
 
@@ -95,10 +119,6 @@ These cover the Stage 9 example/dev surface. None affect the runtime package —
   - **When**: Stage 9 (live testing).
 
 ### Operational-surface deferrals
-
-- **`/ready` Redis check is presence-only** — `buildReadinessReport` reports `redis: 'configured'` when `REDIS_URL` is set and `'not_configured'` otherwise, but it does NOT actually ping Redis, and a configured-but-unreachable Redis does not fail readiness. The real ping (and the Redis-backed store / BullMQ scheduler it would gate) lands in Stage 10.
-  - **Where**: [`src/http/app.ts`](../src/http/app.ts) `buildReadinessReport`.
-  - **When**: Stage 10 (real Redis ping once the Redis-backed store/scheduler exist).
 
 - **Per-dispatch-log PII gating is deferred** — the webhook dispatch logs (`inbound.message`) still emit the full channel-scoped user id at `info` so the wiring stays debuggable end-to-end. Stage 6 redacts only the ADMIN-route OUTPUT (`src/http/redaction.ts`), not these per-dispatch logs. Gating dispatch-log PII (e.g. on `config.nodeEnv` or a log-redaction serializer) is an accepted gap, not an unfulfilled TODO.
   - **Where**: [`src/http/app.ts`](../src/http/app.ts) `logIncomingMessage` (see the in-code KNOWN GAP comment).
@@ -118,9 +138,9 @@ These cover the Stage 9 example/dev surface. None affect the runtime package —
 
 ### Persistence and durability
 
-- **In-memory metrics / status / contact stores are unbounded until Redis** — `InMemoryMetricsCollector`, `InMemoryStatusTracker`, and `InMemoryContactStore` are all per-process plain `Map`s, lost on restart, and (apart from the metrics per-metric cardinality cap that folds overflow into `__overflow__`) unbounded with no TTL or sweeper. This is acceptable for Stage 6 because the production path is the Redis-backed implementations with TTL eviction in Stage 10. The collector/tracker/store interfaces are the contract those impls will honor.
+- **In-memory metrics / status / contact stores are unbounded (STILL — Stage 10 did NOT swap these)** — `InMemoryMetricsCollector`, `InMemoryStatusTracker`, and `InMemoryContactStore` remain per-process plain `Map`s, lost on restart, and (apart from the metrics per-metric cardinality cap that folds overflow into `__overflow__`) unbounded with no TTL or sweeper — in BOTH the in-memory and Redis paths. Stage 10 made the conversation store, buffer scheduler, and limit-counter store Redis-backed, but deliberately left these three for a later pass. Superseded by the Stage 10 entry "Redis store / limits / status / contact: TTL-evicted Redis vs. unbounded in-memory maps" above.
   - **Where**: [`src/metrics/collector.ts`](../src/metrics/collector.ts), [`src/status/tracker.ts`](../src/status/tracker.ts), [`src/identity/contact-store.ts`](../src/identity/contact-store.ts).
-  - **When**: Stage 10 (Redis-backed status tracker with TTL, shared/bounded contact cache; metrics export model TBD).
+  - **When**: Deferred past Stage 10 — Redis-backed status tracker with TTL, shared/bounded contact cache; metrics export model TBD.
 
 ## Open as of Stage 5 (conversation agent)
 
@@ -130,19 +150,19 @@ These cover the Stage 9 example/dev surface. None affect the runtime package —
   - **Where**: [`src/conversation/scheduler.ts`](../src/conversation/scheduler.ts) (the swallowed `.catch`), [`src/conversation/agent.ts`](../src/conversation/agent.ts) (`buffer_flush_total{result:'error'}`).
   - **When**: Optional polish; no change planned.
 
-- **No rate limiting on the conversation/outbound path** — The agent sends as fast as the queue drains. The only pacing anywhere is the Instagram client's coarse 100ms in-process floor (see the Stage 4 entry below). No per-channel send-rate accounting, no token bucket, no cross-replica coordination.
-  - **Where**: [`src/conversation/agent.ts`](../src/conversation/agent.ts) `sendNext`; planned `src/limits/tracker.ts`.
-  - **When**: Stage 10 (`LimitTracker`).
+- **No rate limiting on the conversation/outbound path (RESOLVED in Stage 10)** — `sendNext` now reserves a per-`{channel}:{businessId}`-line virtual-clock token-bucket slot before every outbound-message send via `LimitTracker.acquireSendSlot` (fail-open), backed by `InMemoryLimitCounterStore` or the Lua-atomic `RedisLimitCounterStore` (so replicas share one clock). Per-channel defaults WhatsApp 80/s, Messenger 40/s, IG 2/s. NOT A GAP — recorded here to close out the Stage 5 note. Remaining limitation (no per-hour/per-day caps) is tracked in the Stage 10 section above.
+  - **Where**: [`src/limits/tracker.ts`](../src/limits/tracker.ts), [`src/limits/store.ts`](../src/limits/store.ts), [`src/limits/redis-store.ts`](../src/limits/redis-store.ts), [`src/conversation/agent.ts`](../src/conversation/agent.ts) `sendNext`. Documented in [Rate limiting](./features/rate-limiting.md).
+  - **When**: Done (Stage 10).
 
 ### Persistence and durability
 
-- **In-memory store + scheduler only; Redis + BullMQ deferred** — Conversation state, the dedupe set, and the outbound-handle map live in `InMemoryConversationStore`'s plain `Map`s; the buffer scheduler is `InMemoryBufferScheduler` (setTimeout). All of it is per-process and lost on restart, and the per-replica view diverges in a multi-replica deploy. The `ConversationStore` / `BufferScheduler` interfaces are the contract the production impls will honor.
-  - **Where**: [`src/conversation/store.ts`](../src/conversation/store.ts), [`src/conversation/scheduler.ts`](../src/conversation/scheduler.ts); planned `src/conversation/redis-store.ts` + a `'bullmq'` scheduler, selected on `REDIS_URL`.
-  - **When**: Stage 10 (Redis persistence: conversation state, dedupe via `SET NX`, `SCAN` for `listConversationKeys`, BullMQ for delayed buffer flushes, boot-time `recoverPendingRetries`).
+- **In-memory store + scheduler only; Redis + BullMQ deferred (RESOLVED in Stage 10)** — `buildRuntime` now selects, on `REDIS_URL`, a `RedisConversationStore` (durable conversation state + outbound-handle map + atomic `SET NX` dedupe + `SCAN`-based `listConversationKeys`, all TTL-evicted) and a `BullMqBufferScheduler` (durable delayed buffer flushes), sharing one ioredis client. The in-memory store/scheduler remain for tests, local runs, and single-replica deploys. NOT A GAP — recorded here to close out the Stage 5 note.
+  - **Where**: [`src/conversation/redis-store.ts`](../src/conversation/redis-store.ts), [`src/conversation/scheduler.ts`](../src/conversation/scheduler.ts) (`BullMqBufferScheduler`), [`src/index.ts`](../src/index.ts) (`buildRuntime` selection). Documented in [Persistence](./features/persistence.md).
+  - **When**: Done (Stage 10). Boot-time `recoverPendingRetries` also landed (covers transient retries — see the Stage 10 section above).
 
-- **In-memory dedupe map is never swept** — `InMemoryConversationStore.inboundHandles` stores `channelMessageId -> expiry` and checks expiry on read (`claimInboundHandle` / `peekInboundHandle`), but expired entries are never deleted, so the map grows unbounded for a long-lived process. This is acceptable only because the in-memory store is for tests/local runs; the production Redis store relies on a native key TTL (`SET NX` with expiry) so there is nothing to sweep.
-  - **Where**: [`src/conversation/store.ts`](../src/conversation/store.ts) `inboundHandles`.
-  - **When**: Stage 10 (resolved by the Redis store's native TTL; no sweep needed for the in-memory impl).
+- **In-memory dedupe map is never swept (acceptable — Redis path uses native TTL)** — `InMemoryConversationStore.inboundHandles` stores `channelMessageId -> expiry` and checks expiry on read but never deletes expired entries, so the map grows for a long-lived process. This is acceptable because the in-memory store is for tests/local runs; the production `RedisConversationStore` uses a native key TTL (`SET NX EX`) so there is nothing to sweep. NOT A GAP for the production path.
+  - **Where**: [`src/conversation/store.ts`](../src/conversation/store.ts) `inboundHandles`; the Redis TTL in [`src/conversation/redis-store.ts`](../src/conversation/redis-store.ts).
+  - **When**: Resolved for production by the Redis store's native TTL (Stage 10); no sweep needed for the in-memory impl.
 
 ### Load-bearing invariants to preserve
 
@@ -152,9 +172,9 @@ These cover the Stage 9 example/dev surface. None affect the runtime package —
 
 ### Feature scope
 
-- **24h messaging window is tracked but not enforced** — The agent stamps `windowExpiresAt = lastInboundAt + 24h` on each inbound and surfaces `context.windowOpen` to the chat endpoint, but it does NOT block an out-of-window send or force a WhatsApp template fallback. A reply attempted after the window closes will simply fail at the Meta API and be skipped (fail-soft), with no proactive template substitution.
-  - **Where**: [`src/conversation/types.ts`](../src/conversation/types.ts) (`MESSAGING_WINDOW_MS` / `isWindowOpen`), [`src/conversation/agent.ts`](../src/conversation/agent.ts) (window stamped on inbound, surfaced on the request).
-  - **When**: Stage 10 (rate limiting + WhatsApp messaging-window awareness — full enforcement and template fallback).
+- **24h messaging window: tracked AND now ENFORCED on WhatsApp (Stage 10)** — The agent still stamps `windowExpiresAt = lastInboundAt + 24h` on each inbound and surfaces `context.windowOpen`. Stage 10 added enforcement on WhatsApp: a send failing with the 24h re-engagement error (`131047` / `470`) is classified `window_closed`, and `handleWindowClosed` re-prompts the chat endpoint ONCE per turn with `requiresTemplate: true`, then replaces the queue with whatever it returns (ideally a template). Messenger/Instagram have NO reliable out-of-window mechanism for an automated bot, so there is nothing to enforce there (a closed-window send still fails fail-soft). NOT A GAP for WhatsApp — recorded here to close out the Stage 5 note.
+  - **Where**: [`src/conversation/types.ts`](../src/conversation/types.ts) (`MESSAGING_WINDOW_MS` / `isWindowOpen`), [`src/conversation/agent.ts`](../src/conversation/agent.ts) (`handleWindowClosed`), [`src/limits/tracker.ts`](../src/limits/tracker.ts) (`classifyError` window codes). Documented in [Rate limiting](./features/rate-limiting.md).
+  - **When**: Done for WhatsApp (Stage 10). Messenger/IG out-of-window remains unsupported by Meta for bots.
 
 ## Open as of Stage 4 (outbound clients)
 
@@ -170,9 +190,9 @@ These cover the Stage 9 example/dev surface. None affect the runtime package —
 
 ### Rate limiting
 
-- **Full per-channel rate limiting is deferred; the Instagram 100ms pacer is an interim floor** — The Instagram client has a minimal in-process pacer that enforces a default 100ms minimum spacing between Graph calls for one account (`minIntervalMs`-overridable). It is a coarse per-process floor chosen to honor the strictest per-second sub-limit (the ~10/sec media ceiling → 1000ms/10 = 100ms) without throttling legitimate text bursts. It does NOT model the real per-second ceilings (~300/sec text/links/reactions/stickers, ~10/sec media), does NOT model the hourly throughput cap (`200 × number-of-messageable-users`), and does NOT coordinate across replicas. WhatsApp and Messenger have no pacer at all today.
-  - **Where**: [`src/meta/instagram/client.ts`](../src/meta/instagram/client.ts) `pace` / `DEFAULT_MIN_CALL_SPACING_MS`; planned `src/limits/tracker.ts`.
-  - **When**: Stage 10 (`LimitTracker` — shared, Redis-backed, multi-replica-aware, token-bucket accounting + metrics, modeling both the per-second and hourly Instagram limits and per-channel limits generally).
+- **Per-channel rate limiting landed in Stage 10; the Instagram 100ms client pacer remains as a second floor** — Stage 10's `LimitTracker` adds shared, multi-replica-aware (Redis Lua-atomic) per-channel virtual-clock pacing for ALL three channels (so WhatsApp and Messenger now have pacing too). The Instagram client's own coarse ~100ms in-process floor (`DEFAULT_MIN_CALL_SPACING_MS`) was NOT removed, so IG is now double-paced (both conservative — the stricter wins; harmless). The `LimitTracker` models only the per-SECOND ceiling, not IG's ~300/sec-text-vs-~10/sec-media split or the hourly `200 × messageable-users` throughput cap — those remain unmodeled (see the Stage 10 section at the top).
+  - **Where**: [`src/limits/tracker.ts`](../src/limits/tracker.ts), [`src/meta/instagram/client.ts`](../src/meta/instagram/client.ts) `pace` / `DEFAULT_MIN_CALL_SPACING_MS`. Documented in [Rate limiting](./features/rate-limiting.md).
+  - **When**: Per-second pacing done (Stage 10). Per-second-sub-limit + hourly modeling and collapsing the IG double-pace are deferred (Stage 10 section above).
 
 - **WhatsApp messaging-window / pricing tracking still deferred** — Two Stage-2 entries below (`statuses[].conversation` / `pricing`, and the PMP `pricing` block) were tentatively tagged "Stage 4". Stage 4 added the send clients but NOT messaging-window or billing tracking; that work moves with the rest of the limits/observability surface. The clients are window-agnostic today (WhatsApp `sendTemplate` exists for out-of-window sends, but nothing tracks whether the 24-hour window is open).
   - **Where**: `parseWhatsAppStatus` in [`src/meta/parser.ts`](../src/meta/parser.ts).

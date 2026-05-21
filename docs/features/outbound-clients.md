@@ -424,10 +424,12 @@ comes from `InstagramConfig.accessToken`.
   10/sec media ceiling, so `1000ms / 10 = 100ms` is a conservative floor that
   honors it without throttling legitimate text bursts. This is **only** a coarse
   per-process floor to avoid tripping immediate 429s; it does **not** coordinate
-  across replicas. The full model (per-second + hourly throughput, multi-replica,
-  token-bucket accounting) is Stage 10's `LimitTracker`. The pacer's `now` and
-  `sleep` are injectable so tests assert spacing deterministically with no real
-  delay.
+  across replicas. Stage 10's `LimitTracker` adds multi-replica-aware per-channel
+  per-second token-bucket pacing on top of this client floor (so IG is now
+  double-paced; both conservative) — but the per-second sub-limit split and the
+  hourly throughput model are still not modeled. See
+  [Rate limiting](./rate-limiting.md). The pacer's `now` and `sleep` are injectable
+  so tests assert spacing deterministically with no real delay.
 
 ## Auth & secrets
 
@@ -449,9 +451,11 @@ comes from `InstagramConfig.accessToken`.
   streaming), and the clients do not validate MIME/size before sending (Meta
   rejects an unsupported asset). See [Media send](./media.md) and
   [Known gaps](../KNOWN-GAPS.md).
-- **Out-of-window enforcement** — `context.windowOpen` is surfaced to the chat
-  endpoint but the agent does not require a template when the window is closed
-  (Stage 10).
+- **Out-of-window enforcement (landed for WhatsApp in Stage 10)** —
+  `context.windowOpen` is surfaced to the chat endpoint, and on WhatsApp a send that
+  fails with the 24h re-engagement error now re-prompts the endpoint once for a
+  template (`handleWindowClosed`). Messenger/Instagram have no out-of-window
+  mechanism. See [Rate limiting](./rate-limiting.md).
 - **Profile surfaces** — persistent menu, Get Started, ice breakers — landed in
   Stage 8 as **setup-time** configs (not per-message sends): the Messenger surfaces
   in [Messenger profile](./messenger-profile.md) (`MessengerProfileClient`) and the
@@ -459,9 +463,12 @@ comes from `InstagramConfig.accessToken`.
   [Instagram platform](./instagram-platform.md). The send clients' `supports()`
   matrices now advertise these (Messenger `get_started`/`persistent_menu`/`ice_breakers`;
   Instagram `ice_breakers`).
-- **Full rate limiting** — the real per-second + hourly model and cross-replica
-  coordination — Stage 10 (`LimitTracker`). The IG 100ms pacer is an interim
-  in-process floor only.
+- **Rate limiting (per-second pacing landed in Stage 10)** — the `LimitTracker`
+  adds shared, cross-replica-aware (Redis Lua-atomic) per-channel virtual-clock
+  pacing for all three channels, applied by the agent before each outbound-message
+  send. Still NOT modeled: per-hour/per-day hard caps and IG's per-second-sub-limit /
+  hourly throughput split. The IG client's own ~100ms in-process floor still runs
+  alongside it (double-paced, both conservative). See [Rate limiting](./rate-limiting.md).
 
 See [Known gaps](../KNOWN-GAPS.md) for the running deferral list.
 

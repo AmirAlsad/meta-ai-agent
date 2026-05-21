@@ -2,6 +2,7 @@ import 'dotenv/config';
 import path from 'node:path';
 import express from 'express';
 import pino from 'pino';
+import { Redis } from 'ioredis';
 import { loadConfig, type Config } from './config/loader.js';
 import { createApp, PACKAGE_VERSION } from './http/app.js';
 import { GraphClient } from './meta/shared/graph-client.js';
@@ -12,8 +13,15 @@ import { MessengerClient } from './meta/messenger/client.js';
 import { InstagramClient } from './meta/instagram/client.js';
 import { HttpChatClient } from './chat/client.js';
 import { InMemoryConversationStore } from './conversation/store.js';
-import { InMemoryBufferScheduler } from './conversation/scheduler.js';
+import { RedisConversationStore } from './conversation/redis-store.js';
+import { InMemoryBufferScheduler, BullMqBufferScheduler } from './conversation/scheduler.js';
+import type { BufferScheduler } from './conversation/scheduler.js';
+import type { ConversationStore } from './conversation/store.js';
 import { ConversationAgent } from './conversation/agent.js';
+import { InMemoryLimitCounterStore } from './limits/store.js';
+import type { LimitCounterStore } from './limits/store.js';
+import { RedisLimitCounterStore } from './limits/redis-store.js';
+import { createLimitTracker } from './limits/tracker.js';
 import { InMemoryMetricsCollector } from './metrics/collector.js';
 import { createAgentMetrics } from './metrics/registry.js';
 import { InMemoryStatusTracker } from './status/tracker.js';
@@ -24,20 +32,38 @@ import type { ChannelAdapter } from './meta/shared/adapter.js';
 import type { Channel } from './meta/types.js';
 
 /**
- * Build the full Stage 5 dependency graph and return the wired Express app plus
- * the conversation agent — WITHOUT starting a listener. Extracted from `main()`
- * so dev tooling (e.g. `scripts/dev/loop.ts`) can boot the exact same runtime
- * (real adapters, store, scheduler, chat client, agent) against an alternate
- * chat endpoint and tunnel, instead of reimplementing the construction.
+ * Build the full dependency graph and return the wired Express app, the
+ * conversation agent, and an aggregate `close` — WITHOUT starting a listener.
+ * Extracted from `main()` so dev tooling (e.g. `scripts/dev/loop.ts`) can boot
+ * the exact same runtime (real adapters, store, scheduler, chat client, agent)
+ * against an alternate chat endpoint and tunnel, instead of reimplementing the
+ * construction.
  *
  * Construction order: shared Graph transport → per-channel adapters (only the
- * configured channels) → in-memory store + scheduler → HTTP chat client → agent
- * → createApp.
+ * configured channels) → persistence trio (store + scheduler + limit-counter
+ * store) → limit tracker → HTTP chat client → agent → createApp.
+ *
+ * DUAL PERSISTENCE PATH (Stage 10): selected on `config.redisUrl`.
+ *  - REDIS_URL set → ONE shared ioredis client backs the
+ *    {@link RedisConversationStore} + {@link RedisLimitCounterStore}, and a
+ *    {@link BullMqBufferScheduler} (which owns its OWN BullMQ connections). The
+ *    shared client is also handed to `createApp` so GET /ready can ping it.
+ *  - REDIS_URL unset → the in-memory trio
+ *    ({@link InMemoryConversationStore} + {@link InMemoryBufferScheduler} +
+ *    {@link InMemoryLimitCounterStore}): per-process, single-replica, lost on
+ *    restart. Fine for tests, local runs, and single-replica deploys.
+ *
+ * The Stage 6 metrics collector, status tracker, and contact-store cache below
+ * stay in-memory in both paths (their Redis-backed swaps with TTL eviction are
+ * tracked separately).
+ *
+ * Adding `close` to the return is backward-compatible: existing callers that
+ * destructure `{ app, agent }` keep working.
  */
 export function buildRuntime(
   config: Config,
   logger: pino.Logger
-): { app: express.Express; agent: ConversationAgent } {
+): { app: express.Express; agent: ConversationAgent; close: () => Promise<void> } {
   // The shared Graph transport is constructed once; each configured channel
   // gets its own adapter.
   const graph = new GraphClient({ apiVersion: config.meta.graphApiVersion, logger });
@@ -60,14 +86,51 @@ export function buildRuntime(
     adapters.instagram = new InstagramClient({ config: config.instagram, graph, logger });
   }
 
-  // WHY in-memory store + scheduler for Stage 5/6: state is per-process and the
-  // setTimeout-based scheduler is single-replica. Likewise the Stage 6 metrics
-  // collector, status tracker, and contact-store cache below are all in-memory.
-  // The production swap to Redis-backed implementations (store, BullMQ scheduler,
-  // status tracker with TTL eviction, shared/bounded contact cache), selected on
-  // REDIS_URL, is Stage 10.
-  const store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
-  const scheduler = new InMemoryBufferScheduler();
+  // Persistence trio (store + buffer scheduler + limit-counter store), selected
+  // on REDIS_URL — see the function doc. The Redis path shares ONE ioredis client
+  // across the conversation store + limit-counter store. We DELIBERATELY do NOT set
+  // `maxRetriesPerRequest: null` on this DATA client: that option (which makes a
+  // command retry forever) is a BullMQ-connection requirement, NOT a data-path one.
+  // These stores issue only ordinary (non-blocking) commands on the inbound/flush
+  // hot path, so we keep ioredis's bounded default — during a Redis outage a command
+  // FAILS FAST after the retry budget (caught by the agent's fail-soft handlers)
+  // rather than hanging the flush indefinitely. The BullMQ scheduler owns its OWN
+  // connections (it needs a blocking one for the worker, with `maxRetriesPerRequest:
+  // null`), so it takes the URL rather than this client. `redis` is `undefined` on
+  // the in-memory path; it is threaded into createApp (for the /ready ping) and
+  // disconnected by the aggregate `close` below.
+  //
+  // The Stage 6 metrics collector, status tracker, and contact-store cache
+  // further down stay in-memory in both paths (their Redis swaps are separate).
+  let redis: Redis | undefined;
+  let store: ConversationStore;
+  let scheduler: BufferScheduler;
+  let limitCounterStore: LimitCounterStore;
+  if (config.redisUrl) {
+    redis = new Redis(config.redisUrl);
+    store = new RedisConversationStore({
+      redis,
+      dedupeTtlSeconds: config.conversation.dedupeTtlSeconds,
+      conversationTtlSeconds: config.persistence.conversationTtlSeconds,
+      logger
+    });
+    scheduler = new BullMqBufferScheduler({
+      redisUrl: config.redisUrl,
+      queueName: config.persistence.bufferQueueName,
+      workerConcurrency: config.persistence.bufferWorkerConcurrency,
+      logger
+    });
+    limitCounterStore = new RedisLimitCounterStore({ redis, logger });
+  } else {
+    store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
+    scheduler = new InMemoryBufferScheduler();
+    limitCounterStore = new InMemoryLimitCounterStore();
+  }
+
+  // The limit tracker is built in BOTH paths (it fail-opens on a pacing error,
+  // so it is always safe to wire) over whichever counter store was selected.
+  const limitTracker = createLimitTracker({ store: limitCounterStore, config: config.limits, logger });
+
   const chatClient = new HttpChatClient({
     chatEndpointUrl: config.chatEndpointUrl,
     timeoutMs: config.conversation.chatEndpointTimeoutMs,
@@ -127,8 +190,26 @@ export function buildRuntime(
     metrics,
     identityResolver,
     statusTracker,
+    limitTracker,
     ...(mediaHydrator ? { mediaHydrator } : {})
   });
+
+  // Boot recovery (fire-and-forget, non-blocking): re-arm any transient retries
+  // that were persisted before the last restart. On the in-memory path there is
+  // nothing persisted so this resolves with 0; on the Redis path it resumes
+  // pending retries across replicas. Logged, never awaited — a recovery failure
+  // must not block the listener from coming up.
+  void agent
+    .recoverPendingRetries()
+    .then(({ transientRetriesResumed, processingReset, deliveryTimeoutsRearmed }) => {
+      if (transientRetriesResumed > 0 || processingReset > 0 || deliveryTimeoutsRearmed > 0) {
+        logger.info(
+          { transientRetriesResumed, processingReset, deliveryTimeoutsRearmed },
+          'recovered conversations from persisted state'
+        );
+      }
+    })
+    .catch(err => logger.warn({ err }, 'recoverPendingRetries failed'));
 
   const app = createApp({
     config,
@@ -138,10 +219,25 @@ export function buildRuntime(
     metricsCollector,
     statusTracker,
     store,
-    scheduler
+    scheduler,
+    // Hand the shared client (Redis path only) to /ready so it can ping it. On
+    // the in-memory path this is undefined and /ready reports presence-only.
+    ...(redis ? { redisClient: redis } : {})
   });
 
-  return { app, agent };
+  // Aggregate shutdown: close the agent FIRST (clears the buffer scheduler +
+  // delivery-timeout timers, closes the BullMQ scheduler's own connections, and
+  // runs the store/limit-tracker no-op closes), THEN disconnect the shared
+  // ioredis client. WHY this order: the agent's scheduler may still touch state
+  // during a graceful drain. Our BullMQ scheduler owns SEPARATE connections, so
+  // ordering is not strictly required — disconnecting the shared client after the
+  // agent is closed is simply the safe default.
+  const close = async (): Promise<void> => {
+    await agent.close();
+    if (redis) redis.disconnect();
+  };
+
+  return { app, agent, close };
 }
 
 function main(): void {
@@ -157,7 +253,7 @@ function main(): void {
           }
   });
 
-  const { app, agent } = buildRuntime(config, logger);
+  const { app, close } = buildRuntime(config, logger);
 
   const shouldStart = config.agentAutostart && config.nodeEnv !== 'test';
   if (!shouldStart) {
@@ -181,16 +277,17 @@ function main(): void {
 
   const shutdown = (signal: string): void => {
     logger.info({ signal }, 'shutting down');
-    // Force-exit fallback first so a hung close (agent or server) can't wedge
-    // the process — `unref` so this timer itself never keeps the loop alive.
+    // Force-exit fallback first so a hung close (agent, redis, or server) can't
+    // wedge the process — `unref` so this timer itself never keeps the loop alive.
     setTimeout(() => process.exit(1), 10_000).unref();
-    // Close the agent BEFORE the server: clearing the buffer scheduler +
-    // delivery-timeout timers lets the event loop drain so the process can
-    // exit. agent.close() is best-effort — log and proceed to close the server
-    // regardless so a close failure can't block shutdown.
-    void agent
-      .close()
-      .catch(err => logger.error({ err, signal }, 'agent close failed during shutdown'))
+    // Aggregate close BEFORE the server: it closes the agent (clearing the buffer
+    // scheduler + delivery-timeout timers so the event loop can drain) and then
+    // disconnects the shared Redis client (Redis path). Best-effort — log and
+    // proceed to close the server regardless so a close failure can't block
+    // shutdown. Boot recovery already fired inside buildRuntime, so it is not
+    // repeated here.
+    void close()
+      .catch(err => logger.error({ err, signal }, 'runtime close failed during shutdown'))
       .finally(() => server.close(() => process.exit(0)));
   };
   process.on('SIGINT', () => shutdown('SIGINT'));

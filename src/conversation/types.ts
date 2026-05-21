@@ -105,6 +105,26 @@ export interface ConversationRecord {
   contact?: Contact;
   /** Request-scoped trace id captured at the inbound webhook entry. */
   traceId?: string;
+  /**
+   * Guards a SINGLE WhatsApp out-of-window re-prompt per turn (Stage 10). When a
+   * WhatsApp send fails because the 24h messaging window is closed
+   * (`window_closed`), the agent re-prompts the chat endpoint ONCE (asking it to
+   * reply with a template). This flag is set on that first re-prompt so a second
+   * `window_closed` in the same turn just skips the item instead of looping.
+   * Reset to `false` when a fresh turn attaches its outbound queue. Optional:
+   * absent ⇒ false (no re-prompt has happened).
+   */
+  windowReprompted?: boolean;
+  /**
+   * Per-turn nonce stamped when the conversation enters `processing` (the chat
+   * call is in flight). Boot recovery uses it to build a UNIQUE claim token per
+   * processing entry so that, on a shared Redis, concurrent recoveries of the same
+   * crash dedupe (one replica wins) while a LATER processing turn — after the
+   * conversation has done more work — is never blocked by a stale claim from an
+   * earlier turn. Set in `flushImpl`; absent outside `processing`. See
+   * `ConversationAgent.recoverPendingRetries`.
+   */
+  processingNonce?: string;
 }
 
 /**

@@ -111,6 +111,57 @@ export interface ConversationConfig {
   inboundMediaMaxBytes: number;
 }
 
+/**
+ * Stage 10 Redis-backed persistence + BullMQ scheduler tuning. Only consulted
+ * when REDIS_URL is set. Every field has a default; the loader validates ranges
+ * and throws with the offending env var name on a malformed value (fail-fast,
+ * no logging) — same posture as {@link ConversationConfig}.
+ */
+export interface PersistenceConfig {
+  /** TTL (seconds) for Redis conversation records + outbound-handle mappings. Default 86400 (1 day). */
+  conversationTtlSeconds: number;
+  /** BullMQ queue name for the buffer-flush scheduler. Default 'meta-ai-buffer-timers'. */
+  bufferQueueName: string;
+  /**
+   * BullMQ Worker concurrency for buffer-flush jobs. Default 10. WHY > 1: the
+   * flush handler awaits the (slow) chat-endpoint call, and a concurrency of 1
+   * would serialize EVERY conversation's flush behind one in-flight chat call —
+   * unlike the in-memory scheduler, whose independent setTimeouts interleave
+   * flushes across conversations. Parallel flushes are safe because each acquires
+   * only its per-conversation key lock. Tune up for higher concurrent-conversation
+   * throughput.
+   */
+  bufferWorkerConcurrency: number;
+  /** Timeout (ms) for the GET /ready Redis ping. Default 2000. */
+  readyRedisTimeoutMs: number;
+}
+
+/**
+ * Stage 10 per-channel outbound rate limiting + transient retry. Pacing values
+ * are non-negative (0 disables pacing for that channel); the retry knobs are
+ * positive ints with a `base <= max` cross-field check.
+ */
+export interface LimitsConfig {
+  /**
+   * Outbound pacing (messages/sec) per channel. 0 disables pacing for that channel.
+   * Defaults are conservative and well under Meta's documented per-channel send
+   * caps (WhatsApp default throughput 80 mps → up to 1000; Messenger 300/s text;
+   * Instagram 100/s text, 10/s media). The Instagram default (10) matches both the
+   * IG media cap AND the InstagramClient's own ~10/s in-process pacer floor so the
+   * two layers stay aligned — note 2/s is the *general* Graph baseline, NOT the
+   * messaging limit, so it would over-throttle.
+   */
+  whatsappPerSecond: number;   // default 80
+  messengerPerSecond: number;  // default 40
+  instagramPerSecond: number;  // default 10
+  /** Max transient-retry attempts after the first send. Default 3. */
+  transientRetryMaxAttempts: number;
+  /** Base backoff (ms) for transient retry. Default 1000. */
+  transientRetryBaseMs: number;
+  /** Max backoff (ms) for transient retry. Default 60000. */
+  transientRetryMaxMs: number;
+}
+
 export interface Config {
   meta: MetaConfig;
   whatsapp?: WhatsAppConfig;
@@ -118,6 +169,8 @@ export interface Config {
   instagram?: InstagramConfig;
   channels: Channels;
   conversation: ConversationConfig;
+  persistence: PersistenceConfig;
+  limits: LimitsConfig;
   chatEndpointUrl: string;
   /**
    * Optional. Developer-provided endpoint for identity enrichment — the
@@ -316,6 +369,22 @@ function loadFloatInRange(
 }
 
 /**
+ * Parse a non-negative float env var (value >= 0, finite). Returns `fallback`
+ * when unset/empty; throws with the var name on a non-finite or negative value.
+ * Used for the per-channel rate-limit pacing knobs, where 0 is a meaningful
+ * value (disables pacing for that channel).
+ */
+function loadNonNegativeFloat(env: ConfigEnv, name: string, fallback: number): number {
+  const raw = trimmed(env, name);
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`Invalid ${name}: ${raw}. Expected a non-negative number (>= 0).`);
+  }
+  return parsed;
+}
+
+/**
  * Documented defaults for {@link ConversationConfig}. Kept as a single source
  * of truth so the loader fallbacks and {@link defaultConversationConfig} can
  * never drift, and so the values match `.env.example` and the plan (lines
@@ -379,6 +448,83 @@ function loadConversationConfig(env: ConfigEnv): ConversationConfig {
   };
 }
 
+/**
+ * Documented defaults for {@link PersistenceConfig}. Single source of truth so
+ * the loader fallbacks and {@link defaultPersistenceConfig} can never drift, and
+ * so the values match `.env.example`.
+ */
+const PERSISTENCE_DEFAULTS: PersistenceConfig = {
+  conversationTtlSeconds: 86400, // 1 day
+  bufferQueueName: 'meta-ai-buffer-timers',
+  bufferWorkerConcurrency: 10,
+  readyRedisTimeoutMs: 2000
+};
+
+/**
+ * The {@link PersistenceConfig} defaults as a fresh object — handy for tests and
+ * for callers assembling a `Config` without a full env. Returns a copy so
+ * mutation cannot corrupt the shared constant.
+ */
+export function defaultPersistenceConfig(): PersistenceConfig {
+  return { ...PERSISTENCE_DEFAULTS };
+}
+
+function loadPersistenceConfig(env: ConfigEnv): PersistenceConfig {
+  const d = PERSISTENCE_DEFAULTS;
+  return {
+    conversationTtlSeconds: loadPositiveInt(env, 'CONVERSATION_TTL_SECONDS', d.conversationTtlSeconds),
+    bufferQueueName: trimmed(env, 'BUFFER_QUEUE_NAME') ?? d.bufferQueueName,
+    bufferWorkerConcurrency: loadPositiveInt(env, 'BUFFER_WORKER_CONCURRENCY', d.bufferWorkerConcurrency),
+    readyRedisTimeoutMs: loadPositiveInt(env, 'READY_REDIS_TIMEOUT_MS', d.readyRedisTimeoutMs)
+  };
+}
+
+/**
+ * Documented defaults for {@link LimitsConfig}. Single source of truth so the
+ * loader fallbacks and {@link defaultLimitsConfig} can never drift, and so the
+ * values match `.env.example`.
+ */
+const LIMITS_DEFAULTS: LimitsConfig = {
+  whatsappPerSecond: 80,
+  messengerPerSecond: 40,
+  instagramPerSecond: 10,
+  transientRetryMaxAttempts: 3,
+  transientRetryBaseMs: 1000,
+  transientRetryMaxMs: 60000
+};
+
+/**
+ * The {@link LimitsConfig} defaults as a fresh object — handy for tests and for
+ * callers assembling a `Config` without a full env. Returns a copy so mutation
+ * cannot corrupt the shared constant.
+ */
+export function defaultLimitsConfig(): LimitsConfig {
+  return { ...LIMITS_DEFAULTS };
+}
+
+function loadLimitsConfig(env: ConfigEnv): LimitsConfig {
+  const d = LIMITS_DEFAULTS;
+  const transientRetryBaseMs = loadPositiveInt(env, 'TRANSIENT_RETRY_BASE_MS', d.transientRetryBaseMs);
+  const transientRetryMaxMs = loadPositiveInt(env, 'TRANSIENT_RETRY_MAX_MS', d.transientRetryMaxMs);
+  // Cross-field check, matching the existing fail-fast philosophy (cf. the
+  // buffer max>=base check): a base above the max would let backoff math start
+  // beyond its own ceiling, which is always a misconfiguration.
+  if (transientRetryBaseMs > transientRetryMaxMs) {
+    throw new Error(
+      `Invalid TRANSIENT_RETRY_BASE_MS: ${transientRetryBaseMs} is greater than TRANSIENT_RETRY_MAX_MS (${transientRetryMaxMs}). The base must be <= the max.`
+    );
+  }
+
+  return {
+    whatsappPerSecond: loadNonNegativeFloat(env, 'WHATSAPP_RATE_LIMIT_PER_SECOND', d.whatsappPerSecond),
+    messengerPerSecond: loadNonNegativeFloat(env, 'MESSENGER_RATE_LIMIT_PER_SECOND', d.messengerPerSecond),
+    instagramPerSecond: loadNonNegativeFloat(env, 'INSTAGRAM_RATE_LIMIT_PER_SECOND', d.instagramPerSecond),
+    transientRetryMaxAttempts: loadPositiveInt(env, 'TRANSIENT_RETRY_MAX_ATTEMPTS', d.transientRetryMaxAttempts),
+    transientRetryBaseMs,
+    transientRetryMaxMs
+  };
+}
+
 function loadChatEndpointUrl(env: ConfigEnv): string {
   const raw = requireEnv(env, 'CHAT_ENDPOINT_URL');
   try {
@@ -403,6 +549,31 @@ function loadUserLookupUrl(env: ConfigEnv): string | undefined {
     new URL(raw);
   } catch {
     throw new Error(`Invalid USER_LOOKUP_URL: ${raw}. Expected a parseable URL.`);
+  }
+  return raw;
+}
+
+/**
+ * Load the OPTIONAL `REDIS_URL`. Unset/blank -> `undefined` (Stage 10 Redis
+ * persistence disabled; the in-memory store/scheduler are used). When present it
+ * must parse as a URL AND use the `redis:` or `rediss:` (TLS) protocol — we fail
+ * fast with the var name so a typo'd or wrong-scheme URL (e.g. an http:// paste)
+ * is caught at boot rather than surfacing as an opaque connection error deep in
+ * the Stage 10 client. Returns the trimmed string on success.
+ */
+function loadRedisUrl(env: ConfigEnv): string | undefined {
+  const raw = trimmed(env, 'REDIS_URL');
+  if (raw === undefined) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`Invalid REDIS_URL: ${raw}. Expected a parseable redis:// or rediss:// URL.`);
+  }
+  if (parsed.protocol !== 'redis:' && parsed.protocol !== 'rediss:') {
+    throw new Error(
+      `Invalid REDIS_URL: ${raw}. Expected the redis:// or rediss:// scheme (got "${parsed.protocol}").`
+    );
   }
   return raw;
 }
@@ -516,9 +687,11 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     instagram,
     channels,
     conversation: loadConversationConfig(env),
+    persistence: loadPersistenceConfig(env),
+    limits: loadLimitsConfig(env),
     chatEndpointUrl: loadChatEndpointUrl(env),
     userLookupUrl: loadUserLookupUrl(env),
-    redisUrl: trimmed(env, 'REDIS_URL'),
+    redisUrl: loadRedisUrl(env),
     adminApiToken: loadAdminApiToken(env),
     publicBaseUrl: trimmed(env, 'PUBLIC_BASE_URL'),
     ngrokDomain: loadNgrokDomain(env),
@@ -526,4 +699,56 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     port: loadPort(env),
     nodeEnv: trimmed(env, 'NODE_ENV') ?? 'development'
   };
+}
+
+export interface TokenFormatWarning {
+  field: string;
+  message: string;
+}
+
+/**
+ * Heuristic, NON-FATAL checks on Meta access-token shapes. Returns warnings, never throws —
+ * Meta token formats vary and a false reject would break a working deploy, so these are
+ * advisory only (createApp logs them at startup). Checks:
+ *  - Messenger Page Access Token usually starts with 'EAA'.
+ *  - Instagram (Business Login) user token usually starts with 'IGQ'.
+ *  - WhatsApp access token should be a long (>=20 chars) token.
+ * Each check fires ONLY when the channel is configured.
+ *
+ * Deliberately NOT called from `loadConfig` (which is pure and fail-fast) — the
+ * loader stays logging-free; `createApp` consumes these and logs them.
+ */
+export function tokenFormatWarnings(config: Config): TokenFormatWarning[] {
+  const warnings: TokenFormatWarning[] = [];
+
+  if (config.whatsapp && config.whatsapp.accessToken.length < 20) {
+    warnings.push({
+      field: 'WHATSAPP_ACCESS_TOKEN',
+      message:
+        'WhatsApp access token looks unusually short (<20 chars). Expected a long ' +
+        'System User / Cloud API token; double-check it was copied in full.'
+    });
+  }
+
+  if (config.messenger && !config.messenger.pageAccessToken.startsWith('EAA')) {
+    warnings.push({
+      field: 'MESSENGER_PAGE_ACCESS_TOKEN',
+      message:
+        'Messenger Page Access Token does not start with "EAA". Page tokens minted ' +
+        'via the Dashboard / Facebook Login for Business normally begin with "EAA"; ' +
+        'verify you used a Page token (not an App or User token).'
+    });
+  }
+
+  if (config.instagram && !config.instagram.accessToken.startsWith('IGQ')) {
+    warnings.push({
+      field: 'INSTAGRAM_ACCESS_TOKEN',
+      message:
+        'Instagram access token does not start with "IGQ". Instagram Business Login ' +
+        'user tokens normally begin with "IGQ"; verify you used the long-lived IG ' +
+        'token from the OAuth flow.'
+    });
+  }
+
+  return warnings;
 }

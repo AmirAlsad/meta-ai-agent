@@ -23,13 +23,18 @@ import type {
   SendResult
 } from '../../src/meta/shared/adapter.js';
 import type { Channel, IncomingMessage, StatusUpdate } from '../../src/meta/types.js';
-import { defaultConversationConfig, type Config } from '../../src/config/loader.js';
+import { defaultConversationConfig, defaultLimitsConfig, defaultPersistenceConfig, type Config } from '../../src/config/loader.js';
 import { InMemoryMetricsCollector } from '../../src/metrics/collector.js';
 import { createAgentMetrics, type AgentMetrics } from '../../src/metrics/registry.js';
 import { InMemoryStatusTracker } from '../../src/status/tracker.js';
 import type { IdentityResolver, IdentityLookupRequest } from '../../src/identity/resolver.js';
 import type { Contact } from '../../src/identity/types.js';
 import type { InboundMediaHydrator } from '../../src/meta/shared/media-hydrator.js';
+import type { LimitTracker } from '../../src/limits/tracker.js';
+import type { ErrorClassification } from '../../src/limits/retry.js';
+import { MetaApiError } from '../../src/meta/shared/errors.js';
+import { createIdleConversation, type ConversationRecord } from '../../src/conversation/types.js';
+import type { OutboundItem } from '../../src/delivery/types.js';
 
 /* ──────────────────────────────────────────────────────────────────────── */
 /* Fixtures                                                                  */
@@ -44,6 +49,8 @@ function makeConfig(): Config {
     meta: { appId: undefined, appSecret: 's', verifyToken: 'x'.repeat(16), graphApiVersion: 'v25.0' },
     channels: { whatsapp: true, messenger: true, instagram: true },
     conversation: defaultConversationConfig(),
+    persistence: defaultPersistenceConfig(),
+    limits: defaultLimitsConfig(),
     chatEndpointUrl: 'https://example.test/chat',
     ngrokDomain: 'foo.ngrok-free.app',
     agentAutostart: false,
@@ -197,6 +204,7 @@ interface Harness {
   metrics?: AgentMetrics;
   statusTracker?: InMemoryStatusTracker;
   identityResolver?: IdentityResolver;
+  limitTracker?: LimitTracker;
 }
 
 function makeHarness(opts: {
@@ -211,6 +219,8 @@ function makeHarness(opts: {
   identityResolver?: IdentityResolver;
   /** Optional inbound media hydrator (fake). */
   mediaHydrator?: InboundMediaHydrator;
+  /** Optional Stage 10 limit tracker (fake or real). */
+  limitTracker?: LimitTracker;
 }): Harness {
   const config = makeConfig();
   opts.configMutate?.(config);
@@ -237,7 +247,8 @@ function makeHarness(opts: {
     ...(metrics ? { metrics } : {}),
     ...(statusTracker ? { statusTracker } : {}),
     ...(opts.identityResolver ? { identityResolver: opts.identityResolver } : {}),
-    ...(opts.mediaHydrator ? { mediaHydrator: opts.mediaHydrator } : {})
+    ...(opts.mediaHydrator ? { mediaHydrator: opts.mediaHydrator } : {}),
+    ...(opts.limitTracker ? { limitTracker: opts.limitTracker } : {})
   });
   return {
     agent,
@@ -248,8 +259,55 @@ function makeHarness(opts: {
     ...(collector ? { collector } : {}),
     ...(metrics ? { metrics } : {}),
     ...(statusTracker ? { statusTracker } : {}),
-    ...(opts.identityResolver ? { identityResolver: opts.identityResolver } : {})
+    ...(opts.identityResolver ? { identityResolver: opts.identityResolver } : {}),
+    ...(opts.limitTracker ? { limitTracker: opts.limitTracker } : {})
   };
+}
+
+/* ──────────────────────────────────────────────────────────────────────── */
+/* Stage 10 helpers: a controllable fake LimitTracker                        */
+/* ──────────────────────────────────────────────────────────────────────── */
+
+/**
+ * A fully-controllable fake {@link LimitTracker}. `classify` decides the
+ * verdict per error; `acquireSendSlot` is a spy with no real delay (so tests
+ * stay timer-free for pacing). `retryDelayMs` is fixed at `delayMs` for
+ * deterministic timer math; `transientRetryMaxAttempts` is configurable.
+ */
+function makeLimitTracker(opts: {
+  classify?: (channel: Channel, error: unknown) => ErrorClassification;
+  maxAttempts?: number;
+  delayMs?: number;
+} = {}): LimitTracker & {
+  acquireSendSlot: ReturnType<typeof vi.fn>;
+  classifyError: ReturnType<typeof vi.fn>;
+} {
+  const delayMs = opts.delayMs ?? 1000;
+  const maxAttempts = opts.maxAttempts ?? 3;
+  // Default fake classifier mirrors the REAL tracker's safe-to-re-send set: 429
+  // (and network 0) are transient; everything else (incl. 5xx — double-send risk)
+  // is permanent. Tests drive the agent's retry MECHANISM via this fake.
+  const classify =
+    opts.classify ?? ((_channel: Channel, error: unknown): ErrorClassification =>
+      error instanceof MetaApiError && (error.httpStatus === 429 || error.httpStatus === 0)
+        ? 'transient'
+        : 'permanent');
+  return {
+    acquireSendSlot: vi.fn(async () => undefined),
+    classifyError: vi.fn((channel: Channel, error: unknown) => classify(channel, error)),
+    retryDelayMs: () => delayMs,
+    transientRetryMaxAttempts: () => maxAttempts
+  };
+}
+
+/** A MetaApiError with the given HTTP status (+ optional Meta error code). */
+function metaError(httpStatus: number, errorCode?: number): MetaApiError {
+  return new MetaApiError({
+    operation: 'sendText',
+    httpStatus,
+    ...(errorCode !== undefined ? { errorCode } : {}),
+    responseBody: { error: { message: 'boom' } }
+  });
 }
 
 /* ──────────────────────────────────────────────────────────────────────── */
@@ -2387,6 +2445,559 @@ describe('ConversationAgent', () => {
     const sentId = (await (h.adapters.whatsapp!.sendText.mock.results[0]!.value as Promise<SendResult>)).messageId;
     await expect(h.agent.handleStatus(status(sentId, 'delivered'))).resolves.toBeUndefined();
     await h.agent.close();
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Stage 10: pacing, transient retry, WhatsApp out-of-window, recovery      */
+  /* ────────────────────────────────────────────────────────────────────── */
+  describe('Stage 10 limits (pacing / retry / window / recovery)', () => {
+    it('pacing: acquireSendSlot is called before message AND reaction sends, NOT for typing', async () => {
+      const limitTracker = makeLimitTracker();
+      // A message + a reaction (both real Graph sends → paced) + an explicit typing
+      // item (best-effort UX side-effect → NOT paced). Use Messenger so the whole
+      // queue drains on_send under one lock (no status round-trip between items).
+      const h = makeHarness({
+        responses: [
+          {
+            actions: [
+              { type: 'message', text: 'one' },
+              { type: 'reaction', emoji: '👍', targetMessageId: 'm_x' },
+              { type: 'typing' }
+            ]
+          }
+        ],
+        adapters: { messenger: makeAdapter('messenger', messengerSupports) },
+        limitTracker
+      });
+
+      await h.agent.handleInbound(inbound({ channel: 'messenger', channelMessageId: 'm_p1', channelScopedUserId: 'fb-user' }));
+      await flushBuffer();
+
+      // Both the message and the reaction were paced (each consumes a slot); the
+      // typing item was not.
+      expect(limitTracker.acquireSendSlot).toHaveBeenCalledTimes(2);
+      expect(limitTracker.acquireSendSlot).toHaveBeenCalledWith('messenger', 'biz-1');
+      expect(h.adapters.messenger!.sendText).toHaveBeenCalledTimes(1);
+      expect(h.adapters.messenger!.sendReaction).toHaveBeenCalledTimes(1);
+      await h.agent.close();
+    });
+
+    it('transient retry: a 429 once then success → the item is retried and delivered', async () => {
+      // delayMs is set well BEYOND flushBuffer's 20s advance so the retry timer
+      // does not fire during the flush — we fire it explicitly afterward.
+      const RETRY_MS = 30_000;
+      const limitTracker = makeLimitTracker({ delayMs: RETRY_MS, maxAttempts: 3 });
+      const adapter = makeAdapter('messenger', messengerSupports);
+      adapter.sendText
+        .mockRejectedValueOnce(metaError(429))
+        .mockImplementationOnce(async (recipientId: string) => ({
+          channel: 'messenger' as Channel,
+          messageId: 'messenger-retry-ok',
+          recipientId,
+          timestamp: FIXED_NOW
+        }));
+      const h = makeHarness({
+        responses: [textResponse('hello')],
+        adapters: { messenger: adapter },
+        limitTracker
+      });
+
+      const key = 'messenger:biz-1:fb-user';
+      await h.agent.handleInbound(inbound({ channel: 'messenger', channelMessageId: 'm_t1', channelScopedUserId: 'fb-user' }));
+      await flushBuffer();
+
+      // First send threw → no advance yet; the queue waits on the retry timer.
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      let record = await h.store.getConversation(key);
+      expect(record!.state).toBe('sending');
+      expect(record!.currentOutboundIndex).toBe(0);
+      expect(record!.outboundQueue[0]!.retryCount).toBe(1);
+      expect(record!.outboundQueue[0]!.nextRetryAt).toBe(FIXED_NOW + RETRY_MS);
+
+      // Fire the retry timer → re-send succeeds → queue advances → idle.
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      expect(adapter.sendText).toHaveBeenCalledTimes(2);
+      record = await h.store.getConversation(key);
+      expect(record!.state).toBe('idle');
+      expect(record!.currentOutboundIndex).toBe(1);
+      await h.agent.close();
+    });
+
+    it('retries exhausted: a perpetual transient error skips the item after the cap', async () => {
+      const RETRY_MS = 30_000;
+      const limitTracker = makeLimitTracker({ delayMs: RETRY_MS, maxAttempts: 2 });
+      const adapter = makeAdapter('messenger', messengerSupports);
+      adapter.sendText.mockRejectedValue(metaError(429)); // always transient (rate limited)
+      const h = makeHarness({
+        responses: [textResponse('hello')],
+        adapters: { messenger: adapter },
+        limitTracker
+      });
+
+      const key = 'messenger:biz-1:fb-user';
+      await h.agent.handleInbound(inbound({ channel: 'messenger', channelMessageId: 'm_t2', channelScopedUserId: 'fb-user' }));
+      await flushBuffer();
+
+      // attempt 1 send (the original) failed → retry #1 armed.
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(RETRY_MS); // retry #1 (attempt 1) → fails → retry #2 armed
+      expect(adapter.sendText).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(RETRY_MS); // retry #2 (attempt 2 == cap) → fails → skip
+      expect(adapter.sendText).toHaveBeenCalledTimes(3);
+
+      // The item was skipped and the queue advanced to completion (no infinite loop).
+      await vi.advanceTimersByTimeAsync(RETRY_MS * 2);
+      expect(adapter.sendText).toHaveBeenCalledTimes(3);
+      const record = await h.store.getConversation(key);
+      expect(record!.state).toBe('idle');
+      expect(record!.currentOutboundIndex).toBe(1);
+      expect(record!.outboundQueue[0]!.skipReason).toBeDefined();
+      await h.agent.close();
+    });
+
+    it('window_closed: WhatsApp re-prompts ONCE for a template; a second close just skips', async () => {
+      const limitTracker = makeLimitTracker({
+        classify: (_channel, error) =>
+          error instanceof MetaApiError && error.errorCode === 131047 ? 'window_closed' : 'permanent'
+      });
+      // First send (the original text) throws a closed-window error; the template
+      // sent on the re-prompt succeeds.
+      const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+      adapter.sendText.mockRejectedValueOnce(metaError(470, 131047));
+
+      // The chat client: turn 1 returns text; the re-prompt returns a template.
+      const chat = {
+        complete: vi.fn(),
+        calls: [] as ChatRequest[]
+      };
+      chat.complete.mockImplementation(async (request: ChatRequest) => {
+        chat.calls.push(request);
+        if (request.context.requiresTemplate) {
+          return { actions: [{ type: 'template', name: 'reengage', language: 'en_US' }] } as NormalizedChatResponse;
+        }
+        return textResponse('free-form text');
+      });
+
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const scheduler = new InMemoryBufferScheduler();
+      const config = makeConfig();
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: chat as unknown as ChatClient,
+        adapters: { whatsapp: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config,
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined,
+        limitTracker
+      });
+
+      const key = 'whatsapp:biz-1:user-1';
+      await agent.handleInbound(inbound({ channelMessageId: 'wamid.w1' }));
+      await flushBuffer();
+
+      // The original text send hit a closed window → the agent re-prompted →
+      // got a template → sent the template.
+      expect(chat.complete).toHaveBeenCalledTimes(2);
+      const repromptReq = chat.calls[1]!;
+      expect(repromptReq.context.requiresTemplate).toBe(true);
+      expect(repromptReq.context.windowOpen).toBe(false);
+      expect(adapter.sendTemplate).toHaveBeenCalledTimes(1);
+
+      // The re-prompt's template is WhatsApp on_status: deliver its status so the
+      // queue completes, and confirm the record marked the single re-prompt.
+      const templateId = (await (adapter.sendTemplate!.mock.results[0]!.value as Promise<SendResult>)).messageId;
+      const recordSending = await store.getConversation(key);
+      expect(recordSending!.windowReprompted).toBe(true);
+      await agent.handleStatus(status(templateId, 'delivered'));
+      const recordDone = await store.getConversation(key);
+      expect(recordDone!.state).toBe('idle');
+
+      await agent.close();
+    });
+
+    it('window_closed: a SECOND closed-window error in one turn skips instead of re-prompting again', async () => {
+      const limitTracker = makeLimitTracker({
+        classify: (_channel, error) =>
+          error instanceof MetaApiError && error.errorCode === 131047 ? 'window_closed' : 'permanent'
+      });
+      // BOTH the original text AND the re-prompt's template throw closed-window:
+      // the first triggers a re-prompt, the second (template) must just skip.
+      const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+      adapter.sendText.mockRejectedValueOnce(metaError(470, 131047));
+      adapter.sendTemplate!.mockRejectedValueOnce(metaError(470, 131047));
+
+      const chat = { complete: vi.fn(), calls: [] as ChatRequest[] };
+      chat.complete.mockImplementation(async (request: ChatRequest) => {
+        chat.calls.push(request);
+        if (request.context.requiresTemplate) {
+          return { actions: [{ type: 'template', name: 'reengage', language: 'en_US' }] } as NormalizedChatResponse;
+        }
+        return textResponse('free-form text');
+      });
+
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const scheduler = new InMemoryBufferScheduler();
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: chat as unknown as ChatClient,
+        adapters: { whatsapp: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined,
+        limitTracker
+      });
+
+      const key = 'whatsapp:biz-1:user-1';
+      await agent.handleInbound(inbound({ channelMessageId: 'wamid.w2' }));
+      await flushBuffer();
+
+      // Re-prompted exactly once; the template's own window error did NOT trigger
+      // a second re-prompt — it was skipped and the queue advanced to idle.
+      expect(chat.complete).toHaveBeenCalledTimes(2);
+      expect(adapter.sendTemplate).toHaveBeenCalledTimes(1);
+      const record = await store.getConversation(key);
+      expect(record!.state).toBe('idle');
+      expect(record!.currentOutboundIndex).toBe(1);
+      expect(record!.outboundQueue[0]!.skipReason).toContain('window');
+      await agent.close();
+    });
+
+    it('recoverPendingRetries: re-arms a sending record mid-retry; ignores a non-sending record', async () => {
+      const limitTracker = makeLimitTracker({ delayMs: 1000, maxAttempts: 3 });
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const scheduler = new InMemoryBufferScheduler();
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: makeChatClient([textResponse('unused')]),
+        adapters: { messenger: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined,
+        limitTracker
+      });
+
+      // Seed a `sending` record whose current item is mid-retry (retryCount 1,
+      // nextRetryAt in the past so the re-armed timer fires immediately).
+      const sendingItem: OutboundItem = {
+        id: 'item-1',
+        kind: 'message',
+        text: 'resume me',
+        retryCount: 1,
+        nextRetryAt: FIXED_NOW - 5000
+      };
+      const sending: ConversationRecord = {
+        ...createIdleConversation({
+          key: 'messenger:biz-1:fb-user',
+          channel: 'messenger',
+          channelScopedUserId: 'fb-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'sending',
+        outboundQueue: [sendingItem],
+        currentOutboundIndex: 0
+      };
+      await store.setConversation(sending);
+
+      // A non-sending record must be ignored by recovery.
+      const idle = createIdleConversation({
+        key: 'messenger:biz-1:other',
+        channel: 'messenger',
+        channelScopedUserId: 'other',
+        channelScopedBusinessId: 'biz-1',
+        now: FIXED_NOW
+      });
+      await store.setConversation(idle);
+
+      const result = await agent.recoverPendingRetries();
+      expect(result.transientRetriesResumed).toBe(1);
+
+      // The re-armed timer (remaining delay clamped to 0) fires → the item is re-sent.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(adapter.sendText).toHaveBeenCalledWith('fb-user', 'resume me');
+      const record = await store.getConversation('messenger:biz-1:fb-user');
+      expect(record!.state).toBe('idle');
+      expect(record!.currentOutboundIndex).toBe(1);
+      await agent.close();
+    });
+
+    it('recoverPendingRetries: does NOT re-arm when the store recovery claim is lost (multi-replica guard)', async () => {
+      // Simulate a "losing" replica: the shared store's claimRecovery returns false
+      // (another replica already claimed this retry). The pending retry must NOT be
+      // re-armed here, so the item is never re-sent by this replica — preventing the
+      // N-replica double-send.
+      const limitTracker = makeLimitTracker({ delayMs: 1000, maxAttempts: 3 });
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      // Override the (always-true) in-memory claim with a losing one.
+      store.claimRecovery = async () => false;
+      const scheduler = new InMemoryBufferScheduler();
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: makeChatClient([textResponse('unused')]),
+        adapters: { messenger: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined,
+        limitTracker
+      });
+
+      const sending: ConversationRecord = {
+        ...createIdleConversation({
+          key: 'messenger:biz-1:fb-user',
+          channel: 'messenger',
+          channelScopedUserId: 'fb-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'sending',
+        outboundQueue: [{ id: 'item-1', kind: 'message', text: 'resume me', retryCount: 1, nextRetryAt: FIXED_NOW - 5000 }],
+        currentOutboundIndex: 0
+      };
+      await store.setConversation(sending);
+
+      const result = await agent.recoverPendingRetries();
+      expect(result.transientRetriesResumed).toBe(0);
+
+      // No timer was armed → no re-send by this replica.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(adapter.sendText).not.toHaveBeenCalled();
+      await agent.close();
+    });
+
+    it('recoverPendingRetries: un-wedges a `processing` record stranded by a restart (resets to idle)', async () => {
+      // A `processing` record (chat call was in flight at crash) with both arrays
+      // empty would otherwise wedge forever (no flush is ever scheduled). Recovery
+      // resets it to idle so the NEXT inbound starts a fresh turn.
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const scheduler = new InMemoryBufferScheduler();
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: makeChatClient([textResponse('fresh reply')]),
+        adapters: { messenger: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+
+      const stranded: ConversationRecord = {
+        ...createIdleConversation({
+          key: 'messenger:biz-1:fb-user',
+          channel: 'messenger',
+          channelScopedUserId: 'fb-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'processing'
+      };
+      await store.setConversation(stranded);
+
+      const result = await agent.recoverPendingRetries();
+      expect(result.processingReset).toBe(1);
+      expect((await store.getConversation('messenger:biz-1:fb-user'))!.state).toBe('idle');
+
+      // The conversation is no longer wedged: a fresh inbound flushes normally.
+      await agent.handleInbound(inbound({ channel: 'messenger', channelMessageId: 'm_fresh', channelScopedUserId: 'fb-user' }));
+      await flushBuffer();
+      expect(adapter.sendText).toHaveBeenCalledWith('fb-user', 'fresh reply');
+      await agent.close();
+    });
+
+    it('recoverPendingRetries: a `processing` record with stashed lateArrivals re-buffers + flushes them', async () => {
+      // If messages arrived during the dead chat call (persisted to lateArrivals),
+      // recovery preserves them: fold into the buffer, drop to buffering, flush.
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const scheduler = new InMemoryBufferScheduler();
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: makeChatClient([textResponse('answer to late msg')]),
+        adapters: { messenger: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+
+      const stranded: ConversationRecord = {
+        ...createIdleConversation({
+          key: 'messenger:biz-1:fb-user',
+          channel: 'messenger',
+          channelScopedUserId: 'fb-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'processing',
+        lateArrivals: [inbound({ channel: 'messenger', channelMessageId: 'm_late', channelScopedUserId: 'fb-user', text: 'you there?' })]
+      };
+      await store.setConversation(stranded);
+
+      const result = await agent.recoverPendingRetries();
+      expect(result.processingReset).toBe(1);
+      // The recovery scheduled a flush; let it fire and process the late arrival.
+      await flushBuffer();
+      expect(adapter.sendText).toHaveBeenCalledWith('fb-user', 'answer to late msg');
+      const record = await store.getConversation('messenger:biz-1:fb-user');
+      expect(record!.state).toBe('idle');
+      expect(record!.lateArrivals).toEqual([]);
+      await agent.close();
+    });
+
+    it('recoverPendingRetries: the `processing` claim token includes the per-turn processingNonce', async () => {
+      // The token must be unique per processing entry so a SECOND processing crash
+      // (a later turn, new nonce) is never blocked by a stale claim from an earlier
+      // turn. Concurrent recoveries of the SAME crash share the nonce → dedupe.
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const claimSpy = vi.fn(async () => true);
+      store.claimRecovery = claimSpy;
+      const agent = new ConversationAgent({
+        store,
+        scheduler: new InMemoryBufferScheduler(),
+        chatClient: makeChatClient([textResponse('unused')]),
+        adapters: { messenger: makeAdapter('messenger', messengerSupports) } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+      await store.setConversation({
+        ...createIdleConversation({
+          key: 'messenger:biz-1:fb-user',
+          channel: 'messenger',
+          channelScopedUserId: 'fb-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'processing',
+        processingNonce: 'nonce-abc'
+      });
+      await agent.recoverPendingRetries();
+      expect(claimSpy).toHaveBeenCalledWith('messenger:biz-1:fb-user:processing:nonce-abc', expect.any(Number));
+      await agent.close();
+    });
+
+    it('recoverPendingRetries: re-arms the WhatsApp delivery-timeout for a first-send-crash (advances, no re-send)', async () => {
+      // WhatsApp (on_status) `sending` record: item0 was SENT (channelMessageId +
+      // currentOutboundMessageId) but has NO retryCount/nextRetryAt — the in-memory
+      // delivery-timeout died with the (simulated) old process. Recovery re-arms it so
+      // the queue self-heals: the fallback ADVANCES past the already-sent item0 (no
+      // re-send → no double-send) and sends item1.
+      const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const agent = new ConversationAgent({
+        store,
+        scheduler: new InMemoryBufferScheduler(),
+        chatClient: makeChatClient([textResponse('unused')]),
+        adapters: { whatsapp: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+
+      await store.setConversation({
+        ...createIdleConversation({
+          key: 'whatsapp:biz-1:wa-user',
+          channel: 'whatsapp',
+          channelScopedUserId: 'wa-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'sending',
+        outboundQueue: [
+          { id: 'item-0', kind: 'message', text: 'first', channelMessageId: 'wamid.sent', sentAt: FIXED_NOW },
+          { id: 'item-1', kind: 'message', text: 'second' }
+        ],
+        currentOutboundIndex: 0,
+        currentOutboundMessageId: 'wamid.sent',
+        lastInboundMessageId: 'wamid.in'
+      });
+
+      const result = await agent.recoverPendingRetries();
+      expect(result.deliveryTimeoutsRearmed).toBe(1);
+      expect(adapter.sendText).not.toHaveBeenCalled(); // nothing re-sent on re-arm
+
+      // Fire the re-armed fallback → advance past item0 (NOT re-sent) → send item1.
+      await vi.advanceTimersByTimeAsync(makeConfig().conversation.outboundDeliveryTimeoutMs);
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(adapter.sendText).toHaveBeenCalledWith('wa-user', 'second');
+      await agent.close();
+    });
+
+    it('recoverPendingRetries: a SENT WhatsApp item with STALE retry fields is NOT re-sent (B1 guard → B2)', async () => {
+      // Double-send regression: a WhatsApp item that was retried, SUCCEEDED
+      // (channelMessageId set), then crashed awaiting its status could still carry
+      // retryCount/nextRetryAt. B1 must NOT match (that would RE-SEND it); the
+      // `channelMessageId === undefined` guard sends it to B2 (delivery-timeout
+      // re-arm), which advances past the already-sent item without re-sending.
+      const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const agent = new ConversationAgent({
+        store,
+        scheduler: new InMemoryBufferScheduler(),
+        chatClient: makeChatClient([textResponse('unused')]),
+        adapters: { whatsapp: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined,
+        limitTracker: makeLimitTracker()
+      });
+
+      await store.setConversation({
+        ...createIdleConversation({
+          key: 'whatsapp:biz-1:wa-user',
+          channel: 'whatsapp',
+          channelScopedUserId: 'wa-user',
+          channelScopedBusinessId: 'biz-1',
+          now: FIXED_NOW
+        }),
+        state: 'sending',
+        outboundQueue: [
+          // SENT (channelMessageId set) but still carrying stale retry bookkeeping.
+          { id: 'item-0', kind: 'message', text: 'first', channelMessageId: 'wamid.sent', sentAt: FIXED_NOW, retryCount: 1, nextRetryAt: FIXED_NOW - 1000 },
+          { id: 'item-1', kind: 'message', text: 'second' }
+        ],
+        currentOutboundIndex: 0,
+        currentOutboundMessageId: 'wamid.sent',
+        lastInboundMessageId: 'wamid.in'
+      });
+
+      const result = await agent.recoverPendingRetries();
+      // B1 was skipped (item already sent) → B2 re-armed the delivery timeout instead.
+      expect(result.transientRetriesResumed).toBe(0);
+      expect(result.deliveryTimeoutsRearmed).toBe(1);
+      expect(adapter.sendText).not.toHaveBeenCalled(); // item0 NOT re-sent
+
+      // The fallback advances past the already-sent item0 and sends only item1.
+      await vi.advanceTimersByTimeAsync(makeConfig().conversation.outboundDeliveryTimeoutMs);
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(adapter.sendText).toHaveBeenCalledWith('wa-user', 'second');
+      await agent.close();
+    });
   });
 });
 

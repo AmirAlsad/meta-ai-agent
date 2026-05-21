@@ -27,10 +27,11 @@
  * `handle*` method.
  */
 
+import { randomUUID } from 'node:crypto';
 import type pino from 'pino';
 import type { ChatClient } from '../chat/client.js';
 import { ChatEndpointError } from '../chat/errors.js';
-import type { ChatRequest } from '../chat/types.js';
+import type { ChatRequest, NormalizedChatResponse } from '../chat/types.js';
 import type { Config } from '../config/loader.js';
 import {
   advanceCursor,
@@ -54,6 +55,7 @@ import type { WhatsAppClient } from '../meta/whatsapp/client.js';
 import type { AgentMetrics } from '../metrics/registry.js';
 import { normalizeErrorCodeLabel } from '../metrics/registry.js';
 import type { IdentityResolver } from '../identity/resolver.js';
+import type { LimitTracker } from '../limits/tracker.js';
 import type { StatusTracker } from '../status/tracker.js';
 import { calculateBufferTimeout } from './buffering.js';
 import type { BufferScheduler } from './scheduler.js';
@@ -122,6 +124,18 @@ const MAX_EXPLICIT_TYPING_DURATION_MS = 10_000;
  */
 const MAX_REPROCESS = 5;
 
+/**
+ * Floor for the boot-recovery claim TTL (seconds) — covers the simultaneous-boot
+ * race window across replicas plus the quick un-wedge action. Kept SHORT (not the
+ * conversation lifetime) so a claimer that crashes before completing recovery
+ * doesn't block every other replica from re-recovering for hours; see
+ * {@link ConversationAgent.recoverPendingRetries}.
+ */
+const RECOVERY_CLAIM_MIN_TTL_SECONDS = 120;
+
+/** Grace added past a transient retry's remaining delay when sizing its claim TTL. */
+const RECOVERY_CLAIM_GRACE_SECONDS = 60;
+
 export interface ConversationAgentDeps {
   store: ConversationStore;
   scheduler: BufferScheduler;
@@ -155,6 +169,17 @@ export interface ConversationAgentDeps {
    * `config.conversation.inboundMediaDownload` is true. Fail-open: never throws.
    */
   mediaHydrator?: InboundMediaHydrator;
+  /**
+   * OPTIONAL Stage 10 limits surface — additive. Absent ⇒ no outbound pacing, no
+   * transient retry (a failed send is skipped immediately, exactly as Stage 5),
+   * and no WhatsApp out-of-window re-prompt (a closed-window error is also just
+   * skipped). When present, `sendNext` acquires a pacing slot before each
+   * outbound MESSAGE send, classifies send errors (transient / window_closed /
+   * permanent), retries transient failures up to the configured cap, and
+   * re-prompts ONCE on a WhatsApp closed window. `buildRuntime` constructs one
+   * unconditionally (it fail-opens), so this is wired in production.
+   */
+  limitTracker?: LimitTracker;
 }
 
 export class ConversationAgent {
@@ -172,6 +197,8 @@ export class ConversationAgent {
   private readonly identityResolver?: IdentityResolver;
   private readonly statusTracker?: StatusTracker;
   private readonly mediaHydrator?: InboundMediaHydrator;
+  /** OPTIONAL Stage 10 limits surface — undefined ⇒ no pacing/retry/window re-prompt. */
+  private readonly limitTracker?: LimitTracker;
 
   /**
    * Per-conversation delivery-timeout fallback timers, keyed by conversation
@@ -179,6 +206,27 @@ export class ConversationAgent {
    * never arrives, the timer advances the queue so it cannot wedge forever.
    */
   private readonly deliveryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * Per-conversation transient-retry timers, keyed by conversation key (Stage 10).
+   * Armed by {@link scheduleTransientRetry} when a transient send error leaves the
+   * in-flight item to be re-sent after a backoff delay. Clear-before-arm (one per
+   * key, mirroring {@link startDeliveryTimeout}) so a key never has two outstanding
+   * retry timers. The timer is a true ENTRY POINT (fires outside any held lock), so
+   * it re-acquires the per-key lock before running {@link runTransientRetryImpl}.
+   */
+  private readonly transientRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * The original {@link ChatRequest} for the turn currently `sending`, kept so a
+   * WhatsApp out-of-window failure can re-prompt the chat endpoint with the SAME
+   * input (asking it to reply with a template). In-memory ONLY — lost on restart,
+   * which is fine: the re-prompt is a same-turn best-effort recovery, not durable
+   * state. Set in {@link flushImpl} when a turn commits to sending; cleared at
+   * every turn boundary ({@link finalizeTurn} / {@link transitionToIdle} /
+   * {@link interruptSending} / {@link close}).
+   */
+  private readonly pendingRequests = new Map<string, ChatRequest>();
 
   /**
    * Per-conversation-key {@link AbortController} for the chat call currently in
@@ -221,6 +269,7 @@ export class ConversationAgent {
     this.identityResolver = deps.identityResolver;
     this.statusTracker = deps.statusTracker;
     this.mediaHydrator = deps.mediaHydrator;
+    this.limitTracker = deps.limitTracker;
 
     // Register the buffer-flush handler exactly once. The scheduler fires this
     // after a conversation's burst window elapses (see calculateBufferTimeout).
@@ -247,8 +296,11 @@ export class ConversationAgent {
   /*  ACQUIRE the lock (true entry points, each fired OUTSIDE any held lock): */
   /*    • handleInbound, handleStatus            (public; called by the HTTP   */
   /*      dispatcher concurrently per webhook)                                 */
+  /*    • recoverPendingRetries                  (public; called once at boot) */
   /*    • the delivery-timeout callback          (startDeliveryTimeout's       */
   /*      setTimeout; fired by a delivery timer)                               */
+  /*    • the transient-retry callback           (scheduleTransientRetry's     */
+  /*      setTimeout; fired by a retry timer — Stage 10)                       */
   /*    • handleReaction DOES NOT acquire — it delegates to handleInbound,     */
   /*      which acquires, so it inherits the lock (acquiring here too would    */
   /*      deadlock the chain: a holder calling a same-key acquirer).           */
@@ -264,7 +316,10 @@ export class ConversationAgent {
   /*  they assume the lock is already held):                                   */
   /*    • sendNext, advanceAndContinue, markSkippedAndAdvance,                 */
   /*      transitionToIdle, onDeliveryTimeoutImpl, handleInboundImpl,          */
-  /*      handleStatusImpl, interruptSending                                   */
+  /*      handleStatusImpl, interruptSending, finalizeTurn,                    */
+  /*      scheduleTransientRetry, runTransientRetryImpl, handleWindowClosed    */
+  /*      (the last three are Stage 10: each is called from sendNext or a      */
+  /*      timer's runExclusive, so the lock is already held)                   */
   /*                                                                          */
   /*  NO-DEADLOCK INVARIANT: no lock-holding (acquired) path ever calls        */
   /*  another lock-acquiring method for the SAME key. The acquiring methods    */
@@ -562,6 +617,10 @@ export class ConversationAgent {
   ): Promise<void> {
     const key = record.key;
     this.clearDeliveryTimeout(key);
+    // Stage 10: the old turn is being abandoned — cancel any pending retry timer
+    // and drop its stashed re-prompt request so a fresh rebatched turn starts clean.
+    this.clearTransientRetryTimer(key);
+    this.pendingRequests.delete(key);
     if (record.currentOutboundMessageId !== undefined) {
       await this.store.deleteOutboundHandleMapping(record.currentOutboundMessageId);
     }
@@ -659,6 +718,12 @@ export class ConversationAgent {
         record.inboundBuffer = [];
         record.lateArrivals = [];
         record.state = 'processing';
+        // Stamp a fresh per-turn nonce so boot recovery's `processing` claim token
+        // is UNIQUE to THIS processing entry. Two replicas recovering the SAME
+        // crash read the same nonce (so exactly one wins); a LATER processing turn
+        // gets a new nonce, so its recovery is never blocked by a stale claim from
+        // an earlier turn (see recoverPendingRetries).
+        record.processingNonce = randomUUID();
         await this.store.setConversation(record);
 
         // COMMITTED FLUSH: once a turn has hit the reprocess cap, this flush MUST
@@ -892,6 +957,11 @@ export class ConversationAgent {
         record.outboundQueue = items;
         record.currentOutboundIndex = 0;
         delete record.currentOutboundMessageId;
+        // Stage 10: a fresh turn may re-prompt on a closed window again — reset the
+        // single-re-prompt guard. Stash the original request so handleWindowClosed
+        // can re-prompt with the same input if a send hits a closed window.
+        record.windowReprompted = false;
+        this.pendingRequests.set(key, prep.request);
         // The chat call produced deliverable output — reset the reprocess counter
         // (the cap counts only consecutive aborts within one turn). Any `lateArrivals`
         // are deliberately LEFT on the record: `finalizeTurn` (run when the queue
@@ -978,6 +1048,27 @@ export class ConversationAgent {
     // (e.g. `media:image`) so the per-kind send is visible; everything else uses
     // the bare item kind.
     let operation: string = item.kind;
+    // PRE-SEND PACING (Stage 10): reserve a per-line pacing slot before any item
+    // that makes a real Graph API send — `message`/`reply`/`template`/`media` AND
+    // `reaction` (a reaction is a Graph call too: it counts toward Meta's per-channel
+    // rate, so a reaction-heavy turn left unpaced could contribute to app-level 429s).
+    // EXCLUDED: `typing` (a best-effort UX side-effect already spaced by its own
+    // pre-message delay; pacing it would only push back the real message) and
+    // `silence` (no send). The lock is HELD while acquireSendSlot awaits its internal
+    // pacing sleep — that delays ONLY this conversation (the lock is per-key), exactly
+    // like the typing-delay sleep above. acquireSendSlot is contractually fail-open
+    // (never throws), so no try/catch is needed here.
+    if (
+      this.limitTracker &&
+      (item.kind === 'message' ||
+        item.kind === 'reply' ||
+        item.kind === 'template' ||
+        item.kind === 'media' ||
+        item.kind === 'reaction')
+    ) {
+      await this.limitTracker.acquireSendSlot(record.channel, record.channelScopedBusinessId);
+    }
+
     // Time each adapter (Meta Graph API) call; injectable clock keeps it
     // deterministic in tests.
     const sendT0 = this.now();
@@ -1081,12 +1172,32 @@ export class ConversationAgent {
         error_code: errorCode
       });
       if (error instanceof MetaApiError) {
-        logger.error({ err: error, conversationKey: key, kind: item.kind }, 'outbound send failed; skipping item');
+        logger.error({ err: error, conversationKey: key, kind: item.kind }, 'outbound send failed');
       } else {
-        logger.error({ err: error, conversationKey: key, kind: item.kind }, 'unexpected outbound send error; skipping item');
+        logger.error({ err: error, conversationKey: key, kind: item.kind }, 'unexpected outbound send error');
       }
-      // Stage 5 fail-soft: mark the item skipped and advance so one bad send
-      // never wedges the rest of the queue. Stage 10 adds proper retry.
+
+      // CLASSIFICATION-DRIVEN ROUTING (Stage 10). Without a limit tracker every
+      // error is treated as `permanent` (Stage 5 behavior: skip + advance). With
+      // one, route by the tracker's verdict: a closed WhatsApp window re-prompts
+      // for a template, a transient failure retries with backoff up to the cap,
+      // and anything else (or an exhausted retry) falls through to the skip.
+      const classification = this.limitTracker ? this.limitTracker.classifyError(record.channel, error) : 'permanent';
+      if (classification === 'window_closed') {
+        await this.handleWindowClosed(key, traceId);
+        return;
+      }
+      if (classification === 'transient') {
+        const attempt = (item.retryCount ?? 0) + 1;
+        if (attempt <= this.limitTracker!.transientRetryMaxAttempts()) {
+          await this.scheduleTransientRetry(key, attempt, item.id, traceId);
+          return;
+        }
+        // retries exhausted → fall through to skip+advance below.
+      }
+      // Permanent error, or a transient error whose retries are exhausted:
+      // Stage 5 fail-soft — mark the item skipped and advance so one bad send
+      // never wedges the rest of the queue.
       await this.markSkippedAndAdvance(key, error instanceof Error ? error.message : 'send failed', traceId);
       return;
     }
@@ -1102,6 +1213,13 @@ export class ConversationAgent {
         if (sentItem) {
           sentItem.channelMessageId = sentMessageId;
           sentItem.sentAt = this.now();
+          // ROOT-CAUSE clear (double-send safety): once an item has SENT, drop its
+          // transient-retry bookkeeping so a later boot recovery can never mistake a
+          // successfully-sent item (e.g. a WhatsApp item awaiting its status) for a
+          // pending retry and re-send it. Pairs with the `channelMessageId === undefined`
+          // guard in recoverPendingRetries (B1) as defense-in-depth.
+          delete sentItem.retryCount;
+          delete sentItem.nextRetryAt;
         }
         await this.store.setConversation(after);
       }
@@ -1203,6 +1321,342 @@ export class ConversationAgent {
       await this.store.setConversation(record);
     }
     await this.advanceAndContinue(key, undefined, traceId);
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /* Transient retry (Stage 10)                                                */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Stamp the in-flight item with its retry bookkeeping and arm a backoff timer
+   * to re-send it. LOCK-FREE: only ever called from {@link sendNext}'s catch with
+   * the per-key lock held. Does NOT advance the cursor — the turn stays `sending`
+   * on the same item, which the timer re-sends via {@link runTransientRetryImpl}.
+   */
+  private async scheduleTransientRetry(key: string, attempt: number, itemId: string, traceId?: string): Promise<void> {
+    const logger = this.childLogger(traceId);
+    const record = await this.store.getConversation(key);
+    if (!record) return;
+    const item = record.outboundQueue[record.currentOutboundIndex];
+    // STALE guard: the queue moved past this item between the failed send and
+    // here (e.g. an interrupt rolled the turn back). Don't re-arm against it.
+    if (!item || item.id !== itemId) return;
+
+    const delay = this.limitTracker!.retryDelayMs(attempt);
+    item.retryCount = attempt;
+    item.nextRetryAt = this.now() + delay;
+    await this.store.setConversation(record);
+
+    logger.warn(
+      { conversationKey: key, attempt, delayMs: delay, itemId },
+      'scheduling transient retry'
+    );
+
+    // A failed send never armed a delivery-timeout (that timer is armed only
+    // AFTER a successful WhatsApp send), but clear defensively so the retry timer
+    // is the sole outstanding timer for this item.
+    this.clearDeliveryTimeout(key);
+    this.armTransientRetryTimer(key, itemId, attempt, delay, traceId);
+  }
+
+  /**
+   * Arm (clear-before-arm, one per key) the transient-retry timer. Factored out
+   * of {@link scheduleTransientRetry} so {@link recoverPendingRetries} can re-arm
+   * with an explicit remaining delay after a restart. The timer is a true ENTRY
+   * POINT (fires outside any held lock), so it ACQUIRES the per-key lock before
+   * running the lock-free {@link runTransientRetryImpl}.
+   */
+  private armTransientRetryTimer(
+    key: string,
+    itemId: string,
+    attempt: number,
+    delayMs: number,
+    traceId?: string
+  ): void {
+    this.clearTransientRetryTimer(key);
+    const handle = setTimeout(() => {
+      this.transientRetryTimers.delete(key);
+      this.runExclusive(key, () => this.runTransientRetryImpl(key, itemId, attempt, traceId)).catch(error =>
+        this.logger.warn({ err: error, conversationKey: key }, 'transient-retry handling failed')
+      );
+    }, delayMs);
+    this.transientRetryTimers.set(key, handle);
+  }
+
+  private clearTransientRetryTimer(key: string): void {
+    const handle = this.transientRetryTimers.get(key);
+    if (handle) clearTimeout(handle);
+    this.transientRetryTimers.delete(key);
+  }
+
+  /**
+   * Fired when a transient-retry backoff elapses; re-sends the item at the cursor.
+   * LOCK-FREE / INTERNAL: only ever reached via the setTimeout in
+   * {@link armTransientRetryTimer}, which wraps it in {@link runExclusive}.
+   *
+   * Re-validates that the world has not moved on (the turn is still `sending`, the
+   * in-flight item is the SAME one, and its `retryCount` matches what we armed). If
+   * any of those changed (an interrupt/advance happened), the timer is STALE — do
+   * nothing. Otherwise re-send via {@link sendNext}, which on success advances and,
+   * on another transient failure, re-enters the catch and may reschedule up to the
+   * cap.
+   */
+  private async runTransientRetryImpl(key: string, itemId: string, attempt: number, traceId?: string): Promise<void> {
+    const record = await this.store.getConversation(key);
+    if (!record || record.state !== 'sending') return;
+    const item = record.outboundQueue[record.currentOutboundIndex];
+    if (!item || item.id !== itemId || (item.retryCount ?? 0) !== attempt) return;
+    await this.sendNext(key, traceId);
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /* WhatsApp out-of-window re-prompt (Stage 10)                              */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Handle a WhatsApp `window_closed` send failure: re-prompt the chat endpoint
+   * ONCE for the same turn (signalling it to reply with a template, since a
+   * free-form text would fail again), then deliver whatever it returns. Bounded
+   * and fail-soft — anything unexpected ends in a skip+advance so the queue never
+   * wedges. LOCK-FREE: called from {@link sendNext}'s catch with the per-key lock
+   * held; every record read-modify-write below is part of that critical section.
+   */
+  private async handleWindowClosed(key: string, traceId?: string): Promise<void> {
+    const logger = this.childLogger(traceId);
+    try {
+      let record = await this.store.getConversation(key);
+      // Re-prompt ONLY on WhatsApp, ONLY once per turn. A non-WhatsApp channel
+      // shouldn't reach here (classifyError only returns window_closed for
+      // whatsapp), but guard anyway. A second window_closed (already reprompted)
+      // just skips so we never loop.
+      if (!record || record.channel !== 'whatsapp' || record.windowReprompted === true) {
+        await this.markSkippedAndAdvance(key, 'whatsapp messaging window closed', traceId);
+        return;
+      }
+      const original = this.pendingRequests.get(key);
+      if (!original) {
+        // Can't re-prompt without the original request (e.g. lost on restart).
+        await this.markSkippedAndAdvance(key, 'whatsapp messaging window closed', traceId);
+        return;
+      }
+
+      record.windowReprompted = true;
+      await this.store.setConversation(record);
+
+      const repromptRequest: ChatRequest = {
+        ...original,
+        context: { ...original.context, windowOpen: false, requiresTemplate: true }
+      };
+
+      logger.warn({ conversationKey: key }, 'whatsapp window closed; re-prompting chat endpoint for a template');
+
+      // NB: this chat call runs UNDER the held per-key lock (no abort signal — it
+      // is a bounded follow-on; the chat client has its own timeout). That is
+      // acceptable because this is a rare edge path, mirroring how on_send
+      // channels already drain their whole queue under one held lock.
+      let resp: NormalizedChatResponse;
+      try {
+        resp = await this.chatClient.complete(repromptRequest);
+      } catch (err) {
+        logger.warn({ err, conversationKey: key }, 'window re-prompt chat call failed; skipping item');
+        await this.markSkippedAndAdvance(key, 'whatsapp messaging window closed', traceId);
+        return;
+      }
+
+      // Reload after the (lock-held but awaited) chat call so we mutate fresh state.
+      record = await this.store.getConversation(key);
+      if (!record) return;
+
+      if (resp.silence === true || resp.actions.length === 0) {
+        await this.finalizeTurn(record, traceId);
+        return;
+      }
+      const adapter = this.adapters[record.channel];
+      if (!adapter) {
+        await this.finalizeTurn(record, traceId);
+        return;
+      }
+      const { items } = buildOutboundItems(resp.actions, f => adapter.supports(f));
+      if (items.length === 0) {
+        await this.finalizeTurn(record, traceId);
+        return;
+      }
+
+      // REPLACE the queue with the re-prompt's items and re-drive delivery. The
+      // failed item is dropped; the new queue (ideally a template) takes over.
+      record.outboundQueue = items;
+      record.currentOutboundIndex = 0;
+      delete record.currentOutboundMessageId;
+      await this.store.setConversation(record);
+      await this.sendNext(key, traceId);
+    } catch (error) {
+      // Fail-soft: never throw out of the send path. On an unexpected error,
+      // skip+advance so the queue can make progress.
+      logger.error({ err: error, conversationKey: key }, 'window-closed handling failed; skipping item');
+      await this.markSkippedAndAdvance(key, 'whatsapp messaging window closed', traceId).catch(() => {
+        /* best-effort cleanup; original error already logged. */
+      });
+    }
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────── */
+  /* Boot recovery (Stage 10)                                                  */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Boot recovery for conversations stranded by a process restart. PUBLIC ENTRY
+   * POINT — the runtime calls this once at boot. Each per-key scan runs under
+   * {@link runExclusive} (it is an entry point) and is fail-soft so one bad record
+   * cannot sink recovery. Three cases:
+   *
+   *  - `sending` mid-retry (B1): an in-flight item with `nextRetryAt` + `retryCount > 0`
+   *    whose backoff timer (in-process) died with the old process. Re-arm it with
+   *    the remaining delay.
+   *  - `sending` awaiting a WhatsApp delivery status (B2, the "first-send crash" gap):
+   *    an on_status item that was SENT (`currentOutboundMessageId` set) but whose
+   *    in-memory delivery-timeout fallback died with the process — the queue would sit
+   *    in `sending` until the next inbound. Re-arm the delivery timeout so it ADVANCES
+   *    past the already-sent item (no re-send → no double-send). Messenger/Instagram
+   *    (on_send) have no such timer and self-heal on the next inbound via
+   *    `interruptSending` — see KNOWN-GAPS.
+   *  - `processing` stranded: the chat call was in flight when the process died, so
+   *    the local batch snapshot is gone AND nothing will ever flush this record —
+   *    `handleInbound`'s `processing` branch only stashes to `lateArrivals` and
+   *    aborts a now-absent controller, so the conversation would WEDGE until TTL.
+   *    Un-wedge it: fold any `lateArrivals` (messages that arrived during the dead
+   *    chat call and WERE persisted) back into the buffer and reschedule a flush;
+   *    if there are none, reset to `idle` so the next inbound starts fresh. The
+   *    original (snapshotted, never-persisted) chat-call batch is lost — an inherent
+   *    at-least-once limitation of the snapshot-clears-buffer design; see KNOWN-GAPS.
+   *
+   * MULTI-REPLICA DOUBLE-SEND/DOUBLE-RECOVERY GUARD: on a shared Redis every replica
+   * runs this at boot and the per-process `runExclusive` lock is NOT distributed, so
+   * each recovery action is gated behind an atomic `store.claimRecovery(token, ttl)`
+   * — exactly one replica acts. The in-memory store is single-process and always
+   * wins (and wipes state on restart anyway, so it yields nothing to recover and
+   * returns all-zero counts). A store without `claimRecovery` falls back to true.
+   */
+  async recoverPendingRetries(): Promise<{
+    transientRetriesResumed: number;
+    processingReset: number;
+    deliveryTimeoutsRearmed: number;
+  }> {
+    let transientRetriesResumed = 0;
+    let processingReset = 0;
+    let deliveryTimeoutsRearmed = 0;
+    // CLAIM TTL is deliberately SHORT (not conversationTtlSeconds): the claim only
+    // needs to survive the simultaneous-boot race window AND until the recovered
+    // action (retry fire / un-wedge) completes. If the WINNING replica crashes
+    // before then, a long TTL would block every other replica from re-recovering
+    // for 24h — re-wedging the conversation. A short TTL bounds that orphan window
+    // so a later restart can re-claim. RECOVERY_CLAIM_MIN_TTL_SECONDS covers the
+    // boot race; the `sending` branch extends it to cover the remaining retry delay.
+    const claim = (token: string, ttlSeconds: number): Promise<boolean> =>
+      this.store.claimRecovery ? this.store.claimRecovery(token, ttlSeconds) : Promise.resolve(true);
+    for await (const key of this.store.listConversationKeys()) {
+      try {
+        const outcome = await this.runExclusive(key, async (): Promise<'sending' | 'processing' | 'delivery' | 'none'> => {
+          const record = await this.store.getConversation(key);
+          if (!record) return 'none';
+
+          // (A) `processing` stranded by a restart — un-wedge it (claim-guarded).
+          // The un-wedge action is quick, so the min TTL (boot-race grace) suffices.
+          // The claim token carries the per-turn `processingNonce` so it is UNIQUE
+          // to this processing entry: concurrent recoveries of the same crash share
+          // the nonce (one wins), while a LATER processing turn gets a fresh nonce
+          // and is never blocked by a stale claim from an earlier turn. (A record
+          // written before this field existed has no nonce — fall back to a constant;
+          // such a record predates this code path and won't recur.)
+          if (record.state === 'processing') {
+            const procToken = `${key}:processing:${record.processingNonce ?? 'legacy'}`;
+            if (!(await claim(procToken, RECOVERY_CLAIM_MIN_TTL_SECONDS))) return 'none';
+            this.clearDeliveryTimeout(key);
+            this.clearTransientRetryTimer(key);
+            this.pendingRequests.delete(key);
+            delete record.currentOutboundMessageId;
+            record.reprocessCount = 0;
+            record.outboundQueue = [];
+            record.currentOutboundIndex = 0;
+            if (record.lateArrivals.length > 0) {
+              record.inboundBuffer = [...record.inboundBuffer, ...record.lateArrivals];
+              record.lateArrivals = [];
+              record.state = 'buffering';
+              record.lastActivity = this.now();
+              await this.store.setConversation(record);
+              const delayMs = calculateBufferTimeout(record.inboundBuffer.length, this.config.conversation, this.random);
+              await this.scheduler.schedule(key, delayMs, record.traceId !== undefined ? { traceId: record.traceId } : undefined);
+            } else {
+              record.state = 'idle';
+              record.lastActivity = this.now();
+              await this.store.setConversation(record);
+            }
+            return 'processing';
+          }
+
+          if (record.state !== 'sending') return 'none';
+          const item = record.outboundQueue[record.currentOutboundIndex];
+          if (!item) return 'none';
+
+          // (B1) `sending` mid-retry — re-arm the transient-retry timer (claim-guarded,
+          // scoped to THIS attempt {key}:{itemId}:{retryCount} so a later restart with
+          // a new attempt claims a fresh token).
+          //
+          // LOAD-BEARING `channelMessageId === undefined` guard (double-send safety):
+          // re-arm a transient retry (which RE-SENDS) ONLY for an item that was NOT yet
+          // sent. `channelMessageId` is set only AFTER a successful send. A retry whose
+          // send already SUCCEEDED — then sat awaiting a WhatsApp status when the process
+          // died — still carries `retryCount`/`nextRetryAt` (sendNext clears them on
+          // success, but a record persisted by an older build, or any gap, could retain
+          // them). Without this guard B1 would match and re-send it (DOUBLE-SEND), and
+          // B2 (the safe delivery-timeout re-arm) would never be reached. With it, an
+          // already-sent item falls through to B2 instead.
+          if (item.nextRetryAt !== undefined && (item.retryCount ?? 0) > 0 && item.channelMessageId === undefined) {
+            // Compute remainingMs BEFORE the claim so it drives the claim TTL too:
+            // expire the claim shortly after the retry would have fired (+grace), so a
+            // crashed claimer doesn't block re-recovery for the conversation lifetime.
+            const remainingMs = Math.max(0, item.nextRetryAt - this.now());
+            const claimTtlSeconds = Math.max(
+              Math.ceil(remainingMs / 1000) + RECOVERY_CLAIM_GRACE_SECONDS,
+              RECOVERY_CLAIM_MIN_TTL_SECONDS
+            );
+            if (!(await claim(`${key}:${item.id}:${item.retryCount ?? 0}`, claimTtlSeconds))) return 'none';
+            // Re-arm with the remaining delay (clamped to >= 0 so an overdue retry fires promptly).
+            this.armTransientRetryTimer(key, item.id, item.retryCount ?? 0, remainingMs, record.traceId);
+            return 'sending';
+          }
+
+          // (B2) `sending` awaiting a WhatsApp (on_status) delivery status whose
+          // in-memory fallback timer DIED with the process — the "first-send crash"
+          // gap. Without the timer the queue would sit in `sending` until the next
+          // inbound triggers interruptSending. Re-arm the delivery-timeout fallback so
+          // the queue self-heals: when it fires, `onDeliveryTimeoutImpl` ADVANCES past
+          // the already-sent item (it does NOT re-send it — so no double-send) and
+          // drives the rest of the queue. Guarded by the current-index check + claim.
+          // Only meaningful when the item was actually sent (currentOutboundMessageId
+          // set) and the channel waits on a status. The durable outbound-handle mapping
+          // means a freshly-arriving status can still advance it too — both paths are
+          // idempotent via the index guard. Messenger/Instagram (on_send) have no such
+          // timer and self-heal on the next inbound (interruptSending) — see KNOWN-GAPS.
+          if (
+            advancementMode(record.channel) === 'on_status' &&
+            record.currentOutboundMessageId !== undefined
+          ) {
+            if (!(await claim(`${key}:delivery:${record.currentOutboundMessageId}`, RECOVERY_CLAIM_MIN_TTL_SECONDS))) {
+              return 'none';
+            }
+            this.startDeliveryTimeout(key, record.currentOutboundIndex, record.traceId);
+            return 'delivery';
+          }
+          return 'none';
+        });
+        if (outcome === 'sending') transientRetriesResumed += 1;
+        else if (outcome === 'processing') processingReset += 1;
+        else if (outcome === 'delivery') deliveryTimeoutsRearmed += 1;
+      } catch (error) {
+        this.logger.warn({ err: error, conversationKey: key }, 'recoverPendingRetries: skipping bad record');
+      }
+    }
+    return { transientRetriesResumed, processingReset, deliveryTimeoutsRearmed };
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */
@@ -1473,9 +1927,13 @@ export class ConversationAgent {
   /* Helpers + lifecycle                                                       */
   /* ──────────────────────────────────────────────────────────────────────── */
 
-  /** Reset a conversation to `idle`, clearing any in-flight delivery timer. */
+  /** Reset a conversation to `idle`, clearing any in-flight delivery/retry timer. */
   private async transitionToIdle(key: string): Promise<void> {
     this.clearDeliveryTimeout(key);
+    // Stage 10: this is a turn boundary — clear the retry timer + the stashed
+    // request so a settled turn leaves no dangling retry or re-prompt state.
+    this.clearTransientRetryTimer(key);
+    this.pendingRequests.delete(key);
     const record = await this.store.getConversation(key);
     if (!record) return;
     record.state = 'idle';
@@ -1503,6 +1961,10 @@ export class ConversationAgent {
   private async finalizeTurn(record: ConversationRecord, traceId?: string): Promise<void> {
     const key = record.key;
     this.clearDeliveryTimeout(key);
+    // Stage 10: the current turn's SENDING is over (whatever follows is a fresh
+    // turn), so clear its retry timer + stashed re-prompt request here.
+    this.clearTransientRetryTimer(key);
+    this.pendingRequests.delete(key);
     record.reprocessCount = 0;
     delete record.currentOutboundMessageId;
     if (record.lateArrivals.length > 0) {
@@ -1605,10 +2067,18 @@ export class ConversationAgent {
     return traceId !== undefined ? this.logger.child({ traceId }) : this.logger;
   }
 
-  /** Clear all delivery timers, abort in-flight chats, and close the scheduler. */
+  /**
+   * Clear all delivery + transient-retry timers, abort in-flight chats, drop
+   * stashed requests, and close the scheduler / store / limit tracker.
+   */
   async close(): Promise<void> {
     for (const handle of this.deliveryTimeouts.values()) clearTimeout(handle);
     this.deliveryTimeouts.clear();
+    // Stage 10: cancel every outstanding transient-retry timer + drop the stashed
+    // re-prompt requests so shutdown leaves no dangling timer or in-memory state.
+    for (const handle of this.transientRetryTimers.values()) clearTimeout(handle);
+    this.transientRetryTimers.clear();
+    this.pendingRequests.clear();
     // RESOURCE: abort every in-flight chat call so shutdown cancels the underlying
     // HTTP request rather than leaving an open socket to a slow chat endpoint
     // dangling past close(). Each abort just rejects the awaiting flush (handled as
@@ -1623,5 +2093,9 @@ export class ConversationAgent {
     }
     this.inFlightChatAborts.clear();
     await this.scheduler.close();
+    // Stage 10: release durable resources where present (both may be no-ops /
+    // absent). Guard each so one failing close can't block the rest of shutdown.
+    await this.store.close?.();
+    await this.limitTracker?.close?.();
   }
 }

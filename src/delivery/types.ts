@@ -63,6 +63,18 @@ export interface OutboundItem {
   skippedAt?: number;
   /** Human-readable reason the item was skipped. */
   skipReason?: string;
+  /**
+   * Number of transient retries already ATTEMPTED for this item (Stage 10). 0 /
+   * absent means no retry yet. Bumped by the agent each time a transient send
+   * error reschedules the item; bounded by `LimitTracker.transientRetryMaxAttempts()`.
+   */
+  retryCount?: number;
+  /**
+   * Unix milliseconds the next transient retry is scheduled to fire (Stage 10).
+   * Persisted on the record so boot recovery (`recoverPendingRetries`) can re-arm
+   * the retry timer for a `sending` turn that was interrupted by a restart.
+   */
+  nextRetryAt?: number;
 }
 
 /**

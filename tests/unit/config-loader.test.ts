@@ -6,7 +6,12 @@
  * and the bumped Graph API default.
  */
 import { describe, expect, it } from 'vitest';
-import { loadConfig } from '../../src/config/loader.js';
+import {
+  defaultLimitsConfig,
+  defaultPersistenceConfig,
+  loadConfig,
+  tokenFormatWarnings
+} from '../../src/config/loader.js';
 
 /**
  * A minimal env that satisfies every required loader rule EXCEPT the one
@@ -349,5 +354,255 @@ describe('loadConfig: AGENT_AUTOSTART (unchanged after loadBoolean refactor)', (
     expect(() => loadConfig(baseEnv({ AGENT_AUTOSTART: 'maybe' }))).toThrow(
       /Invalid AGENT_AUTOSTART/
     );
+  });
+});
+
+describe('loadConfig: persistence section (Stage 10)', () => {
+  it('applies all documented defaults when no persistence vars are set', () => {
+    const { persistence } = loadConfig(baseEnv());
+    expect(persistence).toEqual({
+      conversationTtlSeconds: 86400,
+      bufferQueueName: 'meta-ai-buffer-timers',
+      bufferWorkerConcurrency: 10,
+      readyRedisTimeoutMs: 2000
+    });
+  });
+
+  it('defaultPersistenceConfig returns a fresh copy matching the defaults', () => {
+    const a = defaultPersistenceConfig();
+    const b = defaultPersistenceConfig();
+    expect(a).toEqual({
+      conversationTtlSeconds: 86400,
+      bufferQueueName: 'meta-ai-buffer-timers',
+      bufferWorkerConcurrency: 10,
+      readyRedisTimeoutMs: 2000
+    });
+    expect(a).not.toBe(b); // fresh copy each call
+  });
+
+  it('honors CONVERSATION_TTL_SECONDS', () => {
+    expect(
+      loadConfig(baseEnv({ CONVERSATION_TTL_SECONDS: '3600' })).persistence.conversationTtlSeconds
+    ).toBe(3600);
+  });
+
+  it('throws (naming the var) on a malformed CONVERSATION_TTL_SECONDS', () => {
+    expect(() => loadConfig(baseEnv({ CONVERSATION_TTL_SECONDS: '0' }))).toThrow(
+      /Invalid CONVERSATION_TTL_SECONDS/
+    );
+  });
+
+  it('honors BUFFER_QUEUE_NAME', () => {
+    expect(loadConfig(baseEnv({ BUFFER_QUEUE_NAME: 'custom-queue' })).persistence.bufferQueueName).toBe(
+      'custom-queue'
+    );
+  });
+
+  it('falls back to the default BUFFER_QUEUE_NAME when blank', () => {
+    expect(loadConfig(baseEnv({ BUFFER_QUEUE_NAME: '   ' })).persistence.bufferQueueName).toBe(
+      'meta-ai-buffer-timers'
+    );
+  });
+
+  it('honors BUFFER_WORKER_CONCURRENCY', () => {
+    expect(
+      loadConfig(baseEnv({ BUFFER_WORKER_CONCURRENCY: '25' })).persistence.bufferWorkerConcurrency
+    ).toBe(25);
+  });
+
+  it('honors READY_REDIS_TIMEOUT_MS', () => {
+    expect(
+      loadConfig(baseEnv({ READY_REDIS_TIMEOUT_MS: '500' })).persistence.readyRedisTimeoutMs
+    ).toBe(500);
+  });
+
+  it('throws (naming the var) on a malformed READY_REDIS_TIMEOUT_MS', () => {
+    expect(() => loadConfig(baseEnv({ READY_REDIS_TIMEOUT_MS: 'soon' }))).toThrow(
+      /Invalid READY_REDIS_TIMEOUT_MS/
+    );
+  });
+});
+
+describe('loadConfig: limits section (Stage 10)', () => {
+  it('applies all documented defaults when no limits vars are set', () => {
+    const { limits } = loadConfig(baseEnv());
+    expect(limits).toEqual({
+      whatsappPerSecond: 80,
+      messengerPerSecond: 40,
+      instagramPerSecond: 10,
+      transientRetryMaxAttempts: 3,
+      transientRetryBaseMs: 1000,
+      transientRetryMaxMs: 60000
+    });
+  });
+
+  it('defaultLimitsConfig returns a fresh copy matching the defaults', () => {
+    const a = defaultLimitsConfig();
+    const b = defaultLimitsConfig();
+    expect(a).toEqual({
+      whatsappPerSecond: 80,
+      messengerPerSecond: 40,
+      instagramPerSecond: 10,
+      transientRetryMaxAttempts: 3,
+      transientRetryBaseMs: 1000,
+      transientRetryMaxMs: 60000
+    });
+    expect(a).not.toBe(b); // fresh copy each call
+  });
+
+  for (const { env, field } of [
+    { env: 'WHATSAPP_RATE_LIMIT_PER_SECOND', field: 'whatsappPerSecond' },
+    { env: 'MESSENGER_RATE_LIMIT_PER_SECOND', field: 'messengerPerSecond' },
+    { env: 'INSTAGRAM_RATE_LIMIT_PER_SECOND', field: 'instagramPerSecond' }
+  ] as const) {
+    describe(env, () => {
+      it('honors a valid override (fractional allowed)', () => {
+        expect(loadConfig(baseEnv({ [env]: '12.5' })).limits[field]).toBe(12.5);
+      });
+
+      it('accepts 0 (disables pacing for that channel)', () => {
+        expect(loadConfig(baseEnv({ [env]: '0' })).limits[field]).toBe(0);
+      });
+
+      it('throws (naming the var) on a negative value', () => {
+        expect(() => loadConfig(baseEnv({ [env]: '-1' }))).toThrow(new RegExp(`Invalid ${env}`));
+      });
+
+      it('throws (naming the var) on a non-numeric value', () => {
+        expect(() => loadConfig(baseEnv({ [env]: 'fast' }))).toThrow(new RegExp(`Invalid ${env}`));
+      });
+    });
+  }
+
+  // `extra` pins companion vars so a single override never trips the
+  // base<=max cross-check (e.g. raising base above the default max).
+  const retryIntKnobs: Array<{
+    env: string;
+    field: keyof ReturnType<typeof loadConfig>['limits'];
+    extra?: Record<string, string>;
+  }> = [
+    { env: 'TRANSIENT_RETRY_MAX_ATTEMPTS', field: 'transientRetryMaxAttempts' },
+    { env: 'TRANSIENT_RETRY_BASE_MS', field: 'transientRetryBaseMs', extra: { TRANSIENT_RETRY_MAX_MS: '999999' } },
+    { env: 'TRANSIENT_RETRY_MAX_MS', field: 'transientRetryMaxMs' }
+  ];
+
+  for (const { env, field, extra } of retryIntKnobs) {
+    describe(env, () => {
+      it('honors a valid override', () => {
+        const config = loadConfig(baseEnv({ ...extra, [env]: '99999' }));
+        expect(config.limits[field]).toBe(99999);
+      });
+
+      it('throws (naming the var) on zero (must be >= 1)', () => {
+        expect(() => loadConfig(baseEnv({ [env]: '0' }))).toThrow(new RegExp(`Invalid ${env}`));
+      });
+
+      it('throws (naming the var) on a non-integer value', () => {
+        expect(() => loadConfig(baseEnv({ [env]: '1.5' }))).toThrow(new RegExp(`Invalid ${env}`));
+      });
+    });
+  }
+
+  describe('transient-retry base <= max cross-check', () => {
+    it('accepts base equal to max', () => {
+      const config = loadConfig(
+        baseEnv({ TRANSIENT_RETRY_BASE_MS: '5000', TRANSIENT_RETRY_MAX_MS: '5000' })
+      );
+      expect(config.limits.transientRetryBaseMs).toBe(5000);
+      expect(config.limits.transientRetryMaxMs).toBe(5000);
+    });
+
+    it('throws (naming both vars) when base > max', () => {
+      expect(() =>
+        loadConfig(baseEnv({ TRANSIENT_RETRY_BASE_MS: '9000', TRANSIENT_RETRY_MAX_MS: '3000' }))
+      ).toThrow(/TRANSIENT_RETRY_BASE_MS.*greater than TRANSIENT_RETRY_MAX_MS/);
+    });
+  });
+});
+
+describe('loadConfig: REDIS_URL validation', () => {
+  it('is undefined when unset', () => {
+    expect(loadConfig(baseEnv()).redisUrl).toBeUndefined();
+  });
+
+  it('is undefined when whitespace-only (trim-empty-as-unset)', () => {
+    expect(loadConfig(baseEnv({ REDIS_URL: '   ' })).redisUrl).toBeUndefined();
+  });
+
+  it('accepts a redis:// URL', () => {
+    expect(loadConfig(baseEnv({ REDIS_URL: 'redis://localhost:6379' })).redisUrl).toBe(
+      'redis://localhost:6379'
+    );
+  });
+
+  it('accepts a rediss:// (TLS) URL', () => {
+    expect(loadConfig(baseEnv({ REDIS_URL: 'rediss://user:pass@host:6380/0' })).redisUrl).toBe(
+      'rediss://user:pass@host:6380/0'
+    );
+  });
+
+  it('throws (naming the var) on a wrong scheme like https://', () => {
+    expect(() => loadConfig(baseEnv({ REDIS_URL: 'https://localhost:6379' }))).toThrow(
+      /Invalid REDIS_URL/
+    );
+  });
+
+  it('throws (naming the var) on garbage that does not parse as a URL', () => {
+    expect(() => loadConfig(baseEnv({ REDIS_URL: 'not a url' }))).toThrow(/Invalid REDIS_URL/);
+  });
+});
+
+describe('tokenFormatWarnings (advisory, never throws)', () => {
+  it('returns no warnings for plausible tokens across all channels', () => {
+    const config = loadConfig(
+      baseEnv({
+        WHATSAPP_ACCESS_TOKEN: 'a-suitably-long-whatsapp-token-value',
+        MESSENGER_PAGE_ID: '100000000000001',
+        MESSENGER_PAGE_ACCESS_TOKEN: 'EAAplausiblepageaccesstoken',
+        INSTAGRAM_USER_ID: '17841400000000000',
+        INSTAGRAM_ACCESS_TOKEN: 'IGQplausibleinstagramtoken'
+      })
+    );
+    expect(tokenFormatWarnings(config)).toEqual([]);
+  });
+
+  it('warns on a short WhatsApp access token', () => {
+    const config = loadConfig(baseEnv({ WHATSAPP_ACCESS_TOKEN: 'short' }));
+    const warnings = tokenFormatWarnings(config);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].field).toBe('WHATSAPP_ACCESS_TOKEN');
+  });
+
+  it('warns on a Messenger token missing the EAA prefix', () => {
+    const config = loadConfig(
+      baseEnv({
+        MESSENGER_PAGE_ID: '100000000000001',
+        MESSENGER_PAGE_ACCESS_TOKEN: 'not-an-eaa-token-but-long-enough'
+      })
+    );
+    const warnings = tokenFormatWarnings(config);
+    expect(warnings.map(w => w.field)).toContain('MESSENGER_PAGE_ACCESS_TOKEN');
+  });
+
+  it('warns on an Instagram token missing the IGQ prefix', () => {
+    const config = loadConfig(
+      baseEnv({
+        INSTAGRAM_USER_ID: '17841400000000000',
+        INSTAGRAM_ACCESS_TOKEN: 'not-an-igq-token-but-long-enough'
+      })
+    );
+    const warnings = tokenFormatWarnings(config);
+    expect(warnings.map(w => w.field)).toContain('INSTAGRAM_ACCESS_TOKEN');
+  });
+
+  it('fires a check ONLY when its channel is configured', () => {
+    // Only WhatsApp configured (the baseEnv default) — Messenger/IG checks do
+    // not fire even though no Messenger/IG token is present.
+    const config = loadConfig(
+      baseEnv({ WHATSAPP_ACCESS_TOKEN: 'a-suitably-long-whatsapp-token-value' })
+    );
+    const warnings = tokenFormatWarnings(config);
+    expect(warnings.map(w => w.field)).not.toContain('MESSENGER_PAGE_ACCESS_TOKEN');
+    expect(warnings.map(w => w.field)).not.toContain('INSTAGRAM_ACCESS_TOKEN');
   });
 });
