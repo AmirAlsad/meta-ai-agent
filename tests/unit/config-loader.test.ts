@@ -117,7 +117,9 @@ describe('loadConfig: conversation defaults', () => {
       outboundDeliveryTimeoutMs: 30000,
       chatEndpointTimeoutMs: 30000,
       dedupeTtlSeconds: 86400,
-      userLookupTimeoutMs: 5000
+      userLookupTimeoutMs: 5000,
+      inboundMediaDownload: false,
+      inboundMediaMaxBytes: 5_242_880
     });
   });
 });
@@ -138,7 +140,8 @@ describe('loadConfig: positive-integer conversation knobs', () => {
     { env: 'OUTBOUND_DELIVERY_TIMEOUT_MS', field: 'outboundDeliveryTimeoutMs' },
     { env: 'CHAT_ENDPOINT_TIMEOUT_MS', field: 'chatEndpointTimeoutMs' },
     { env: 'DEDUPE_TTL_SECONDS', field: 'dedupeTtlSeconds' },
-    { env: 'USER_LOOKUP_TIMEOUT_MS', field: 'userLookupTimeoutMs' }
+    { env: 'USER_LOOKUP_TIMEOUT_MS', field: 'userLookupTimeoutMs' },
+    { env: 'INBOUND_MEDIA_MAX_BYTES', field: 'inboundMediaMaxBytes' }
   ];
 
   for (const { env, field, extra } of intKnobs) {
@@ -240,7 +243,8 @@ describe('loadConfig: buffer max >= base cross-check', () => {
 describe('loadConfig: boolean conversation knobs', () => {
   for (const { env, field, def } of [
     { env: 'OUTBOUND_TYPING_INDICATORS_ENABLED', field: 'outboundTypingIndicatorsEnabled', def: true },
-    { env: 'READ_RECEIPTS_ENABLED', field: 'readReceiptsEnabled', def: false }
+    { env: 'READ_RECEIPTS_ENABLED', field: 'readReceiptsEnabled', def: false },
+    { env: 'INBOUND_MEDIA_DOWNLOAD', field: 'inboundMediaDownload', def: false }
   ] as const) {
     describe(env, () => {
       it(`defaults to ${def}`, () => {

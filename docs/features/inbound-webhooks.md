@@ -82,6 +82,8 @@ The ACK-then-dispatch ordering is non-negotiable. Meta retries any non-2xx respo
 
 Throughout, when a `metrics` handle is supplied the dispatcher increments `webhook_received_total{channel,result}` (`accepted`, or `parse_error` on the defensive catch, plus `webhook_parse_failures_total`). The `traceMarker` log values are stable and asserted by the integration tests — preserve them.
 
+> The parser-emitted `media` shape carries only `id` / `url` / `mimeType` / etc. — it does **not** include the base64 `MediaInfo.dataUrl`. That field is populated later (and only when enabled) by the agent's optional inbound media-hydration step on the flush path; see [Inbound media hydration](./media-hydration.md).
+
 ### Postbacks and referrals
 
 Postbacks (button taps — including Get Started, persistent-menu items, and

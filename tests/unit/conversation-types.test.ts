@@ -92,6 +92,8 @@ describe('createIdleConversation', () => {
       channelScopedBusinessId: 'pn-1',
       state: 'idle',
       inboundBuffer: [],
+      lateArrivals: [],
+      reprocessCount: 0,
       outboundQueue: [],
       currentOutboundIndex: 0,
       deliveredMessageIds: [],

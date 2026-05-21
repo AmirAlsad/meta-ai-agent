@@ -20,7 +20,15 @@ export { normalizeChatResponse } from './contract.js';
 export { ChatEndpointError } from './errors.js';
 
 export interface ChatClient {
-  complete(request: ChatRequest): Promise<NormalizedChatResponse>;
+  /**
+   * Dispatch one chat request. An OPTIONAL external `signal` lets the caller
+   * abort an in-flight call (the ConversationAgent uses this to cancel a flush's
+   * chat call when a late message arrives, so the two can be rebatched into one
+   * response). When the external signal aborts, `complete` rejects (a
+   * {@link ChatEndpointError} wrapping the AbortError) — the agent catches it and
+   * routes to its reprocess path.
+   */
+  complete(request: ChatRequest, signal?: AbortSignal): Promise<NormalizedChatResponse>;
 }
 
 export interface HttpChatClientDeps {
@@ -45,9 +53,29 @@ export class HttpChatClient implements ChatClient {
     this.logger = deps.logger;
   }
 
-  async complete(request: ChatRequest): Promise<NormalizedChatResponse> {
+  async complete(request: ChatRequest, signal?: AbortSignal): Promise<NormalizedChatResponse> {
+    // The fetch is aborted if EITHER the internal timeout fires OR the optional
+    // external signal aborts. We combine them onto one controller manually rather
+    // than relying on AbortSignal.any (keeps the floor at plain Node 20 without a
+    // version probe). The external listener is removed in `finally` so a settled
+    // call never leaves a dangling listener on a long-lived caller signal.
+    // Already-aborted external signal: short-circuit before allocating a timer or
+    // touching the network. Real `fetch` rejects immediately on a pre-aborted
+    // signal, so we mirror that as a wrapped AbortError (no fetch impl required to
+    // model it).
+    if (signal?.aborted) {
+      throw new ChatEndpointError('Chat endpoint request aborted', {
+        cause: Object.assign(new Error('aborted'), { name: 'AbortError' })
+      });
+    }
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    let onExternalAbort: (() => void) | undefined;
+    if (signal) {
+      onExternalAbort = () => controller.abort();
+      signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
 
     try {
       this.logger?.debug(
@@ -86,6 +114,7 @@ export class HttpChatClient implements ChatClient {
       throw new ChatEndpointError('Chat endpoint request failed', { cause: error });
     } finally {
       clearTimeout(timeout);
+      if (signal && onExternalAbort) signal.removeEventListener('abort', onExternalAbort);
     }
   }
 }

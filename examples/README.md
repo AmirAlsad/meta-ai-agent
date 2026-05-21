@@ -11,6 +11,22 @@ for the request/response shapes, capability gating, and normalization rules.
 
 ## The examples
 
+There are **six**, in three groups:
+
+- **Chat endpoints (drivable via the REPL / `example:dev`)** —
+  [`minimal-chat-endpoint`](#minimal-chat-endpoint--the-echo-bot) (echo),
+  [`multi-channel-router`](#multi-channel-router--channel-aware--capability-driven)
+  (channel + capability aware),
+  [`action-catalog`](#action-catalog--every-chataction-shape) (every `ChatAction`
+  shape), and [`scripted-flow`](#scripted-flow--deterministic-state-machine) (a
+  deterministic state machine). All four are pure, LLM-free, and boot in-process
+  in the runners below. Each has its own per-example README with a keyword map /
+  state table.
+- **[`showcase-bot`](#showcase-bot--llm-backed-separate-package)** — an
+  LLM-backed endpoint; a **separate package**, run standalone.
+- **[`identity-lookup`](#identity-lookup--a-user_lookup_url-stub)** — a
+  `USER_LOOKUP_URL` stub (NOT a chat endpoint); run alongside a chat endpoint.
+
 ### `minimal-chat-endpoint` — the echo bot
 
 The smallest possible endpoint: it echoes the aggregated inbound text back, and
@@ -54,27 +70,127 @@ node --import tsx examples/multi-channel-router/index.ts
 
 …or via the **local REPL** (below).
 
+### `action-catalog` — every `ChatAction` shape
+
+A keyword-routed **reference endpoint**: send a keyword as the first word of your
+message and it returns **one labeled response shape per `ChatAction`** — so you
+can see, in one place, the exact JSON the transport expects for each capability.
+A pure `switch`, **no LLM**. Every rich branch gates on `req.capabilities` and
+**degrades to a plain message** when the channel can't do the rich thing.
+
+Keywords: `silence`, `multi`, `react`, `reply`, `media`, `template`, `typing`,
+`help`. See [`action-catalog/README.md`](./action-catalog/README.md) for the full
+keyword → action map.
+
+- Source: [`action-catalog/index.ts`](./action-catalog/index.ts)
+- Exports: `catalogResponse(req)` (pure handler) and `createCatalogChatEndpoint()`
+  (the Express app).
+
+Run it **standalone** (listens on `PORT` or 4003):
+
+```bash
+node --import tsx examples/action-catalog/index.ts
+```
+
+…or via the **local REPL** (below):
+
+```bash
+npm run example:chat -- action-catalog
+```
+
+### `scripted-flow` — deterministic state machine
+
+A small, realistic conversational arc — a **coffee pickup order** — driven by a
+hand-written **state machine**, with **no LLM**. State lives in memory keyed by
+`req.conversationKey`, so the flow walks `greet → size → milk → name → done`, one
+step per inbound turn. Where `action-catalog` shows each action in isolation, this
+exercises the rich actions **naturally** as the conversation progresses (a
+`reaction` ack, a threaded `reply`, a closed-window `template` re-engagement, and
+`silence` on a duplicate message id). Say `restart` to start over. See
+[`scripted-flow/README.md`](./scripted-flow/README.md) for the full step table.
+
+- Source: [`scripted-flow/index.ts`](./scripted-flow/index.ts)
+- Exports: `scriptedFlowResponse(req, store?)` (pure-ish handler — accepts an
+  injectable state store), `createScriptedFlowChatEndpoint()` (the Express app),
+  and `FlowStore` (+ `createInMemoryFlowStore()`).
+
+Run it **standalone** (listens on `PORT` or 4004):
+
+```bash
+node --import tsx examples/scripted-flow/index.ts
+```
+
+…or via the **local REPL** (below) — type the answers one per turn (`large`,
+`oat`, `Amir`) to walk the arc:
+
+```bash
+npm run example:chat -- scripted-flow
+```
+
 ### `showcase-bot` — LLM-backed (separate package)
 
-A full reference endpoint backed by **Claude** (via the Anthropic SDK):
-multi-turn history, prompt caching, and capability-gated rich actions via tool
-use. It is a **separate npm package** with its own dependencies — the root
-`meta-ai-agent` package intentionally never depends on a model provider — so it
-is **not** installed by the root `npm install` and is **not** booted by the
-runners below.
+A full reference endpoint backed by an LLM via the **[Vercel AI SDK](https://sdk.vercel.ai)**
+— multi-provider (Anthropic by default, OpenAI swappable via a provider
+registry), with multi-turn history, prompt caching, capability-gated rich actions
+via tool use, **inbound media** (images multimodally, PDFs extracted), and
+**speech-to-text** (voice notes via Groq Whisper). It is a **separate npm
+package** with its own dependencies (`ai`, `@ai-sdk/anthropic`, `@ai-sdk/openai`,
+plus media/STT deps) — the root `meta-ai-agent` package intentionally never
+depends on a model provider — so it is **not** installed by the root
+`npm install` and is **not** booted by the runners below.
 
 Run it standalone, then point the agent at it:
 
 ```bash
 cd examples/showcase-bot
 npm install
-export ANTHROPIC_API_KEY=sk-ant-...      # required
-npm start                                 # listens on PORT (default 4003)
+cp .env.example .env                      # then set ANTHROPIC_API_KEY=sk-ant-...
+npm start                                 # listens on PORT (default 4055)
 ```
 
-Then set `CHAT_ENDPOINT_URL=http://localhost:4003` and run the agent (or
-`npm run dev:loop`). See [`showcase-bot/README.md`](./showcase-bot/README.md)
-for full details.
+It has its **own** `.env.example` (separate from the root package's) documenting
+`ANTHROPIC_API_KEY` (required), optional `OPENAI_API_KEY` (for an `openai:` model)
+and `GROQ_API_KEY` (for STT), plus `SHOWCASE_MODEL`, `MAX_TOKENS`, and `PORT`.
+
+Then set `CHAT_ENDPOINT_URL=http://localhost:4055` in the transport package's
+`.env` and start the agent with `npm run dev` (it reads `CHAT_ENDPOINT_URL`).
+Note: `npm run dev:loop` will **not** route here — it overrides
+`CHAT_ENDPOINT_URL` with its own in-process keyword test endpoint. See
+[`showcase-bot/README.md`](./showcase-bot/README.md) for full details.
+
+### `identity-lookup` — a `USER_LOOKUP_URL` stub
+
+A reference stub for the **identity-resolution** hook — it implements the
+`USER_LOOKUP_URL` contract, **not** `CHAT_ENDPOINT_URL`, so it is **not** a chat
+endpoint and is **not** a target for the runners below (it is deliberately absent
+from the REPL / `example:dev` example lists). The agent POSTs an inbound sender's
+`{ channel, channelScopedUserId, channelScopedBusinessId }` and expects a
+`Contact` back; this stub returns a hardcoded contact for two known users and a
+404 (fail-open → "no enrichment, proceed") for everyone else.
+
+Run it **alongside** a chat endpoint so the resolved `contact` rides on the
+`ChatRequest`:
+
+```bash
+# terminal 1 — a chat endpoint
+node --import tsx examples/minimal-chat-endpoint/index.ts   # listens on 4001
+
+# terminal 2 — this lookup stub
+node --import tsx examples/identity-lookup/index.ts         # listens on 4010
+
+# terminal 3 — the agent, wired to BOTH
+CHAT_ENDPOINT_URL=http://localhost:4001 \
+USER_LOOKUP_URL=http://localhost:4010 \
+npm run dev
+```
+
+- Source: [`identity-lookup/index.ts`](./identity-lookup/index.ts)
+- Exports: `lookupIdentity(req)` (pure handler) and
+  `createIdentityLookupEndpoint()` (the Express app).
+
+See [`identity-lookup/README.md`](./identity-lookup/README.md) and
+[`docs/features/identity-resolution.md`](../docs/features/identity-resolution.md)
+for the request/response shape, the built-in contacts, and the fail-open rules.
 
 ## Running the examples
 
@@ -84,8 +200,10 @@ There are two runners, both driven by npm scripts from the repo root.
 
 ```bash
 npm run example:chat -- minimal-chat-endpoint
-# or:
+# or any of the other chat endpoints:
 npm run example:chat -- multi-channel-router
+npm run example:chat -- action-catalog
+npm run example:chat -- scripted-flow
 ```
 
 This is the **fastest way to see the full loop**. It boots the chosen example
@@ -98,13 +216,14 @@ REPL commands:
 
 | Command | What it does |
 | --- | --- |
-| `/channel <name>` | Switch the simulated channel (`whatsapp` / `messenger` / `instagram`) — changes the `capabilities` your endpoint sees. |
-| `/media` | Send a simulated inbound media message (image) instead of text. |
-| `/reaction <emoji>` | Send a simulated inbound reaction on the last message. |
-| `/status` | Show the current simulated conversation state (channel, window, last message id). |
-| `/raw` | Toggle printing the raw `ChatRequest` / `ChatResponse` JSON for the next turns. |
+| `/channel <whatsapp\|messenger\|instagram>` | Switch the simulated channel — changes the `capabilities` your endpoint sees. |
+| `/media <url>` | Send a simulated inbound image (by URL; on WhatsApp the value is used as the media id) instead of text. |
+| `/reaction <emoji>` | Send a simulated inbound reaction targeting the **last outbound** message id. |
+| `/status <delivered\|read>` | Send a delivery/read status for the last outbound id (WhatsApp drives queue advancement; Messenger/Instagram `read` is a read receipt). |
+| `/raw` | Toggle printing the raw signed webhook + response JSON for subsequent turns. |
 | `/reset` | Clear the simulated conversation state and start fresh. |
 | `/help` | List the commands. |
+| `/exit` | Shut down and quit (Ctrl-C also works). |
 
 Anything that isn't a `/command` is sent as inbound text.
 
@@ -112,8 +231,10 @@ Anything that isn't a `/command` is sent as inbound text.
 
 ```bash
 npm run example:dev -- minimal-chat-endpoint
-# or:
+# or any of the other chat endpoints:
 npm run example:dev -- multi-channel-router
+npm run example:dev -- action-catalog
+npm run example:dev -- scripted-flow
 ```
 
 This boots the **real** agent stack (real Meta adapters → live Graph API sends)
@@ -132,16 +253,20 @@ runner **overrides** it to the in-process example for this run). Useful flags:
 | `--no-webhook-registration` | Skip programmatic subscription (assume the Dashboard is already configured). |
 | `--help` | Show usage. |
 
-The `showcase-bot` is **not** bootable through `example:dev` (separate package);
-run it standalone and set `CHAT_ENDPOINT_URL` as shown above.
+Neither `showcase-bot` (separate package) nor `identity-lookup` (a
+`USER_LOOKUP_URL` stub, not a chat endpoint) is bootable through `example:dev`;
+run each standalone as shown in its section above.
 
 ## At a glance
 
-| Example | LLM? | Meta account needed? | Separate install? |
-| --- | --- | --- | --- |
-| `minimal-chat-endpoint` | No | No (REPL) / Yes (`example:dev`) | No |
-| `multi-channel-router` | No | No (REPL) / Yes (`example:dev`) | No |
-| `showcase-bot` | Yes (Claude) | Only to test on a real device | Yes (`cd examples/showcase-bot && npm install`) |
+| Example | LLM? | Meta account? | Separate install? | REPL-drivable? |
+| --- | --- | --- | --- | --- |
+| `minimal-chat-endpoint` | No | No (REPL) / Yes (`example:dev`) | No | Yes |
+| `multi-channel-router` | No | No (REPL) / Yes (`example:dev`) | No | Yes |
+| `action-catalog` | No | No (REPL) / Yes (`example:dev`) | No | Yes |
+| `scripted-flow` | No | No (REPL) / Yes (`example:dev`) | No | Yes |
+| `showcase-bot` | Yes (Vercel AI SDK) | Only to test on a real device | Yes (`cd examples/showcase-bot && npm install`) | No (separate package) |
+| `identity-lookup` | No | No | No | No (`USER_LOOKUP_URL` stub, not a chat endpoint) |
 
 ## The contract
 

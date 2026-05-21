@@ -29,6 +29,7 @@ import { createAgentMetrics, type AgentMetrics } from '../../src/metrics/registr
 import { InMemoryStatusTracker } from '../../src/status/tracker.js';
 import type { IdentityResolver, IdentityLookupRequest } from '../../src/identity/resolver.js';
 import type { Contact } from '../../src/identity/types.js';
+import type { InboundMediaHydrator } from '../../src/meta/shared/media-hydrator.js';
 
 /* ──────────────────────────────────────────────────────────────────────── */
 /* Fixtures                                                                  */
@@ -132,6 +133,45 @@ function makeChatClient(
   return { complete, calls };
 }
 
+/**
+ * A controllable {@link ChatClient} for the interrupt/rebatch tests: each
+ * `complete` call parks on a per-call deferred you resolve manually, AND rejects
+ * (AbortError) when the external abort signal fires — mirroring the real
+ * {@link HttpChatClient}. `release(i)` resolves the i-th call with the response
+ * returned by `responseFor(request)`.
+ */
+function makeControllableChatClient(
+  responseFor: (request: ChatRequest, callIndex: number) => NormalizedChatResponse
+): ChatClient & {
+  complete: ReturnType<typeof vi.fn>;
+  calls: ChatRequest[];
+  release: (callIndex: number) => void;
+  pendingCount: () => number;
+} {
+  const calls: ChatRequest[] = [];
+  const gates: Array<() => void> = [];
+  let resolved = 0;
+  const complete = vi.fn((request: ChatRequest, signal?: AbortSignal) => {
+    const callIndex = calls.length;
+    calls.push(request);
+    return new Promise<NormalizedChatResponse>((resolve, reject) => {
+      gates[callIndex] = () => {
+        resolved += 1;
+        resolve(responseFor(request, callIndex));
+      };
+      signal?.addEventListener('abort', () =>
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      );
+    });
+  });
+  return {
+    complete,
+    calls,
+    release: (callIndex: number) => gates[callIndex]?.(),
+    pendingCount: () => calls.length - resolved
+  };
+}
+
 function inbound(overrides: Partial<IncomingMessage> = {}): IncomingMessage {
   return {
     channel: 'whatsapp',
@@ -169,6 +209,8 @@ function makeHarness(opts: {
   withStatusTracker?: boolean;
   /** Optional identity resolver (fake). */
   identityResolver?: IdentityResolver;
+  /** Optional inbound media hydrator (fake). */
+  mediaHydrator?: InboundMediaHydrator;
 }): Harness {
   const config = makeConfig();
   opts.configMutate?.(config);
@@ -194,7 +236,8 @@ function makeHarness(opts: {
     sleep: async () => undefined, // no-op so typing delays don't wait
     ...(metrics ? { metrics } : {}),
     ...(statusTracker ? { statusTracker } : {}),
-    ...(opts.identityResolver ? { identityResolver: opts.identityResolver } : {})
+    ...(opts.identityResolver ? { identityResolver: opts.identityResolver } : {}),
+    ...(opts.mediaHydrator ? { mediaHydrator: opts.mediaHydrator } : {})
   });
   return {
     agent,
@@ -297,6 +340,75 @@ describe('ConversationAgent', () => {
 
     expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledTimes(1);
     expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledWith('user-1', 'hi there');
+  });
+
+  describe('inbound media hydration (mediaHydrator)', () => {
+    const DATA_URL = 'data:image/jpeg;base64,QUJD';
+
+    /** A fake hydrator returning a fixed data URL for any media-bearing message. */
+    function fakeHydrator(dataUrl: string | undefined): InboundMediaHydrator & {
+      hydrate: ReturnType<typeof vi.fn>;
+    } {
+      const hydrate = vi.fn(async (m: IncomingMessage) =>
+        m.media ? dataUrl : undefined
+      );
+      return { hydrate };
+    }
+
+    const imageInbound = (): IncomingMessage =>
+      inbound({
+        channelMessageId: 'wamid.img',
+        type: 'image',
+        text: undefined,
+        media: { id: 'MEDIA_ID_1', mimeType: 'image/jpeg' }
+      });
+
+    it('attaches the hydrated data URL to the request message media', async () => {
+      const hydrator = fakeHydrator(DATA_URL);
+      const h = makeHarness({ responses: [textResponse('got it')], mediaHydrator: hydrator });
+
+      await h.agent.handleInbound(imageInbound());
+      await flushBuffer();
+
+      expect(hydrator.hydrate).toHaveBeenCalledTimes(1);
+      const req = h.chat.calls[0]!;
+      expect(req.messages[0]!.media?.dataUrl).toBe(DATA_URL);
+    });
+
+    it('leaves media.dataUrl undefined when NO hydrator is wired (today’s behavior)', async () => {
+      const h = makeHarness({ responses: [textResponse('got it')] }); // no mediaHydrator
+
+      await h.agent.handleInbound(imageInbound());
+      await flushBuffer();
+
+      const req = h.chat.calls[0]!;
+      expect(req.messages[0]!.media?.dataUrl).toBeUndefined();
+    });
+
+    it('still delivers the message (no dataUrl) when the hydrator returns undefined (fail-open)', async () => {
+      const hydrator = fakeHydrator(undefined);
+      const h = makeHarness({ responses: [textResponse('got it')], mediaHydrator: hydrator });
+
+      await h.agent.handleInbound(imageInbound());
+      await flushBuffer();
+
+      expect(hydrator.hydrate).toHaveBeenCalledTimes(1);
+      const req = h.chat.calls[0]!;
+      expect(req.messages).toHaveLength(1);
+      expect(req.messages[0]!.media?.dataUrl).toBeUndefined();
+      // The turn still produced a reply — hydration failure is fail-open.
+      expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledWith('user-1', 'got it');
+    });
+
+    it('does not call the hydrator for a text-only message (no media)', async () => {
+      const hydrator = fakeHydrator(DATA_URL);
+      const h = makeHarness({ responses: [textResponse('hi')], mediaHydrator: hydrator });
+
+      await h.agent.handleInbound(inbound({ text: 'hello', channelMessageId: 'wamid.t' }));
+      await flushBuffer();
+
+      expect(hydrator.hydrate).not.toHaveBeenCalled();
+    });
   });
 
   describe('read receipts (READ_RECEIPTS_ENABLED)', () => {
@@ -1163,6 +1275,58 @@ describe('ConversationAgent', () => {
     expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledTimes(1);
   });
 
+  it('close aborts an in-flight chat call (the in-flight complete settles)', async () => {
+    // FIX 2 (RESOURCE): a chat call is parked in-flight (state `processing`, an
+    // AbortController registered). close() must abort it so the underlying request
+    // is cancelled rather than dangling. We observe the abort via the controllable
+    // client: complete() rejects (AbortError) when the external signal fires, and
+    // the flush swallows it (fail-soft), so the in-flight promise settles + no send.
+    const config = makeConfig();
+    const store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
+    const scheduler = new InMemoryBufferScheduler();
+    const adapter = makeAdapter('messenger', messengerSupports);
+    const chat = makeControllableChatClient(() => textResponse('never sent'));
+
+    let aborted = false;
+    // Wrap complete so we can observe the abort-driven rejection settling.
+    const wrappedComplete = vi.fn((request: ChatRequest, signal?: AbortSignal) => {
+      const p = chat.complete(request, signal);
+      p.catch(() => {
+        aborted = true;
+      });
+      return p;
+    });
+
+    const agent = new ConversationAgent({
+      store,
+      scheduler,
+      chatClient: { complete: wrappedComplete } as unknown as ChatClient,
+      adapters: { messenger: adapter },
+      config,
+      logger: silentLogger,
+      random: () => 0.5,
+      now: () => FIXED_NOW,
+      sleep: async () => undefined
+    });
+
+    await agent.handleInbound(
+      inbound({ channel: 'messenger', channelScopedUserId: 'fb-user', channelMessageId: 'm_inflight' })
+    );
+    await vi.advanceTimersByTimeAsync(20_000);
+    // The chat call is parked in-flight.
+    expect(wrappedComplete).toHaveBeenCalledTimes(1);
+    expect(chat.pendingCount()).toBe(1);
+
+    // close() must abort the in-flight call.
+    await agent.close();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(aborted).toBe(true);
+    // The aborted turn produced no send, and a fresh inbound after close would find
+    // no stale abort handle (the map was cleared) — no crash, no double-send.
+    expect(adapter.sendText).not.toHaveBeenCalled();
+  });
+
   /* ────────────────────────────────────────────────────────────────────── */
   /* Concurrency: per-key serialization lock (regression tests)             */
   /* ────────────────────────────────────────────────────────────────────── */
@@ -1190,29 +1354,39 @@ describe('ConversationAgent', () => {
     expect(req.message).toBe('first\nsecond');
   });
 
-  it('flush vs. late inbound: a message arriving mid-flush is not lost', async () => {
-    // While a flush is awaiting a SLOW chat call, a new inbound arrives for the
-    // same key. The per-key lock makes the late inbound queue BEHIND the
-    // in-flight flush; once the flush releases the lock, the late message is
-    // buffered and a fresh flush fires for it. It must reach a SECOND chat call
-    // (never dropped, never folded into the already-snapshotted first turn).
+  it('flush vs. late inbound: a message arriving mid-flush is rebatched into ONE combined turn', async () => {
+    // INTERRUPT/REBATCH: while a flush is awaiting a SLOW chat call (state
+    // `processing`, lock RELEASED), a new inbound arrives for the same key. The
+    // late message lands in `lateArrivals` and ABORTS the in-flight chat call.
+    // The flush, on re-acquiring the lock, sees the late arrival and folds
+    // [early] + [late] back into the buffer for ONE fresh flush — a SINGLE
+    // combined chat call/response, never two. (Pre-fix this produced two
+    // responses; the narrowed lock + abort/rebatch is what fixes it.)
     const config = makeConfig();
     const store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
     const scheduler = new InMemoryBufferScheduler();
     const adapter = makeAdapter('messenger', messengerSupports); // on_send: flush completes synchronously after the send
 
-    // A chat client whose FIRST complete() blocks on a deferred we control; the
-    // second resolves immediately.
+    // A chat client whose FIRST complete() blocks on a deferred we control AND
+    // respects the external abort signal (rejecting like the real HttpChatClient);
+    // the second resolves immediately.
     const calls: ChatRequest[] = [];
     let releaseFirst!: () => void;
     const firstGate = new Promise<void>(resolve => {
       releaseFirst = resolve;
     });
     let callIndex = 0;
-    const complete = vi.fn(async (request: ChatRequest) => {
+    const complete = vi.fn(async (request: ChatRequest, signal?: AbortSignal) => {
       calls.push(request);
       const thisCall = callIndex++;
-      if (thisCall === 0) await firstGate;
+      if (thisCall === 0) {
+        await new Promise<void>((resolve, reject) => {
+          firstGate.then(resolve);
+          signal?.addEventListener('abort', () =>
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          );
+        });
+      }
       return textResponse(`reply-${thisCall}`);
     });
 
@@ -1234,41 +1408,258 @@ describe('ConversationAgent', () => {
       inbound({ channel: 'messenger', channelScopedUserId: 'fb-user', text: 'early', channelMessageId: 'm_early' })
     );
     // Kick the flush timer; the flush enters the (gated) chat call and parks
-    // there, still holding the per-key lock.
+    // there — but with the lock RELEASED (the fix), so a late inbound can run.
     await vi.advanceTimersByTimeAsync(20_000);
     expect(complete).toHaveBeenCalledTimes(1);
     expect(calls[0]!.messages.map(m => m.channelMessageId)).toEqual(['m_early']);
 
-    // Late inbound for the SAME key while the flush is mid-flight. It must NOT
-    // settle yet — the per-key lock is held by the in-flight flush.
+    // Late inbound for the SAME key while the flush is mid-flight. The lock is
+    // free during the chat call, so this SETTLES immediately (it does not block).
     let lateSettled = false;
-    const latePromise = agent
+    await agent
       .handleInbound(
         inbound({ channel: 'messenger', channelScopedUserId: 'fb-user', text: 'late', channelMessageId: 'm_late' })
       )
       .then(() => {
         lateSettled = true;
       });
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(lateSettled).toBe(false); // blocked behind the flush
-
-    // Release the first chat call → flush finishes, releases the lock, the late
-    // inbound runs and buffers 'late', then arms its own flush timer.
-    releaseFirst();
-    await latePromise;
     expect(lateSettled).toBe(true);
 
-    // The late message is buffered, not lost.
+    // The late inbound aborted the in-flight chat call; let that rejection
+    // propagate, then the flush rebatches [early] + [late] into the buffer.
+    releaseFirst();
+    await vi.advanceTimersByTimeAsync(0);
     const buffered = await store.getConversation(key);
-    expect(buffered!.inboundBuffer.map(m => m.channelMessageId)).toEqual(['m_late']);
+    expect(buffered!.inboundBuffer.map(m => m.channelMessageId)).toEqual(['m_early', 'm_late']);
+    expect(buffered!.lateArrivals).toEqual([]);
 
-    // Fire the late flush → a SECOND chat call carrying exactly the late message.
+    // Fire the rebatched flush → a SECOND chat call carrying BOTH messages, and
+    // exactly ONE outbound send (the single combined response).
     await vi.advanceTimersByTimeAsync(20_000);
     expect(complete).toHaveBeenCalledTimes(2);
-    expect(calls[1]!.messages.map(m => m.channelMessageId)).toEqual(['m_late']);
+    expect(calls[1]!.messages.map(m => m.channelMessageId)).toEqual(['m_early', 'm_late']);
+    expect(adapter.sendText).toHaveBeenCalledTimes(1);
 
     await agent.close();
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Interrupt / rebatch during an in-flight chat call (the batching fix)    */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  describe('interrupt / rebatch (narrowed lock)', () => {
+    /** Build an agent over a controllable chat client (messenger = on_send). */
+    function makeInterruptHarness(
+      responseFor: (request: ChatRequest, callIndex: number) => NormalizedChatResponse
+    ): {
+      agent: ConversationAgent;
+      store: InMemoryConversationStore;
+      adapter: FakeAdapter;
+      chat: ReturnType<typeof makeControllableChatClient>;
+      key: string;
+    } {
+      const config = makeConfig();
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
+      const scheduler = new InMemoryBufferScheduler();
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const chat = makeControllableChatClient(responseFor);
+      const agent = new ConversationAgent({
+        store,
+        scheduler,
+        chatClient: chat,
+        adapters: { messenger: adapter },
+        config,
+        logger: silentLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined
+      });
+      return { agent, store, adapter, chat, key: 'messenger:biz-1:fb-user' };
+    }
+
+    const mkInbound = (id: string, text: string): IncomingMessage =>
+      inbound({ channel: 'messenger', channelScopedUserId: 'fb-user', channelMessageId: id, text });
+
+    it('message B during processing aborts the in-flight chat and produces ONE combined response', async () => {
+      // THE REGRESSION TEST. A arrives → flush fires → chat call in-flight
+      // (processing) → B arrives (distinct id) while processing → the in-flight
+      // chat is aborted, A+B are rebatched, and exactly ONE chat call ultimately
+      // produces a response containing BOTH A and B. Pre-fix: two chat calls each
+      // with one message and TWO responses.
+      const h = makeInterruptHarness((req, i) => textResponse(`reply-${i}-${req.messages.length}`));
+
+      // A → flush → chat call #0 parks (in-flight), lock released.
+      await h.agent.handleInbound(mkInbound('m_a', 'first'));
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(h.chat.complete).toHaveBeenCalledTimes(1);
+      expect(h.chat.calls[0]!.messages.map(m => m.channelMessageId)).toEqual(['m_a']);
+
+      let processing = await h.store.getConversation(h.key);
+      expect(processing!.state).toBe('processing');
+
+      // B arrives while processing → lands in lateArrivals, aborts call #0.
+      await h.agent.handleInbound(mkInbound('m_b', 'second'));
+      processing = await h.store.getConversation(h.key);
+      expect(processing!.lateArrivals.map(m => m.channelMessageId)).toEqual(['m_b']);
+
+      // Let the aborted call #0 reject + the flush rebatch run.
+      await vi.advanceTimersByTimeAsync(0);
+      const rebatched = await h.store.getConversation(h.key);
+      expect(rebatched!.state).toBe('buffering');
+      expect(rebatched!.inboundBuffer.map(m => m.channelMessageId)).toEqual(['m_a', 'm_b']);
+      expect(rebatched!.reprocessCount).toBe(1);
+
+      // Fire the rebatched flush → chat call #1 carries BOTH; release it.
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(h.chat.complete).toHaveBeenCalledTimes(2);
+      const winning = h.chat.calls[1]!;
+      expect(winning.messages.map(m => m.channelMessageId)).toEqual(['m_a', 'm_b']);
+      expect(winning.message).toBe('first\nsecond');
+
+      h.chat.release(1);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Exactly ONE combined response was sent (not two separate replies).
+      expect(h.adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(h.adapter.sendText).toHaveBeenCalledWith('fb-user', 'reply-1-2');
+      const done = await h.store.getConversation(h.key);
+      expect(done!.state).toBe('idle');
+      expect(done!.reprocessCount).toBe(0);
+      await h.agent.close();
+    });
+
+    it('no false interrupt: a flush with no late arrival → one chat call, one response, reprocessCount stays 0', async () => {
+      const h = makeInterruptHarness(() => textResponse('only reply'));
+
+      await h.agent.handleInbound(mkInbound('m_solo', 'hi'));
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(h.chat.complete).toHaveBeenCalledTimes(1);
+
+      // No late arrival → release the single call → it sends and goes idle.
+      h.chat.release(0);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(h.chat.complete).toHaveBeenCalledTimes(1);
+      expect(h.adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(h.adapter.sendText).toHaveBeenCalledWith('fb-user', 'only reply');
+      const done = await h.store.getConversation(h.key);
+      expect(done!.state).toBe('idle');
+      expect(done!.reprocessCount).toBe(0);
+      expect(done!.lateArrivals).toEqual([]);
+      await h.agent.close();
+    });
+
+    it('reprocess cap: a steady stream stops deferring after MAX_REPROCESS and still produces a response', async () => {
+      // A new message arrives during EVERY in-flight chat call. Without a cap this
+      // would reprocess forever; with MAX_REPROCESS the turn eventually proceeds.
+      const MAX_REPROCESS = 5;
+      const h = makeInterruptHarness((_req, i) => textResponse(`reply-${i}`));
+      let nextId = 0;
+
+      // Kick off the first turn.
+      await h.agent.handleInbound(mkInbound(`m_${nextId++}`, 'msg'));
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      // For each in-flight chat call, drop a fresh inbound (forces a reprocess)
+      // until we exceed the cap. After MAX_REPROCESS deferrals, the next flush
+      // must NOT defer again even though a late message is present.
+      for (let attempt = 0; attempt < MAX_REPROCESS + 2; attempt++) {
+        // The current call is in-flight (parked). Inject a late arrival.
+        await h.agent.handleInbound(mkInbound(`m_${nextId++}`, 'more'));
+        // Aborted call rejects → rebatch (or, past the cap, proceed) → next flush.
+        await vi.advanceTimersByTimeAsync(20_000);
+        const rec = await h.store.getConversation(h.key);
+        if (rec!.state === 'sending' || rec!.state === 'idle' || rec!.state === 'processing') {
+          // Past the cap: the flush proceeded with whatever it had. If it's
+          // parked in `processing` (waiting on this call), release it.
+          if (h.chat.pendingCount() > 0) h.chat.release(h.chat.calls.length - 1);
+          await vi.advanceTimersByTimeAsync(0);
+          break;
+        }
+      }
+
+      // A response was ultimately produced — the stream did not starve.
+      expect(h.adapter.sendText).toHaveBeenCalledTimes(1);
+      const done = await h.store.getConversation(h.key);
+      expect(done!.state).toBe('idle');
+      // The cap was respected: reprocessCount never exceeded MAX_REPROCESS while
+      // deferring, and resets to 0 on the clean completion.
+      expect(done!.reprocessCount).toBe(0);
+      await h.agent.close();
+    });
+
+    it('cap-reached committed flush ALWAYS sends + overflow becomes a follow-up turn (FIX 1)', async () => {
+      // BLOCKING-BUG REGRESSION. Drive reprocessCount to MAX_REPROCESS via
+      // successive aborts (a late arrival aborts each interruptible flush). At the
+      // cap the next flush is COMMITTED (un-abortable): a message arriving DURING it
+      // can NOT abort it; it queues to lateArrivals. The committed flush MUST send a
+      // response (the accumulated batch), and the message that arrived during it
+      // MUST produce a SECOND, follow-up response. Pre-FIX-1 the cap-triggering
+      // abort dropped the whole turn and the user got NO reply.
+      const MAX_REPROCESS = 5;
+      const h = makeInterruptHarness((req, i) => textResponse(`reply-${i}-n${req.messages.length}`));
+      let nextId = 0;
+
+      // Turn 1: m_0 → flush → chat #0 parks in-flight (interruptible, reprocessCount 0).
+      await h.agent.handleInbound(mkInbound(`m_${nextId++}`, 'msg'));
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      // Drive reprocessCount up to MAX_REPROCESS via successive aborts. Each loop:
+      // a late arrival aborts the in-flight interruptible flush → rebatch (count++),
+      // then the rescheduled flush parks again.
+      for (let i = 0; i < MAX_REPROCESS; i++) {
+        await h.agent.handleInbound(mkInbound(`m_${nextId++}`, 'more'));
+        await vi.advanceTimersByTimeAsync(20_000);
+      }
+      const atCap = await h.store.getConversation(h.key);
+      // The flush now in-flight is COMMITTED: reprocessCount is at the cap and NO
+      // abort handle was registered for it (committed flushes can't be interrupted).
+      expect(atCap!.reprocessCount).toBe(MAX_REPROCESS);
+      expect(atCap!.state).toBe('processing');
+      const committedCallIndex = h.chat.calls.length - 1;
+      const committedBatchSize = h.chat.calls[committedCallIndex]!.messages.length;
+      expect(committedBatchSize).toBeGreaterThan(1); // all the rebatched messages
+
+      // A message arrives DURING the committed flush. It must NOT abort it — it
+      // queues to lateArrivals (no controller present) for a follow-up turn.
+      await h.agent.handleInbound(mkInbound(`m_${nextId++}`, 'during-committed'));
+      await vi.advanceTimersByTimeAsync(0);
+      const duringCommitted = await h.store.getConversation(h.key);
+      expect(duringCommitted!.state).toBe('processing'); // committed flush still running
+      expect(duringCommitted!.lateArrivals.map(m => m.text)).toEqual(['during-committed']);
+
+      // Release the committed flush → it SENDS its response (the BLOCKING fix: no
+      // dropped turn at the cap).
+      h.chat.release(committedCallIndex);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.adapter.sendText).toHaveBeenCalledTimes(1);
+      expect(h.adapter.sendText).toHaveBeenLastCalledWith(
+        'fb-user',
+        `reply-${committedCallIndex}-n${committedBatchSize}`
+      );
+
+      // The committed flush's completion turned the late arrival into a FOLLOW-UP
+      // turn (state buffering, reprocessCount reset to 0), NOT a lost message.
+      const afterCommitted = await h.store.getConversation(h.key);
+      expect(afterCommitted!.reprocessCount).toBe(0);
+      expect(afterCommitted!.state).toBe('buffering');
+      expect(afterCommitted!.inboundBuffer.map(m => m.text)).toEqual(['during-committed']);
+      expect(afterCommitted!.lateArrivals).toEqual([]);
+
+      // Fire the follow-up flush → a SECOND chat call carrying only the overflow
+      // message, and a SECOND response is sent. Nothing was dropped.
+      await vi.advanceTimersByTimeAsync(20_000);
+      const followUpIndex = h.chat.calls.length - 1;
+      expect(h.chat.calls[followUpIndex]!.messages.map(m => m.text)).toEqual(['during-committed']);
+      h.chat.release(followUpIndex);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(h.adapter.sendText).toHaveBeenCalledTimes(2);
+      const done = await h.store.getConversation(h.key);
+      expect(done!.state).toBe('idle');
+      expect(done!.reprocessCount).toBe(0);
+      await h.agent.close();
+    });
   });
 
   it('handleStatus concurrent with an in-flight send does not double-advance (exactly-once)', async () => {

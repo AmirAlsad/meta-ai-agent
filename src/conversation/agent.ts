@@ -48,6 +48,7 @@ import type {
   TemplateComponent
 } from '../meta/shared/adapter.js';
 import { inferMediaKind } from '../meta/shared/media.js';
+import type { InboundMediaHydrator } from '../meta/shared/media-hydrator.js';
 import type { Channel, IncomingMessage, StatusUpdate } from '../meta/types.js';
 import type { WhatsAppClient } from '../meta/whatsapp/client.js';
 import type { AgentMetrics } from '../metrics/registry.js';
@@ -110,6 +111,17 @@ const MAX_TYPING_DELAY_MS = 1500;
  */
 const MAX_EXPLICIT_TYPING_DURATION_MS = 10_000;
 
+/**
+ * Maximum number of times a single turn may be deferred + rebatched because a
+ * late message interrupted its in-flight chat call (the interrupt/rebatch flow
+ * in {@link ConversationAgent.handleInboundImpl} / {@link
+ * ConversationAgent.flushImpl}). Once a turn has reprocessed this many times, the
+ * NEXT flush processes whatever it has WITHOUT deferring again (logging a warn) —
+ * so a user typing a steady, never-ending stream of messages eventually gets a
+ * response instead of starving forever. Reset to 0 on every clean turn.
+ */
+const MAX_REPROCESS = 5;
+
 export interface ConversationAgentDeps {
   store: ConversationStore;
   scheduler: BufferScheduler;
@@ -134,6 +146,15 @@ export interface ConversationAgentDeps {
   identityResolver?: IdentityResolver;
   /** Optional delivery-status history sink. Absent ⇒ no status tracking. */
   statusTracker?: StatusTracker;
+  /**
+   * OPTIONAL inbound media hydrator (opt-in, additive). When present, the flush
+   * path downloads each buffered message's media and attaches a base64 data URL
+   * to `message.media.dataUrl` before the chat call, so the endpoint can see
+   * WhatsApp media it can't fetch itself. Absent ⇒ no hydration, exactly today's
+   * behavior. `buildRuntime` only constructs one when
+   * `config.conversation.inboundMediaDownload` is true. Fail-open: never throws.
+   */
+  mediaHydrator?: InboundMediaHydrator;
 }
 
 export class ConversationAgent {
@@ -150,6 +171,7 @@ export class ConversationAgent {
   private readonly metrics?: AgentMetrics;
   private readonly identityResolver?: IdentityResolver;
   private readonly statusTracker?: StatusTracker;
+  private readonly mediaHydrator?: InboundMediaHydrator;
 
   /**
    * Per-conversation delivery-timeout fallback timers, keyed by conversation
@@ -157,6 +179,16 @@ export class ConversationAgent {
    * never arrives, the timer advances the queue so it cannot wedge forever.
    */
   private readonly deliveryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * Per-conversation-key {@link AbortController} for the chat call currently in
+   * flight (state `processing`). Set by {@link flushImpl} just before it AWAITs
+   * the chat call (outside the lock) and cleared right after. When an inbound
+   * arrives for a key whose chat call is in flight, {@link handleInboundImpl}
+   * aborts it here so the wasted call is cancelled and the turn is rebatched with
+   * the late message — producing ONE combined response instead of two.
+   */
+  private readonly inFlightChatAborts = new Map<string, AbortController>();
 
   /**
    * Per-conversation-key serialization tails. Each value is the promise that
@@ -188,15 +220,22 @@ export class ConversationAgent {
     this.metrics = deps.metrics;
     this.identityResolver = deps.identityResolver;
     this.statusTracker = deps.statusTracker;
+    this.mediaHydrator = deps.mediaHydrator;
 
     // Register the buffer-flush handler exactly once. The scheduler fires this
     // after a conversation's burst window elapses (see calculateBufferTimeout).
     // The scheduler timer fires OUTSIDE any held lock, so this is a true entry
-    // point: it ACQUIRES the per-key lock before running the (lock-free)
-    // flush body, serializing flush against handleInbound/handleStatus/timeout
-    // for the same key.
+    // point.
+    //
+    // NOTE (changed for the batching fix): flushImpl is NO LONGER wrapped in a
+    // single runExclusive that spans the whole flush. The chat call is slow, and
+    // holding the per-key lock across it blocked every concurrent handleInbound
+    // for that key — so a second message couldn't interrupt/rebatch the in-flight
+    // turn and produced a SECOND response. flushImpl now acquires the lock only
+    // around its record read-modify-write SEGMENTS and RELEASES it during the
+    // awaited chat call (see flushImpl's doc + the locking comments inside it).
     this.scheduler.setHandler(async (conversationKey, options) => {
-      await this.runExclusive(conversationKey, () => this.flushImpl(conversationKey, options));
+      await this.flushImpl(conversationKey, options);
     });
   }
 
@@ -208,26 +247,30 @@ export class ConversationAgent {
   /*  ACQUIRE the lock (true entry points, each fired OUTSIDE any held lock): */
   /*    • handleInbound, handleStatus            (public; called by the HTTP   */
   /*      dispatcher concurrently per webhook)                                 */
-  /*    • the scheduler flush handler            (constructor; fired by a      */
-  /*      buffer timer)                                                        */
   /*    • the delivery-timeout callback          (startDeliveryTimeout's       */
   /*      setTimeout; fired by a delivery timer)                               */
   /*    • handleReaction DOES NOT acquire — it delegates to handleInbound,     */
   /*      which acquires, so it inherits the lock (acquiring here too would    */
   /*      deadlock the chain: a holder calling a same-key acquirer).           */
   /*                                                                          */
+  /*  SEGMENTED locking (the batching fix):                                    */
+  /*    • flushImpl is fired by the scheduler OUTSIDE any held lock and        */
+  /*      acquires the lock ITSELF, but only around its record read-modify-    */
+  /*      write SEGMENTS — it RELEASES the lock for the slow chat call so a     */
+  /*      concurrent handleInbound can interrupt/rebatch the in-flight turn.    */
+  /*      See flushImpl's doc for the full model + race-free argument.          */
+  /*                                                                          */
   /*  DO NOT acquire (internal; ONLY ever reached from within a holder, so    */
   /*  they assume the lock is already held):                                   */
-  /*    • flushImpl, sendNext, advanceAndContinue, markSkippedAndAdvance,      */
+  /*    • sendNext, advanceAndContinue, markSkippedAndAdvance,                 */
   /*      transitionToIdle, onDeliveryTimeoutImpl, handleInboundImpl,          */
-  /*      handleStatusImpl                                                     */
+  /*      handleStatusImpl, interruptSending                                   */
   /*                                                                          */
   /*  NO-DEADLOCK INVARIANT: no lock-holding (acquired) path ever calls        */
   /*  another lock-acquiring method for the SAME key. The acquiring methods    */
-  /*  call ONLY the *Impl bodies, and no *Impl body calls handleInbound /      */
-  /*  handleStatus / onDeliveryTimeout (verified against the call graph). The  */
-  /*  promise chain is therefore strictly linear per key and cannot wait on    */
-  /*  itself.                                                                  */
+  /*  call ONLY the *Impl bodies (and flushImpl's lock-free segment bodies),   */
+  /*  and none of those calls a lock acquirer for the same key. The promise    */
+  /*  chain is therefore strictly linear per key and cannot wait on itself.    */
   /* ──────────────────────────────────────────────────────────────────────── */
 
   /**
@@ -369,34 +412,76 @@ export class ConversationAgent {
         this.metrics?.identityLookupTotal.inc({ result: 'disabled' });
       }
 
-      // Append to the buffer and refresh the activity/window bookkeeping. The
-      // 24h messaging window restarts from every inbound (`lastInboundAt + 24h`).
-      record.inboundBuffer.push(message);
+      // Refresh activity/window bookkeeping for EVERY accepted inbound. The 24h
+      // messaging window restarts from every inbound (`lastInboundAt + 24h`).
       record.lastInboundAt = now;
       record.windowExpiresAt = now + MESSAGING_WINDOW_MS;
       record.lastActivity = now;
       record.lastInboundMessageId = message.channelMessageId;
       if (traceId !== undefined) record.traceId = traceId;
-      record.state = 'buffering';
-      await this.store.setConversation(record);
 
-      // (Re)arm the flush timer. A fresh inbound resets the per-key timer, so a
-      // rapid burst aggregates into ONE flush rather than N chat calls.
-      //
-      // LOCK SAFETY: we're holding the per-key lock here. `scheduler.schedule`
-      // with `delayMs > 0` only registers a setTimeout and returns — the flush
-      // handler (which re-acquires the SAME key's lock) fires LATER, outside
-      // this lock, so there is no self-deadlock. A `delayMs <= 0` would make the
-      // scheduler fire the handler INLINE (synchronously), which WOULD deadlock
-      // the chain. `calculateBufferTimeout` never returns <= 0 for a valid
-      // config (bufferBaseTimeoutMs is a positive int, clamped to >= base*0.5),
-      // so this stays safe — keep that invariant if the buffer math changes.
-      const delayMs = calculateBufferTimeout(
-        record.inboundBuffer.length,
-        this.config.conversation,
-        this.random
-      );
-      await this.scheduler.schedule(key, delayMs, traceId !== undefined ? { traceId } : undefined);
+      // STATE-BRANCH on the conversation's lifecycle phase. This is the crux of
+      // the batching fix: where the message lands (and whether we (re)arm a flush
+      // or interrupt one) depends on what the turn is currently doing.
+      switch (record.state) {
+        case 'idle':
+        case 'buffering': {
+          // Normal accumulation: append to the buffer, (re)arm the flush timer so
+          // a rapid burst aggregates into ONE flush rather than N chat calls.
+          record.inboundBuffer.push(message);
+          record.state = 'buffering';
+          await this.store.setConversation(record);
+
+          // LOCK SAFETY: we're holding the per-key lock here. `scheduler.schedule`
+          // with `delayMs > 0` only registers a setTimeout and returns — the flush
+          // handler (which re-acquires the SAME key's lock) fires LATER, outside
+          // this lock, so there is no self-deadlock. A `delayMs <= 0` would make
+          // the scheduler fire the handler INLINE (synchronously), which WOULD
+          // deadlock the chain. `calculateBufferTimeout` never returns <= 0 for a
+          // valid config (bufferBaseTimeoutMs is a positive int, clamped to >=
+          // base*0.5), so this stays safe — keep that invariant if the buffer math
+          // changes.
+          const delayMs = calculateBufferTimeout(
+            record.inboundBuffer.length,
+            this.config.conversation,
+            this.random
+          );
+          await this.scheduler.schedule(key, delayMs, traceId !== undefined ? { traceId } : undefined);
+          break;
+        }
+        case 'processing': {
+          // A message arrived WHILE the flush's chat call is in flight. The buffer
+          // was already snapshotted + cleared by flushImpl, so appending here
+          // would be re-sent in THIS turn (or lost). Instead stash it in
+          // `lateArrivals` and ABORT the in-flight chat call so the (now stale)
+          // request is cancelled — don't waste it. We do NOT schedule a new flush:
+          // flushImpl's post-chat reprocess check sees `lateArrivals.length > 0`,
+          // folds `[...batch, ...lateArrivals]` back into the buffer, and arms a
+          // fresh flush. Net effect: the two messages become ONE combined
+          // response instead of two.
+          record.lateArrivals.push(message);
+          await this.store.setConversation(record);
+          // ABORT-ONLY-IF-A-CONTROLLER-IS-PRESENT: a flush that is at the reprocess
+          // cap is COMMITTED — flushImpl registers NO AbortController for it (see
+          // flushImpl's "committed flush" segment), so it must run to completion and
+          // SEND its response. Finding no controller here means "don't interrupt";
+          // the late arrival still sits in `lateArrivals`, where flushImpl's
+          // finalization turns it into a fresh FOLLOW-UP turn. For a normal
+          // (interruptible) flush a controller IS present and we abort it to rebatch.
+          const inFlight = this.inFlightChatAborts.get(key);
+          if (inFlight) inFlight.abort();
+          break;
+        }
+        case 'sending': {
+          // Mid-delivery interrupt: a new message arrived while we were sending a
+          // previous turn's outbound queue. Roll the turn back to `buffering` with
+          // the new message so the user gets ONE coherent follow-up that accounts
+          // for what they just said, rather than the rest of a now-stale reply
+          // followed by a second reply. Mirrors the reference's interruptSending.
+          await this.interruptSending(record, message, traceId);
+          break;
+        }
+      }
     } catch (error) {
       logger.error(
         { err: error, channel: message.channel, channelMessageId: message.channelMessageId },
@@ -425,6 +510,55 @@ export class ConversationAgent {
     await this.handleInbound(message, opts);
   }
 
+  /**
+   * Interrupt an in-flight `sending` turn so a message that arrived mid-delivery
+   * is folded into a fresh, combined turn. Mirrors the reference's
+   * `interruptSending`, adapted to our queue/lock model.
+   *
+   * Called ONLY from {@link handleInboundImpl} (the `sending` branch), so the
+   * per-key lock is already held — every record read-modify-write below is part
+   * of that one critical section. We:
+   *   - clear the delivery-timeout fallback for this key (the old turn's queue is
+   *     being abandoned, so its timer must not fire against a stale index);
+   *   - drop the in-flight outbound-handle mapping (a late status for the
+   *     abandoned item must not advance the new turn);
+   *   - reset the outbound queue + cursor, stash the new message in the buffer,
+   *     reset `reprocessCount`, and return to `buffering`;
+   *   - (re)arm a flush so the rebatched input produces one combined response.
+   *
+   * WHY full interrupt (not just defer): once we are `sending`, the chat call for
+   * the old turn already returned, so there is no in-flight chat to abort and
+   * deferring to a reprocess can't help — the queue would keep draining stale
+   * replies. Rolling back to `buffering` with the new message is what gives the
+   * user a single coherent follow-up. Unsent queue items are simply dropped
+   * (Stage 5 has no "cancelled message" surface; the chat endpoint re-decides the
+   * whole reply from the combined buffer on the next flush).
+   */
+  private async interruptSending(
+    record: ConversationRecord,
+    message: IncomingMessage,
+    traceId?: string
+  ): Promise<void> {
+    const key = record.key;
+    this.clearDeliveryTimeout(key);
+    if (record.currentOutboundMessageId !== undefined) {
+      await this.store.deleteOutboundHandleMapping(record.currentOutboundMessageId);
+    }
+
+    record.inboundBuffer.push(message);
+    record.lateArrivals = [];
+    record.outboundQueue = [];
+    record.currentOutboundIndex = 0;
+    delete record.currentOutboundMessageId;
+    record.reprocessCount = 0;
+    record.state = 'buffering';
+    record.lastActivity = this.now();
+    await this.store.setConversation(record);
+
+    const delayMs = calculateBufferTimeout(record.inboundBuffer.length, this.config.conversation, this.random);
+    await this.scheduler.schedule(key, delayMs, traceId !== undefined ? { traceId } : undefined);
+  }
+
   /* ──────────────────────────────────────────────────────────────────────── */
   /* Flush (buffering → processing → sending)                                 */
   /* ──────────────────────────────────────────────────────────────────────── */
@@ -433,121 +567,284 @@ export class ConversationAgent {
    * Buffer-flush body. Snapshots the buffered turn, calls the chat endpoint, and
    * starts ordered delivery of the resulting actions.
    *
-   * INTERNAL / lock-free: invoked ONLY by the scheduler handler (constructor),
-   * which wraps it in {@link runExclusive}, so it runs with the per-key lock
-   * already held. It must NOT re-acquire (it calls sendNext/transitionToIdle,
-   * which are likewise lock-free).
+   * THE LOCKING MODEL (changed for the batching fix — read before editing):
+   * unlike the other handlers, flushImpl is NOT wrapped in a single
+   * {@link runExclusive} by its caller (the scheduler handler). The chat call is
+   * slow, and holding the per-key lock across it blocked every concurrent
+   * handleInbound for that key, which is exactly what produced TWO responses for
+   * two messages sent close together. So flushImpl ACQUIRES the lock only around
+   * its record read-modify-write SEGMENTS and RELEASES it while it awaits the
+   * chat call:
+   *
+   *   [lock] load record, snapshot+clear buffer, set `processing`, store an
+   *          AbortController, save                                  [unlock]
+   *      → AWAIT chatClient.complete(request, signal)  ← NO LOCK HELD HERE
+   *   [lock] re-read record; if late arrivals → rebatch + reschedule + return,
+   *          else attach the outbound queue + set `sending`, save   [unlock]
+   *      → run the send loop (sendNext) under one more locked segment.
+   *
+   * WHY THIS IS STILL RACE-FREE (the Stage 5 clobber-prevention is preserved):
+   * every record mutation here is a COMPLETE locked read-modify-write — load,
+   * mutate, save, all inside one runExclusive — so two flows for the same key can
+   * never both read the same clone and clobber each other. The only thing moved
+   * OUTSIDE the lock is the chat call, which mutates NOTHING (it just produces a
+   * response into a local var) until it re-acquires the lock to apply its result.
+   * A concurrent handleInbound that lands during the unlocked chat call therefore
+   * runs a full, isolated read-modify-write of its own (appending to lateArrivals
+   * + aborting the chat) — and the post-chat re-read segment observes that and
+   * rebatches. Lock guards record mutations, not chat I/O.
+   *
+   * INTERNAL: only the scheduler handler calls this. It must NOT itself be called
+   * from inside a held lock for `key` (it acquires the lock), and it never calls
+   * a lock-acquiring handler for `key` (only the lock-free *Impl helpers, each
+   * inside its own runExclusive segment) — so the no-deadlock invariant holds.
    */
   private async flushImpl(key: string, opts?: { traceId?: string }): Promise<void> {
     const traceId = opts?.traceId;
     const logger = this.childLogger(traceId);
     try {
-      const record = await this.store.getConversation(key);
-      if (!record || record.inboundBuffer.length === 0) {
-        // Nothing to flush (already drained by a prior flush, or no record).
-        return;
+      // ── Locked segment 1: snapshot the buffer, enter `processing`, arm abort ──
+      const prep = await this.runExclusive(key, async () => {
+        const record = await this.store.getConversation(key);
+        if (!record || record.inboundBuffer.length === 0) {
+          // Nothing to flush (already drained by a prior flush, or no record).
+          return undefined;
+        }
+        const adapter = this.adapters[record.channel];
+        if (!adapter) {
+          // Channel not configured (no adapter wired) — cannot send a reply.
+          logger.warn({ conversationKey: key, channel: record.channel }, 'no adapter for channel; dropping turn');
+          record.state = 'idle';
+          delete record.currentOutboundMessageId;
+          record.lastActivity = this.now();
+          await this.store.setConversation(record);
+          return undefined;
+        }
+
+        // WHY snapshot-and-clear up front: the chat call is async and a new
+        // inbound may arrive mid-flight. Clearing the buffer NOW (and persisting)
+        // means a late inbound lands in `lateArrivals` (handleInbound's
+        // `processing` branch) instead of this turn's already-snapshotted batch.
+        const batch = record.inboundBuffer;
+        record.inboundBuffer = [];
+        record.lateArrivals = [];
+        record.state = 'processing';
+        await this.store.setConversation(record);
+
+        // COMMITTED FLUSH: once a turn has hit the reprocess cap, this flush MUST
+        // produce + SEND a response — it can no longer be interrupted/rebatched, or
+        // a relentless message stream would let the user be aborted forever and get
+        // NO reply at the cap (the lost-turn bug). We mark it committed by NOT
+        // registering an AbortController: with no controller in the map,
+        // handleInbound's `processing` branch can't abort it (it queues the late
+        // message to `lateArrivals` instead), so the chat call runs to completion.
+        // Any messages that arrive during a committed flush become a fresh FOLLOW-UP
+        // turn (see flushImpl's finalization), never lost.
+        const committed = record.reprocessCount >= MAX_REPROCESS;
+        let signal: AbortSignal | undefined;
+        if (!committed) {
+          // Normal (interruptible) flush: arm the abort handle BEFORE leaving the
+          // lock so a late inbound that lands during the (unlocked) chat call can
+          // cancel the now-stale request and trigger a rebatch.
+          const abort = new AbortController();
+          this.inFlightChatAborts.set(key, abort);
+          signal = abort.signal;
+        }
+
+        // Read receipt for this turn — fired BEFORE the chat call so a silent,
+        // reaction-only, or even chat-error turn still marks the user's message
+        // read. Best-effort.
+        await this.maybeMarkRead(record, adapter, logger);
+
+        const capabilities = this.capabilitiesOf(adapter);
+        const now = this.now();
+        const request: ChatRequest = {
+          channel: record.channel,
+          conversationKey: key,
+          // Backward-compat aggregated text: the buffered bodies, newline-joined.
+          message: batch
+            .map(m => m.text)
+            .filter((t): t is string => t !== undefined)
+            .join('\n'),
+          messages: batch,
+          capabilities,
+          context: {
+            windowOpen: isWindowOpen(record, now),
+            ...(record.windowExpiresAt !== undefined ? { windowExpiresAt: record.windowExpiresAt } : {})
+          },
+          ...(record.contact !== undefined ? { contact: record.contact } : {})
+        };
+        return { batch, request, signal, committed };
+      });
+      if (!prep) return; // nothing to flush / no adapter (already handled under lock).
+
+      // ── Unlocked: inbound media hydration on the LOCAL snapshot. ──
+      // WHY here: this is opt-in transport-side download (it holds the access
+      // token the chat endpoint lacks), so the media rides INTO the request as a
+      // base64 data URL. It runs OUTSIDE the lock — it is pure I/O on the local
+      // `prep.batch` (whose message objects ARE `request.messages`), mutates no
+      // record, and must precede the chat call so the data is present in the
+      // request. Each hydrate is independently FAIL-OPEN (never throws), so one
+      // bad attachment can't sink the turn; idempotent on reprocess via the
+      // dataUrl check. Absent hydrator ⇒ skipped entirely (today's behavior).
+      if (this.mediaHydrator) {
+        const hydrator = this.mediaHydrator;
+        await Promise.all(
+          prep.batch.map(async message => {
+            if (!message.media || message.media.dataUrl !== undefined) return;
+            const dataUrl = await hydrator.hydrate(message);
+            if (dataUrl && message.media) message.media.dataUrl = dataUrl;
+          })
+        );
       }
 
-      // WHY snapshot-and-clear up front: the chat call is async and a new
-      // inbound may arrive mid-flight. Clearing the buffer NOW (and persisting)
-      // means those new messages accumulate cleanly for the NEXT flush instead
-      // of being re-sent in this turn or lost when we overwrite the record.
-      const batch = record.inboundBuffer;
-      record.inboundBuffer = [];
-      record.state = 'processing';
-      await this.store.setConversation(record);
-
-      const adapter = this.adapters[record.channel];
-      if (!adapter) {
-        // Channel not configured (no adapter wired) — cannot send a reply.
-        logger.warn({ conversationKey: key, channel: record.channel }, 'no adapter for channel; dropping turn');
-        await this.transitionToIdle(key);
-        return;
-      }
-
-      // Read receipt for this turn — fired BEFORE the chat call so a silent,
-      // reaction-only, or even chat-error turn still marks the user's message
-      // read. Decoupled from the typing indicator (which only marks read as a
-      // WhatsApp side effect when a text reply is sent). Best-effort.
-      await this.maybeMarkRead(record, adapter, logger);
-
-      const capabilities = this.capabilitiesOf(adapter);
-      const now = this.now();
-      const request: ChatRequest = {
-        channel: record.channel,
-        conversationKey: key,
-        // Backward-compat aggregated text: the buffered bodies, newline-joined.
-        message: batch
-          .map(m => m.text)
-          .filter((t): t is string => t !== undefined)
-          .join('\n'),
-        messages: batch,
-        capabilities,
-        context: {
-          windowOpen: isWindowOpen(record, now),
-          ...(record.windowExpiresAt !== undefined ? { windowExpiresAt: record.windowExpiresAt } : {})
-        },
-        ...(record.contact !== undefined ? { contact: record.contact } : {})
-      };
-
+      // ── Unlocked: the slow chat call. Lock is RELEASED here so a concurrent ──
+      // handleInbound can append to lateArrivals + abort this call (rebatch).
       let resp;
-      // Time only the chat dispatch (the developer's endpoint round-trip), using
-      // the injectable clock so tests stay deterministic.
+      let aborted = false;
       const t0 = this.now();
       try {
-        resp = await this.chatClient.complete(request);
+        // A committed flush passes NO signal (no AbortController was registered), so
+        // it cannot be aborted — it always runs to completion.
+        resp = await this.chatClient.complete(prep.request, prep.signal);
       } catch (error) {
-        this.metrics?.chatDispatchDuration.observe({ result: 'error' }, (this.now() - t0) / 1000);
-        this.metrics?.bufferFlushTotal.inc({ result: 'error' });
-        // Fail soft: Stage 10 adds retry. For now a chat-endpoint failure ends
-        // the turn quietly (the user simply gets no reply).
-        if (error instanceof ChatEndpointError) {
-          logger.error({ err: error, conversationKey: key }, 'chat endpoint failed; ending turn');
+        // The abort signal firing surfaces here (the client rejects when the
+        // external signal aborts). Distinguish it from a real endpoint error so we
+        // route to the reprocess path rather than ending the turn. A committed flush
+        // has no signal, so `aborted` stays false and a thrown error is a real one.
+        if (prep.signal?.aborted) {
+          aborted = true;
         } else {
-          logger.error({ err: error, conversationKey: key }, 'unexpected error calling chat endpoint');
+          this.metrics?.chatDispatchDuration.observe({ result: 'error' }, (this.now() - t0) / 1000);
+          this.metrics?.bufferFlushTotal.inc({ result: 'error' });
+          // Fail soft: Stage 10 adds retry. For now a chat-endpoint failure ends
+          // the turn quietly (the user simply gets no reply).
+          if (error instanceof ChatEndpointError) {
+            logger.error({ err: error, conversationKey: key }, 'chat endpoint failed; ending turn');
+          } else {
+            logger.error({ err: error, conversationKey: key }, 'unexpected error calling chat endpoint');
+          }
+          this.inFlightChatAborts.delete(key);
+          await this.runExclusive(key, () => this.transitionToIdle(key));
+          return;
         }
-        await this.transitionToIdle(key);
-        return;
+      } finally {
+        // The chat call is done (resolved, errored, or aborted) — the abort handle
+        // is no longer needed and a future inbound must not abort a settled call.
+        this.inFlightChatAborts.delete(key);
       }
-      this.metrics?.chatDispatchDuration.observe({ result: 'success' }, (this.now() - t0) / 1000);
-
-      // An explicit silence (or an empty action list) means "send nothing".
-      if (resp.silence === true || resp.actions.length === 0) {
-        this.metrics?.bufferFlushTotal.inc({ result: 'silence' });
-        logger.debug({ conversationKey: key, silence: resp.silence === true }, 'chat response produced no outbound');
-        await this.transitionToIdle(key);
-        return;
+      if (!aborted) {
+        this.metrics?.chatDispatchDuration.observe({ result: 'success' }, (this.now() - t0) / 1000);
       }
 
-      const { items, skipped } = buildOutboundItems(resp.actions, f => adapter.supports(f));
-      if (skipped.length > 0) {
-        logger.debug({ conversationKey: key, skipped }, 'some chat actions were skipped/downgraded');
-      }
-      if (items.length === 0) {
-        // Every action was unsupported and skipped (no downgrade produced an
-        // item). No outbound is dispatched, so count it as a silent flush.
-        this.metrics?.bufferFlushTotal.inc({ result: 'silence' });
-        logger.debug({ conversationKey: key }, 'no deliverable items after capability filtering');
-        await this.transitionToIdle(key);
-        return;
-      }
+      // ── Locked segment 2: decide reprocess-or-proceed, then attach the queue ──
+      const proceed = await this.runExclusive(key, async () => {
+        const record = await this.store.getConversation(key);
+        if (!record) return undefined;
 
-      // We have at least one deliverable item — the flush dispatched outbound work.
-      this.metrics?.bufferFlushTotal.inc({ result: 'dispatched' });
+        // REPROCESS: a late message arrived during the chat call AND it aborted the
+        // (interruptible) call. Only an interruptible flush reaches here with
+        // `aborted` true — a committed flush has no signal and never aborts. Fold
+        // `[...batch, ...lateArrivals]` back into the buffer (the batch was cleared
+        // in segment 1, so re-add it from the local snapshot) and reschedule a fresh
+        // flush so the COMBINED input becomes ONE response. The just-computed `resp`
+        // is stale/aborted, so discard it and RETURN. Bounded by MAX_REPROCESS so a
+        // never-ending stream can't starve: at the cap the NEXT flush is committed
+        // (un-abortable) and always sends — see the committed-flush handling below
+        // and in segment 1.
+        if (aborted && record.reprocessCount < MAX_REPROCESS) {
+          record.inboundBuffer = [...prep.batch, ...record.inboundBuffer, ...record.lateArrivals];
+          record.lateArrivals = [];
+          record.reprocessCount += 1;
+          record.state = 'buffering';
+          record.lastActivity = this.now();
+          await this.store.setConversation(record);
+          const delayMs = calculateBufferTimeout(record.inboundBuffer.length, this.config.conversation, this.random);
+          await this.scheduler.schedule(key, delayMs, traceId !== undefined ? { traceId } : undefined);
+          return undefined;
+        }
 
-      // Reload to pick up any record mutations (e.g. lastInboundMessageId from a
-      // concurrent inbound) before we attach the queue, then enter `sending`.
-      const sendRecord = (await this.store.getConversation(key)) ?? record;
-      sendRecord.outboundQueue = items;
-      sendRecord.currentOutboundIndex = 0;
-      delete sendRecord.currentOutboundMessageId;
-      sendRecord.state = 'sending';
-      await this.store.setConversation(sendRecord);
+        if (aborted) {
+          // Aborted AT the cap (an interruptible flush that hit MAX_REPROCESS). We
+          // do NOT send this aborted/stale `resp`; instead fold everything we have
+          // (this turn's batch + buffer + the late arrivals) back into the buffer
+          // and reschedule. The next flush will be COMMITTED (segment 1 sees
+          // reprocessCount >= MAX_REPROCESS, registers no AbortController) and is
+          // therefore un-abortable — it WILL produce + send a response. This is the
+          // BLOCKING-bug fix: the cap-triggering abort no longer drops the turn.
+          logger.warn(
+            { conversationKey: key, reprocessCount: record.reprocessCount },
+            'reprocess cap reached; next flush is committed and will send without further deferral'
+          );
+          record.inboundBuffer = [...prep.batch, ...record.inboundBuffer, ...record.lateArrivals];
+          record.lateArrivals = [];
+          record.state = 'buffering';
+          record.lastActivity = this.now();
+          await this.store.setConversation(record);
+          const delayMs = calculateBufferTimeout(record.inboundBuffer.length, this.config.conversation, this.random);
+          await this.scheduler.schedule(key, delayMs, traceId !== undefined ? { traceId } : undefined);
+          return undefined;
+        }
 
-      await this.sendNext(key, traceId);
+        // From here the chat call COMPLETED normally (or is a committed flush that
+        // ran to completion). Any messages that arrived during it sit in
+        // `lateArrivals` and become a fresh FOLLOW-UP turn once this turn finishes
+        // sending / goes silent — see `finalizeTurn`, which every completion path
+        // below funnels through so nothing is dropped.
+
+        // NORMAL completion: build + attach the outbound queue.
+        const r = resp!;
+        if (r.silence === true || r.actions.length === 0) {
+          this.metrics?.bufferFlushTotal.inc({ result: 'silence' });
+          logger.debug({ conversationKey: key, silence: r.silence === true }, 'chat response produced no outbound');
+          await this.finalizeTurn(record, traceId);
+          return undefined;
+        }
+
+        const adapter = this.adapters[record.channel];
+        if (!adapter) {
+          logger.warn({ conversationKey: key, channel: record.channel }, 'no adapter for channel; dropping turn');
+          await this.finalizeTurn(record, traceId);
+          return undefined;
+        }
+
+        const { items, skipped } = buildOutboundItems(r.actions, f => adapter.supports(f));
+        if (skipped.length > 0) {
+          logger.debug({ conversationKey: key, skipped }, 'some chat actions were skipped/downgraded');
+        }
+        if (items.length === 0) {
+          // Every action was unsupported and skipped (no downgrade produced an
+          // item). No outbound is dispatched, so count it as a silent flush.
+          this.metrics?.bufferFlushTotal.inc({ result: 'silence' });
+          logger.debug({ conversationKey: key }, 'no deliverable items after capability filtering');
+          await this.finalizeTurn(record, traceId);
+          return undefined;
+        }
+
+        // We have at least one deliverable item — the flush dispatched outbound work.
+        this.metrics?.bufferFlushTotal.inc({ result: 'dispatched' });
+        record.outboundQueue = items;
+        record.currentOutboundIndex = 0;
+        delete record.currentOutboundMessageId;
+        // The chat call produced deliverable output — reset the reprocess counter
+        // (the cap counts only consecutive aborts within one turn). Any `lateArrivals`
+        // are deliberately LEFT on the record: `finalizeTurn` (run when the queue
+        // drains in sendNext) folds them into a fresh follow-up turn so a message
+        // that arrived during a committed flush still gets its own response.
+        record.reprocessCount = 0;
+        record.state = 'sending';
+        await this.store.setConversation(record);
+        return true;
+      });
+      if (!proceed) return;
+
+      // ── Locked segment 3: drive ordered delivery (sendNext + its helpers are ──
+      // lock-free, so wrap the whole send loop in one runExclusive segment).
+      await this.runExclusive(key, () => this.sendNext(key, traceId));
     } catch (error) {
       logger.error({ err: error, conversationKey: key }, 'flush failed');
-      await this.transitionToIdle(key).catch(() => {
+      this.inFlightChatAborts.delete(key);
+      await this.runExclusive(key, () => this.transitionToIdle(key)).catch(() => {
         /* best-effort cleanup; original error already logged. */
       });
     }
@@ -574,10 +871,11 @@ export class ConversationAgent {
       currentIndex: record.currentOutboundIndex
     };
     if (isQueueComplete(state)) {
-      delete record.currentOutboundMessageId;
-      record.state = 'idle';
-      record.lastActivity = this.now();
-      await this.store.setConversation(record);
+      // Queue drained — finalize. If messages arrived DURING this turn (a committed
+      // flush can't be interrupted, so they queued in `lateArrivals`), finalizeTurn
+      // turns them into a fresh follow-up turn instead of going idle, so nothing is
+      // dropped. It also resets reprocessCount now that the turn fully completed.
+      await this.finalizeTurn(record, traceId);
       return;
     }
 
@@ -1120,6 +1418,44 @@ export class ConversationAgent {
     await this.store.setConversation(record);
   }
 
+  /**
+   * Finalize a turn that COMPLETED (sent its outbound, went silent, or had nothing
+   * deliverable). Two outcomes, both of which RESET `reprocessCount` to 0 — the cap
+   * counts only consecutive aborts WITHIN one logical turn, so a turn that actually
+   * resolved starts the next turn fresh:
+   *
+   *  - OVERFLOW FOLLOW-UP: if messages arrived during this turn (`lateArrivals`,
+   *    e.g. during a COMMITTED flush that couldn't be interrupted), they are NOT
+   *    lost. Move them into `inboundBuffer`, drop back to `buffering`, and schedule
+   *    a fresh flush — a brand-new logical turn that produces its OWN response.
+   *  - OTHERWISE: go fully idle (clearing any delivery timer), exactly as before.
+   *
+   * Called from the lock-held completion paths (segment 2 silence/no-deliverable
+   * branches and `sendNext`'s queue-complete branch), so it assumes the per-key
+   * lock is held and the caller passes the freshly-loaded `record`.
+   */
+  private async finalizeTurn(record: ConversationRecord, traceId?: string): Promise<void> {
+    const key = record.key;
+    this.clearDeliveryTimeout(key);
+    record.reprocessCount = 0;
+    delete record.currentOutboundMessageId;
+    if (record.lateArrivals.length > 0) {
+      record.inboundBuffer = [...record.inboundBuffer, ...record.lateArrivals];
+      record.lateArrivals = [];
+      record.outboundQueue = [];
+      record.currentOutboundIndex = 0;
+      record.state = 'buffering';
+      record.lastActivity = this.now();
+      await this.store.setConversation(record);
+      const delayMs = calculateBufferTimeout(record.inboundBuffer.length, this.config.conversation, this.random);
+      await this.scheduler.schedule(key, delayMs, traceId !== undefined ? { traceId } : undefined);
+      return;
+    }
+    record.state = 'idle';
+    record.lastActivity = this.now();
+    await this.store.setConversation(record);
+  }
+
   /** The adapter's `supports()` truth set, as the array the chat request wants. */
   private capabilitiesOf(adapter: ChannelAdapter): ChannelFeature[] {
     return ALL_CHANNEL_FEATURES.filter(feature => adapter.supports(feature));
@@ -1189,10 +1525,23 @@ export class ConversationAgent {
     return traceId !== undefined ? this.logger.child({ traceId }) : this.logger;
   }
 
-  /** Clear all delivery timers and close the buffer scheduler. */
+  /** Clear all delivery timers, abort in-flight chats, and close the scheduler. */
   async close(): Promise<void> {
     for (const handle of this.deliveryTimeouts.values()) clearTimeout(handle);
     this.deliveryTimeouts.clear();
+    // RESOURCE: abort every in-flight chat call so shutdown cancels the underlying
+    // HTTP request rather than leaving an open socket to a slow chat endpoint
+    // dangling past close(). Each abort just rejects the awaiting flush (handled as
+    // an abort); swallow per-controller failures so one bad abort can't block the
+    // rest. Clear the map so a late inbound after close() finds no stale handle.
+    for (const controller of this.inFlightChatAborts.values()) {
+      try {
+        controller.abort();
+      } catch {
+        /* best-effort: a controller that fails to abort must not block shutdown. */
+      }
+    }
+    this.inFlightChatAborts.clear();
     await this.scheduler.close();
   }
 }

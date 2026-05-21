@@ -1,5 +1,5 @@
 {
-  "//": "Self-contained tsconfig for the showcase-bot package ONLY. It deliberately does NOT extend the root tsconfig: this package has its own node_modules (it brings @anthropic-ai/sdk, which the root package must never pull in), so it must typecheck against those, independent of the root project.",
+  "//": "Self-contained tsconfig for the showcase-bot package ONLY. It deliberately does NOT extend the root tsconfig: this package has its own node_modules (it brings the Vercel AI SDK + provider SDKs, which the root package must never pull in), so it must typecheck against those, independent of the root project.",
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022"],
@@ -16,6 +16,6 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts"],
+  "include": ["src/**/*.ts"],
   "exclude": ["node_modules"]
 }

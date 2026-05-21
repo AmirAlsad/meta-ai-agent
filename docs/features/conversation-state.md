@@ -29,27 +29,48 @@ A conversation moves through four phases. `ConversationStateName` is
 
 ```
 idle ──first inbound──▶ buffering ──flush timer fires──▶ processing
-                                                              │
-                                                  chat endpoint returns
-                                                              │
-                                                              ▼
-idle ◀──queue complete / silence / chat error / no adapter── sending
+   ▲                       ▲   ▲                            │
+   │                       │   └─ late inbound aborts the   │
+   │                       │      in-flight chat → rebatch  │
+   │           interruptSending  (processing → buffering)   │
+   │           (new inbound mid-send)             chat endpoint returns
+   │                       │                                │
+   │                       │                                ▼
+   └──queue complete / silence / chat error / no adapter── sending
+            (via finalizeTurn — may instead spawn a
+             follow-up buffering turn from lateArrivals)
 ```
 
 | Transition | Where it happens | Trigger |
 | --- | --- | --- |
-| `idle → buffering` | `handleInboundImpl` sets `record.state = 'buffering'` and (re)arms the flush timer | First inbound message (and every subsequent inbound while buffering — each resets the timer) |
-| `buffering → processing` | `flushImpl` snapshots the buffer, clears it, sets `record.state = 'processing'`, then calls `chatClient.complete` | The buffer scheduler fires after the burst window elapses |
-| `processing → sending` | `flushImpl` builds the outbound queue from the chat response and sets `record.state = 'sending'` | Chat endpoint returned deliverable actions |
-| `processing → idle` | `flushImpl` calls `transitionToIdle` | Chat error, explicit `silence`, empty action list, no deliverable items after capability filtering, or no adapter for the channel |
-| `sending → idle` | `sendNext` finds the queue complete and sets `record.state = 'idle'` | The outbound cursor advances past the last item |
+| `idle → buffering` | `handleInboundImpl` (`idle`/`buffering` branch) appends to `inboundBuffer`, sets `record.state = 'buffering'`, and (re)arms the flush timer | First inbound message (and every subsequent inbound while buffering — each resets the timer) |
+| `buffering → processing` | `flushImpl` locked segment 1 snapshots the buffer, clears `inboundBuffer` and `lateArrivals`, sets `record.state = 'processing'`, registers an `AbortController` (unless committed), then calls `chatClient.complete` outside the lock | The buffer scheduler fires after the burst window elapses |
+| `processing → buffering` | `flushImpl` locked segment 2: an inbound arrived during the chat call and aborted it (or the reprocess cap was hit) → fold `[...batch, ...inboundBuffer, ...lateArrivals]` back into `inboundBuffer`, increment `reprocessCount` (unless at cap), and reschedule a flush | A late arrival aborted the in-flight chat (rebatch), or the abort happened at `MAX_REPROCESS` (cap overflow — the next flush is committed) |
+| `processing → sending` | `flushImpl` locked segment 2 builds the outbound queue from the chat response, resets `reprocessCount = 0`, and sets `record.state = 'sending'` | Chat endpoint returned deliverable actions |
+| `processing → idle` | `flushImpl` calls `transitionToIdle` | Chat error (not an abort), or no adapter at segment 1 |
+| `processing → idle` / `processing → buffering` | `flushImpl` segment 2 silence / no-deliverable branches call `finalizeTurn` | Explicit `silence`, empty action list, or no deliverable items after capability filtering — `finalizeTurn` goes `idle` unless `lateArrivals` is non-empty, in which case it spawns a follow-up `buffering` turn |
+| `sending → buffering` | `handleInboundImpl` (`sending` branch) calls `interruptSending` | A new inbound arrives mid-delivery — the turn is rolled back and rebatched |
+| `sending → idle` / `sending → buffering` | `sendNext` finds the queue complete and calls `finalizeTurn` | The outbound cursor advances past the last item — `finalizeTurn` goes `idle`, or spawns a follow-up `buffering` turn if `lateArrivals` is non-empty |
 | `sending → idle` | `transitionToIdle` | No adapter mid-send, or an unexpected error in the flush body |
 
+`finalizeTurn` is the single completion path for a turn that resolved (sent its
+outbound, went silent, or had nothing deliverable). It clears the delivery
+timeout, resets `reprocessCount` to 0, then either:
+
+- **Follow-up turn:** if `lateArrivals` is non-empty (messages arrived during a
+  *committed* flush that could not be interrupted — see the locking section
+  below), it moves them into `inboundBuffer`, resets the outbound queue/cursor,
+  drops back to `buffering`, and schedules a fresh flush — a brand-new logical
+  turn that produces its own response, so nothing is dropped.
+- **Idle:** otherwise it sets `record.state = 'idle'` and stamps `lastActivity`.
+
 `sendNext` is the only place that completes the queue: when
-`isQueueComplete(state)` is true it clears `currentOutboundMessageId`, sets state
-back to `idle`, and stamps `lastActivity`. Ordered advancement within `sending`
-(WhatsApp waiting on a delivery status vs. Messenger/Instagram advancing on send)
-is covered in [Ordered delivery](./ordered-delivery.md).
+`isQueueComplete(state)` is true it calls `finalizeTurn` (which replaced the old
+inline transition-to-idle). Ordered advancement within `sending` (WhatsApp waiting
+on a delivery status vs. Messenger/Instagram advancing on send) and the
+`interruptSending` rollback are covered in
+[Ordered delivery](./ordered-delivery.md). The interrupt/rebatch behavior on the
+inbound side is covered in [Message buffering](./message-buffering.md).
 
 ## Conversation keying
 
@@ -82,7 +103,9 @@ The record is the unit the store persists and the agent mutates
 | --- | --- |
 | `key`, `channel`, `channelScopedUserId`, `channelScopedBusinessId` | Identity of the conversation. |
 | `state` | Current `ConversationStateName`. |
-| `inboundBuffer` | Inbound messages awaiting flush to the chat endpoint. Cleared on flush. |
+| `inboundBuffer` | Inbound messages awaiting flush to the chat endpoint. Snapshotted and cleared at the start of a flush. |
+| `lateArrivals` | Inbound messages that arrived while a flush's chat call was in flight (state `processing`). Folded back into `inboundBuffer` on rebatch, or turned into a follow-up turn by `finalizeTurn`. Cleared on each flush start. |
+| `reprocessCount` | How many times the current turn has been deferred + rebatched because a late arrival aborted its in-flight chat call. Bounded by `MAX_REPROCESS` (5); reset to 0 on a clean turn completion. |
 | `outboundQueue` | Ordered `OutboundItem`s produced from the chat response. |
 | `currentOutboundIndex` | Cursor into `outboundQueue` for the in-flight item. |
 | `currentOutboundMessageId` | Channel message id of the in-flight outbound, for status correlation (set only while WhatsApp waits on a status). |
@@ -93,9 +116,10 @@ The record is the unit the store persists and the agent mutates
 | `contact` | Resolved identity, when available. Populated by the [identity resolver](./identity-resolution.md) when `USER_LOOKUP_URL` is configured; otherwise undefined. |
 | `traceId` | Request-scoped trace id captured at the inbound webhook entry. |
 
-`createIdleConversation(...)` builds a fresh record with empty buffers/queues and
-`state: 'idle'`. It only attaches `contact` when supplied so the field stays
-absent rather than `undefined`.
+`createIdleConversation(...)` builds a fresh record with empty buffers/queues
+(`inboundBuffer: []`, `lateArrivals: []`, `reprocessCount: 0`) and `state: 'idle'`.
+It only attaches `contact` when supplied so the field stays absent rather than
+`undefined`.
 
 ## Dedupe and echo filtering
 
@@ -178,19 +202,23 @@ The lock has one rule that future edits must preserve: **entry points acquire,
 internal helpers stay lock-free.**
 
 - **Acquire** (true entry points, each fired OUTSIDE any held lock):
-  `handleInbound`, `handleStatus`, the scheduler flush handler (registered in the
-  constructor), and the delivery-timeout callback. `handleReaction` does NOT
-  acquire — it delegates to `handleInbound`, which acquires, so it inherits the
-  lock; acquiring again would deadlock (a holder calling a same-key acquirer).
+  `handleInbound`, `handleStatus`, and the delivery-timeout callback.
+  `handleReaction` does NOT acquire — it delegates to `handleInbound`, which
+  acquires, so it inherits the lock; acquiring again would deadlock (a holder
+  calling a same-key acquirer).
 - **Do not acquire** (internal; only ever reached from within a holder):
-  `flushImpl`, `sendNext`, `advanceAndContinue`, `markSkippedAndAdvance`,
-  `transitionToIdle`, `onDeliveryTimeoutImpl`, `handleInboundImpl`,
-  `handleStatusImpl`.
+  `sendNext`, `advanceAndContinue`, `markSkippedAndAdvance`, `transitionToIdle`,
+  `finalizeTurn`, `interruptSending`, `onDeliveryTimeoutImpl`,
+  `handleInboundImpl`, `handleStatusImpl`.
+- **Segmented (the batching fix):** `flushImpl` is fired by the scheduler outside
+  any held lock and acquires the lock *itself*, but only around its record
+  read-modify-write segments — see below.
 
 The no-deadlock invariant: no lock-holding path ever calls another
-lock-acquiring method for the same key. Acquiring methods call only the `*Impl`
-bodies, and no `*Impl` body calls `handleInbound` / `handleStatus` /
-`onDeliveryTimeout`. The chain is therefore strictly linear per key.
+lock-acquiring method for the same key. Acquiring methods (and `flushImpl`'s
+locked segment bodies) call only the `*Impl` / lock-free helpers, and none of
+those calls `handleInbound` / `handleStatus` / `onDeliveryTimeout`. The chain is
+therefore strictly linear per key.
 
 `handleStatus` is a special case: the conversation key isn't known until the
 outbound-handle mapping is resolved, so it does a lock-free pre-lookup to find
@@ -202,6 +230,82 @@ The regression test `concurrent same-key inbound: BOTH messages survive` in
 [`tests/unit/conversation-agent.test.ts`](../../tests/unit/conversation-agent.test.ts)
 proves the fix: without the lock the second buffer-append clobbers the first; with
 it, both survive.
+
+### Segmented locking: the batching fix
+
+The original model wrapped the *entire* flush — including the slow
+`chatClient.complete` call — in a single `runExclusive`, so the per-key lock was
+held across the whole turn. That blocked every concurrent `handleInbound` for the
+key: a message arriving mid-flush could not interrupt the in-flight turn, so it
+queued for a *second* flush and the user got **two separate replies** for two
+messages sent close together.
+
+The rewrite narrows the lock to **segments** and releases it during the chat call.
+`flushImpl` is no longer wrapped by the scheduler handler; instead it acquires the
+lock only around its record read-modify-write segments
+([`src/conversation/agent.ts`](../../src/conversation/agent.ts)):
+
+```
+[lock]  segment 1: load record; snapshot + clear inboundBuffer AND lateArrivals;
+        set `processing`; decide committed = reprocessCount >= MAX_REPROCESS;
+        register an AbortController (UNLESS committed); build the request   [unlock]
+   →    run the media hydrator, then AWAIT chatClient.complete(request, signal)
+        ← NO LOCK HELD HERE (only the network call, on a private snapshot)
+[lock]  segment 2: re-read record; if aborted under cap → rebatch
+        [...batch, ...inboundBuffer, ...lateArrivals] into inboundBuffer,
+        reprocessCount += 1, → `buffering`, reschedule; if aborted at cap → warn,
+        rebatch, reschedule (next flush is committed); else attach the outbound
+        queue, reset reprocessCount = 0, → `sending`                       [unlock]
+[lock]  segment 3: sendNext (drives ordered delivery)                      [unlock]
+```
+
+**The interrupt / rebatch flow.** When an inbound arrives during `processing`,
+`handleInboundImpl` pushes it onto `lateArrivals` and aborts the in-flight chat
+call *if* an `AbortController` is registered for the key
+(`inFlightChatAborts`). The aborted call rejects; `flushImpl` distinguishes the
+abort from a real endpoint error via `signal.aborted` and routes to segment 2's
+rebatch path — folding the original batch plus the late arrivals back into one
+combined turn. Net effect: the two messages become **one** combined reply, not
+two. The abort handle is always cleared in a `finally`, so a settled call can
+never be aborted by a later inbound.
+
+**The `MAX_REPROCESS` cap (forward progress).** A user typing a never-ending
+stream could abort the turn forever and starve. `MAX_REPROCESS` (5) bounds how
+many times one logical turn may be deferred + rebatched. Once `reprocessCount`
+reaches the cap, the next flush is **committed**: segment 1 registers *no*
+`AbortController`, so `handleInboundImpl` cannot abort it (a late arrival just
+queues to `lateArrivals` instead), and the chat call runs to completion and sends.
+Messages that arrived during a committed flush are not lost — `finalizeTurn` turns
+them into a fresh follow-up turn.
+
+**Why this is still race-free.** The Stage-5 clobber-prevention is preserved:
+every record mutation here is a *complete* locked read-modify-write — load,
+mutate, save, all inside one `runExclusive` segment — so two flows for the same
+key can never both read the same clone and clobber each other. The only thing
+moved outside the lock is the chat call (plus media hydration), which mutates no
+record — it just produces a response into a local variable and operates on the
+flush's private `batch` snapshot. A concurrent `handleInbound` that lands during
+the unlocked window runs a full, isolated read-modify-write of its own (appending
+to `lateArrivals` + aborting the chat), and segment 2's re-read observes that and
+rebatches. The lock guards record mutations, not chat I/O. The new transitions
+this introduces — `processing → buffering` (rebatch / cap overflow) and
+`sending → buffering` (`interruptSending`) — are documented in
+[the state machine](#the-state-machine).
+
+**Shutdown.** `close()` aborts every in-flight chat call (via
+`inFlightChatAborts`) and clears the map, so a slow chat endpoint can't leave an
+open socket dangling past shutdown; each abort just rejects the awaiting flush,
+which handles it as an abort. It also clears all delivery timers and closes the
+scheduler.
+
+The regression tests in
+[`tests/unit/conversation-agent.test.ts`](../../tests/unit/conversation-agent.test.ts)
+cover this: `message B during processing aborts the in-flight chat and produces
+ONE combined response`, `reprocess cap: a steady stream stops deferring after
+MAX_REPROCESS and still produces a response`, `cap-reached committed flush ALWAYS
+sends + overflow becomes a follow-up turn`, and `close aborts an in-flight chat
+call` prove the rebatch, the cap, the committed-flush + follow-up behavior, and
+the shutdown abort respectively.
 
 ## Fail-soft
 

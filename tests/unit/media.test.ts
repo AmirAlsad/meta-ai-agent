@@ -6,8 +6,10 @@ import {
   uploadWhatsAppMedia,
   getWhatsAppMediaUrl,
   downloadWhatsAppMedia,
-  downloadAttachmentUrl
+  downloadAttachmentUrl,
+  MEDIA_OVER_CAP
 } from '../../src/meta/shared/media.js';
+import type { DownloadedMedia } from '../../src/meta/shared/media.js';
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Helpers                                                                    */
@@ -439,8 +441,10 @@ describe('downloadAttachmentUrl', () => {
       fetchImpl: fetchImpl as unknown as typeof fetch
     });
 
-    expect(Array.from(result.data)).toEqual([7, 7, 7, 7]);
-    expect(result.mimeType).toBe('image/jpeg');
+    expect(result).not.toBe(MEDIA_OVER_CAP);
+    const media = result as DownloadedMedia;
+    expect(Array.from(media.data)).toEqual([7, 7, 7, 7]);
+    expect(media.mimeType).toBe('image/jpeg');
     expect(fetchImpl).toHaveBeenCalledOnce();
 
     const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit | undefined];
@@ -478,5 +482,46 @@ describe('downloadAttachmentUrl', () => {
       operation: 'media.downloadAttachment',
       httpStatus: 0
     });
+  });
+
+  it('EARLY-rejects via Content-Length when over maxBytes WITHOUT reading the body', async () => {
+    // The CDN advertises a 9 MB Content-Length; with maxBytes 1000 the download
+    // must bail BEFORE buffering the body. We spy on arrayBuffer() to prove the
+    // body was never read (no over-cap blob buffered).
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const response = binaryResponse(200, bytes, {
+      'content-type': 'image/jpeg',
+      'content-length': '9000000'
+    });
+    const arrayBufferSpy = vi.spyOn(response, 'arrayBuffer');
+    const fetchImpl = vi.fn().mockResolvedValueOnce(response);
+
+    const result = await downloadAttachmentUrl({
+      url: ATTACHMENT_URL,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      maxBytes: 1000
+    });
+
+    expect(result).toBe(MEDIA_OVER_CAP);
+    // The whole point of the early reject: the body was NOT read/buffered.
+    expect(arrayBufferSpy).not.toHaveBeenCalled();
+  });
+
+  it('falls back to reading the body when Content-Length is absent (post-download check applies)', async () => {
+    // No Content-Length → the early pre-flight can't reject, so the bytes ARE read
+    // and returned; the caller's post-download cap check enforces the size instead.
+    const bytes = new Uint8Array([1, 2, 3, 4, 5, 6]);
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(binaryResponse(200, bytes, { 'content-type': 'image/png' }));
+
+    const result = await downloadAttachmentUrl({
+      url: ATTACHMENT_URL,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      maxBytes: 3 // smaller than the bytes, but no header → no early reject
+    });
+
+    expect(result).not.toBe(MEDIA_OVER_CAP);
+    expect(Array.from((result as DownloadedMedia).data)).toEqual([1, 2, 3, 4, 5, 6]);
   });
 });

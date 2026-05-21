@@ -304,6 +304,14 @@ export async function downloadWhatsAppMedia(input: {
 }
 
 /**
+ * Sentinel returned by {@link downloadAttachmentUrl} when an EARLY size-cap
+ * pre-flight rejects the download: the response's `Content-Length` already
+ * exceeded `maxBytes`, so we never read the body. Distinct from a thrown error so
+ * the caller (the fail-open hydrator) can treat it as a clean over-cap skip.
+ */
+export const MEDIA_OVER_CAP = Symbol('media-over-cap');
+
+/**
  * Download a Messenger / Instagram attachment from the pre-signed CDN URL Meta
  * put in the webhook payload.
  *
@@ -311,11 +319,22 @@ export async function downloadWhatsAppMedia(input: {
  * the app token is unnecessary and can be actively harmful — the CDN may reject
  * a Bearer it didn't expect, and a redirect to a third-party origin would leak
  * the token cross-origin. So this GET carries NO auth.
+ *
+ * EARLY SIZE CAP (`maxBytes`): when supplied, the `Content-Length` response
+ * header is checked BEFORE `response.arrayBuffer()` reads (and buffers) the body.
+ * An over-cap attachment is rejected with the {@link MEDIA_OVER_CAP} sentinel
+ * having read nothing — so a huge blob is no longer fully buffered just to be
+ * discarded. This mirrors the WhatsApp path's `file_size` pre-flight intent.
+ * FAIL-OPEN: when the header is ABSENT (or `maxBytes` is omitted) we fall back to
+ * the body read and let the caller's post-download check enforce the cap, exactly
+ * as before.
  */
 export async function downloadAttachmentUrl(input: {
   url: string;
   fetchImpl?: typeof fetch;
-}): Promise<DownloadedMedia> {
+  /** Optional hard byte cap, checked against `Content-Length` before reading the body. */
+  maxBytes?: number;
+}): Promise<DownloadedMedia | typeof MEDIA_OVER_CAP> {
   const fetchImpl = input.fetchImpl ?? globalThis.fetch;
 
   let response: Response;
@@ -341,6 +360,21 @@ export async function downloadAttachmentUrl(input: {
   if (!response.ok) {
     const rawText = await safeText(response);
     throw buildHttpError('media.downloadAttachment', response.status, tryParseJson(rawText), rawText);
+  }
+
+  // EARLY REJECT: when we both know a cap and the server told us the size up
+  // front, bail BEFORE reading the body so an over-cap blob is never buffered.
+  // Cancel the body to release the socket promptly (best-effort).
+  if (input.maxBytes !== undefined) {
+    const contentLength = parseContentLength(response.headers.get('content-length'));
+    if (contentLength !== undefined && contentLength > input.maxBytes) {
+      try {
+        await response.body?.cancel();
+      } catch {
+        /* best-effort: cancelling the unread body must not throw. */
+      }
+      return MEDIA_OVER_CAP;
+    }
   }
 
   const data = new Uint8Array(await response.arrayBuffer());

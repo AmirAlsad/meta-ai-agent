@@ -29,6 +29,7 @@
 import http, { type Server } from 'node:http';
 import { createHmac } from 'node:crypto';
 import readline from 'node:readline';
+import type { Express } from 'express';
 import pino from 'pino';
 
 import type { Config } from '../src/config/loader.js';
@@ -43,11 +44,14 @@ import type {
   ChannelFeature,
   MediaSendInput,
   SendOptions,
-  SendResult
+  SendResult,
+  TemplateComponent
 } from '../src/meta/shared/adapter.js';
 import type { Channel } from '../src/meta/types.js';
 import { createEchoChatEndpoint } from '../examples/minimal-chat-endpoint/index.js';
 import { createRouterChatEndpoint } from '../examples/multi-channel-router/index.js';
+import { createCatalogChatEndpoint } from '../examples/action-catalog/index.js';
+import { createScriptedFlowChatEndpoint } from '../examples/scripted-flow/index.js';
 import {
   buildInstagramImageWebhook,
   buildInstagramReactionWebhook,
@@ -79,8 +83,34 @@ const IDS: Record<Channel, { business: string; user: string }> = {
 };
 
 /** The example endpoints the REPL can boot, by name. */
-const EXAMPLES = ['minimal-chat-endpoint', 'multi-channel-router'] as const;
+const EXAMPLES = [
+  'minimal-chat-endpoint',
+  'multi-channel-router',
+  'action-catalog',
+  'scripted-flow'
+] as const;
 type ExampleName = (typeof EXAMPLES)[number];
+
+/**
+ * Build the chosen example's Express app. Each factory is a no-arg,
+ * listener-guarded `express.Express` factory (importing the module is
+ * side-effect-free; only running the file as the entry point starts a listener),
+ * so it is safe to construct here and mount on the REPL's ephemeral port. The
+ * `switch` is exhaustive over {@link ExampleName} — adding a new example name to
+ * `EXAMPLES` without a branch here is a compile error.
+ */
+function buildExampleApp(name: ExampleName): Express {
+  switch (name) {
+    case 'minimal-chat-endpoint':
+      return createEchoChatEndpoint();
+    case 'multi-channel-router':
+      return createRouterChatEndpoint();
+    case 'action-catalog':
+      return createCatalogChatEndpoint();
+    case 'scripted-flow':
+      return createScriptedFlowChatEndpoint();
+  }
+}
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Console adapter — prints outbound instead of calling Meta                  */
@@ -103,7 +133,23 @@ type LastOutbound = Partial<Record<Channel, string>>;
  * agent never downgrades a chat action away (typing/read/reaction/reply/media on
  * all three; template only on WhatsApp), matching the real adapters' surface.
  */
-function createConsoleAdapter(channel: Channel, lastOutbound: LastOutbound): ChannelAdapter {
+function createConsoleAdapter(
+  channel: Channel,
+  lastOutbound: LastOutbound
+): ChannelAdapter & {
+  // The agent dispatches a `template` action by calling `sendTemplate` on the
+  // WhatsApp adapter (it duck-types `typeof adapter.sendTemplate === 'function'`
+  // before casting). `sendTemplate` is NOT on the base `ChannelAdapter`, so we
+  // widen the return type to include it — otherwise a WhatsApp template action
+  // from the chat endpoint would be silently dropped in the REPL (the agent's
+  // check fails) and the user would see nothing.
+  sendTemplate(
+    to: string,
+    name: string,
+    language: string,
+    components?: TemplateComponent[]
+  ): Promise<SendResult>;
+} {
   let counter = 0;
   // Synthesize a channel-shaped outbound id, recorded as the channel's "last"
   // so /status and /reaction can reference it.
@@ -149,6 +195,16 @@ function createConsoleAdapter(channel: Channel, lastOutbound: LastOutbound): Cha
     async sendMedia(recipientId: string, input: MediaSendInput): Promise<SendResult> {
       const caption = input.caption ? ` caption=${JSON.stringify(input.caption)}` : '';
       line(`media(${input.kind}): ${input.mediaIdOrUrl}${caption}`);
+      return result(recipientId);
+    },
+    async sendTemplate(
+      recipientId: string,
+      name: string,
+      language: string,
+      components?: TemplateComponent[]
+    ): Promise<SendResult> {
+      const comp = components && components.length > 0 ? ` (${components.length} component(s))` : '';
+      line(`template: ${name} [${language}]${comp}`);
       return result(recipientId);
     },
     supports(feature: ChannelFeature): boolean {
@@ -376,8 +432,9 @@ interface Runtime {
  */
 async function bootRuntime(example: ExampleName, logger: pino.Logger): Promise<Runtime> {
   // 1. Boot the chosen example chat endpoint in-process on an ephemeral port.
-  const chatApp =
-    example === 'multi-channel-router' ? createRouterChatEndpoint() : createEchoChatEndpoint();
+  // Each factory returns a listener-guarded express.Express (no side effects on
+  // import), so we construct + listen ourselves below.
+  const chatApp = buildExampleApp(example);
   const chat = await listen(chatApp);
   const chatUrl = `http://127.0.0.1:${chat.port}/`;
 

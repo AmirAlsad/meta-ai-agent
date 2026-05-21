@@ -91,6 +91,24 @@ export interface ConversationConfig {
    * hit on this timeout drops enrichment rather than blocking the turn.
    */
   userLookupTimeoutMs: number;
+  /**
+   * OPT-IN inbound media hydration. When `true`, the transport downloads inbound
+   * media on the flush path (it holds the per-channel access tokens the chat
+   * endpoint does not) and attaches a base64 data URL to the chat request, so the
+   * endpoint can actually "see" WhatsApp images (which arrive as a bare media id,
+   * not a fetchable URL). DEFAULT `false`: base64 inflates every request body
+   * carrying media (~33% over the raw bytes), so it stays off until explicitly
+   * enabled. Lives in the conversation group because, like the chat call, the
+   * download sits inline on the inbound→chat path.
+   */
+  inboundMediaDownload: boolean;
+  /**
+   * Hard cap (bytes) on a single piece of inbound media to hydrate. Media larger
+   * than this is left as id/url (NOT base64-attached) and logged — protecting the
+   * chat request from an unbounded base64 blob. DEFAULT 5 MiB. Only consulted
+   * when {@link inboundMediaDownload} is `true`.
+   */
+  inboundMediaMaxBytes: number;
 }
 
 export interface Config {
@@ -315,7 +333,10 @@ const CONVERSATION_DEFAULTS: ConversationConfig = {
   outboundDeliveryTimeoutMs: 30000,
   chatEndpointTimeoutMs: 30000,
   dedupeTtlSeconds: 86400,
-  userLookupTimeoutMs: 5000
+  userLookupTimeoutMs: 5000,
+  // Opt-in: off by default so the base64 cost is never paid unless asked for.
+  inboundMediaDownload: false,
+  inboundMediaMaxBytes: 5_242_880 // 5 MiB
 };
 
 /**
@@ -352,7 +373,9 @@ function loadConversationConfig(env: ConfigEnv): ConversationConfig {
     outboundDeliveryTimeoutMs: loadPositiveInt(env, 'OUTBOUND_DELIVERY_TIMEOUT_MS', d.outboundDeliveryTimeoutMs),
     chatEndpointTimeoutMs: loadPositiveInt(env, 'CHAT_ENDPOINT_TIMEOUT_MS', d.chatEndpointTimeoutMs),
     dedupeTtlSeconds: loadPositiveInt(env, 'DEDUPE_TTL_SECONDS', d.dedupeTtlSeconds),
-    userLookupTimeoutMs: loadPositiveInt(env, 'USER_LOOKUP_TIMEOUT_MS', d.userLookupTimeoutMs)
+    userLookupTimeoutMs: loadPositiveInt(env, 'USER_LOOKUP_TIMEOUT_MS', d.userLookupTimeoutMs),
+    inboundMediaDownload: loadBoolean(env, 'INBOUND_MEDIA_DOWNLOAD', d.inboundMediaDownload),
+    inboundMediaMaxBytes: loadPositiveInt(env, 'INBOUND_MEDIA_MAX_BYTES', d.inboundMediaMaxBytes)
   };
 }
 

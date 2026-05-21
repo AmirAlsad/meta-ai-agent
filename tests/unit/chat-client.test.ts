@@ -155,6 +155,48 @@ describe('HttpChatClient.complete — failure modes', () => {
     expect(((error as ChatEndpointError).cause as Error).name).toBe('AbortError');
   });
 
+  it('rejects with ChatEndpointError when the EXTERNAL abort signal fires', async () => {
+    // The agent passes an external AbortController.signal to cancel an in-flight
+    // chat call (interrupt/rebatch). A fake fetch that respects the signal must
+    // reject as AbortError when the external controller aborts, surfacing as a
+    // wrapped ChatEndpointError.
+    const fetchImpl = vi.fn().mockImplementation(
+      (_url: string, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => {
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          });
+        })
+    ) as unknown as typeof fetch;
+
+    // Large timeout so ONLY the external signal can abort the call.
+    const client = new HttpChatClient({ chatEndpointUrl: URL_, timeoutMs: 60_000, fetchImpl });
+    const external = new AbortController();
+    const promise = client.complete(makeRequest(), external.signal);
+    external.abort();
+
+    const error = await promise.catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ChatEndpointError);
+    expect(((error as ChatEndpointError).cause as Error).name).toBe('AbortError');
+  });
+
+  it('rejects immediately when given an already-aborted external signal', async () => {
+    const fetchImpl = vi.fn().mockImplementation(
+      (_url: string, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => {
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          });
+        })
+    ) as unknown as typeof fetch;
+    const client = new HttpChatClient({ chatEndpointUrl: URL_, timeoutMs: 60_000, fetchImpl });
+
+    const error = await client
+      .complete(makeRequest(), AbortSignal.abort())
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ChatEndpointError);
+  });
+
   it('clears the timeout after a successful call (no dangling timer)', async () => {
     const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ message: 'ok' })) as unknown as typeof fetch;

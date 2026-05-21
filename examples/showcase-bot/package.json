@@ -3,23 +3,31 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Reference LLM-backed chat endpoint for meta-ai-agent, powered by Claude via the Anthropic SDK. A separate package with its own dependencies — intentionally outside the root package's model-provider-free dependency graph.",
+  "description": "Reference LLM-backed chat endpoint for meta-ai-agent, powered by the Vercel AI SDK (multi-provider via a provider registry). A separate package with its own dependencies — intentionally outside the root package's model-provider-free dependency graph.",
   "scripts": {
-    "start": "node --import tsx index.ts",
+    "start": "node --import tsx src/server.ts",
+    "dev": "tsx watch src/server.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.97.1",
+    "@ai-sdk/anthropic": "^3.0.58",
+    "@ai-sdk/openai": "^3.0.41",
+    "ai": "^6.0.116",
     "dotenv": "^17.4.2",
-    "express": "^5.2.1"
+    "express": "^4.21.2",
+    "groq-sdk": "^0.37.0",
+    "js-yaml": "^4.1.0",
+    "pdf-parse": "^2.4.5",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^25.9.1",
     "tsx": "^4.22.3",
-    "typescript": "^6.0.3"
+    "typescript": "^5.7.3"
   }
 }
