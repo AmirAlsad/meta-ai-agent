@@ -12,7 +12,3 @@ coverage/
 
 .DS_Store
 *.log
-
-# Reference package kept locally for parity; it is its own git repo and is not
-# part of this package.
-sendblue-ai-agent/
