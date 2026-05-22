@@ -8,11 +8,14 @@ one item at a time, advancing only when the current item is confirmed. How
 different delivery signals.
 
 Source: [`src/delivery/queue.ts`](../../src/delivery/queue.ts) (pure queue logic),
-[`src/delivery/types.ts`](../../src/delivery/types.ts) (shapes), and the
-`sendNext` / `handleStatus` / delivery-timeout machinery in
-[`src/conversation/agent.ts`](../../src/conversation/agent.ts). For the
-surrounding state machine see [Conversation state](./conversation-state.md); for
-how actions become items see [Rich chat actions](./rich-chat-actions.md).
+[`src/delivery/types.ts`](../../src/delivery/types.ts) (shapes incl. `retryCount` /
+`asyncFailRetryCount`), and the `sendNext` / `handleStatus` / `handleStatusImpl`
+(async-`failed` routing) / delivery-timeout machinery in
+[`src/conversation/agent.ts`](../../src/conversation/agent.ts), with error
+classification in [`src/limits/tracker.ts`](../../src/limits/tracker.ts)
+(`classifyStatusErrorCode`). For the surrounding state machine see
+[Conversation state](./conversation-state.md); for how actions become items see
+[Rich chat actions](./rich-chat-actions.md).
 
 ## Queue and cursor
 
@@ -58,9 +61,11 @@ the Send API response — see [Known gaps](../KNOWN-GAPS.md).)
 
 `statusAdvancesQueue(channel, status)` encodes the WhatsApp rule: only `sent` /
 `delivered` advance. `read` is post-delivery (the queue already moved on) and
-`failed` is left to Stage 10 retry, so neither advances. For `on_send` channels it
-always returns false — the queue already advanced at send time, so a
-watermark-derived status must never double-advance it.
+`failed` does not advance the queue here — instead a `failed` status for the
+in-flight item is routed into async retry / window re-prompt / skip (see
+[Async failure from a `failed` delivery status](#async-failure-from-a-failed-delivery-status)).
+For `on_send` channels it always returns false — the queue already advanced at
+send time, so a watermark-derived status must never double-advance it.
 
 ## Reaction and typing always advance on send
 
@@ -113,6 +118,77 @@ the guards stay as defense-in-depth. The regression test `handleStatus concurren
 with an in-flight send does not double-advance (exactly-once)` in
 [`tests/unit/conversation-agent.test.ts`](../../tests/unit/conversation-agent.test.ts)
 covers this.
+
+## Async failure from a `failed` delivery status
+
+This is the headline behaviour of the limits wave. On WhatsApp the real
+rate-limit / closed-window failures usually surface **asynchronously** — the
+synchronous send POST returns `200`/queued, and Meta later emits a `failed`
+delivery-status webhook carrying `status.errorCode`. Before this wave a `failed`
+status fell through to the "stale or non-advancing" debug log and was effectively
+ignored, so those failures were never retried and never triggered a template
+re-prompt. Now `handleStatusImpl` routes a `failed` status for the
+**currently in-flight item** (`record.currentOutboundIndex === mapping.messageIndex`)
+through `LimitTracker.classifyStatusErrorCode(channel, status.errorCode)`:
+
+| Classification | Action |
+| --- | --- |
+| `window_closed` (WhatsApp `131047` / `470`) | one template re-prompt via `handleWindowClosed` (see [Rate limiting → WhatsApp out-of-window re-prompt](./rate-limiting.md#whatsapp-out-of-window-re-prompt)) |
+| `transient` (a Meta rate-limit code) | backoff retry via `scheduleTransientRetry`, bounded by `asyncFailRetryCount` |
+| `permanent` (or retries exhausted) | `skipReason`/`skippedAt` stamped, then `advanceAndContinue` skips + advances |
+
+A `failed` status for a **non-current** (already-advanced) item is a stale
+failure for a slot the queue has long since moved past — it stays a no-op (the
+existing debug log), so the queue is never re-processed or double-advanced. (The
+status is still recorded in history regardless, observable on
+`GET /admin/status/:messageId` — see [Status tracking](./status-tracking.md).)
+
+### The double-send-safety rule is INVERTED on this path (load-bearing)
+
+The synchronous-send rule — "a 5xx after a POST may have already delivered, so do
+NOT retry" (`classifyError` treats 5xx as `permanent`; see [Rate limiting →
+classification](./rate-limiting.md#the-classification-table-double-send-safety))
+— does **not** apply to a `failed` *delivery status*. A `failed` status is Meta's
+**definitive statement that the message did NOT reach the user**, so retrying a
+transient-classified async failure is **safe** (no double-send). This is the exact
+opposite of the sync 5xx rule, and it is intentional. **Do not "fix" it back** to
+skip-on-failed by analogy with the synchronous path — the two situations are not
+the same. (The classifier `classifyStatusErrorCode` still keeps the retryable set
+narrow and semantic anyway: a window-closed condition needs a template re-prompt,
+not a plain re-send, and only rate-limit codes are worth a backoff retry;
+everything else is `permanent`.)
+
+### `asyncFailRetryCount` bounds the async loop (separate from `retryCount`)
+
+The async retry path counts attempts on a **dedicated** `asyncFailRetryCount`
+field on `OutboundItem`, separate from the synchronous `retryCount`. The reason is
+load-bearing: the async path fires only **after a send SUCCEEDED** (then failed via
+the status webhook), and `sendNext`'s success tail **deletes** `item.retryCount`
+for double-send safety. So `retryCount` is always absent on this path and would
+reset the attempt to 1 on every cycle — a re-send that keeps async-failing (e.g. a
+recurring `130429` rate-limit) would loop **forever**, never tripping the cap. The
+success tail does NOT clear `asyncFailRetryCount`, so it survives success→async-fail
+cycles and the `transientRetryMaxAttempts()` cap actually trips. (The synchronous
+transient path is unaffected: there the send THROWS and never reaches the
+`retryCount`-clearing tail, so its `retryCount` accumulates correctly.)
+
+### Dead-handle reset before a transient re-send
+
+The in-flight item carries the `channelMessageId`/`sentAt` of the **failed** send
+— a dead handle, since the message never reached the user. The failed path:
+
+- clears the WhatsApp delivery-timeout fallback up front (it was armed by the
+  earlier successful send and must not double-fire and advance the queue out from
+  under the retry/re-prompt);
+- before a transient re-send, clears `item.channelMessageId` / `item.sentAt` /
+  `record.currentOutboundMessageId` and deletes the dead id's outbound-handle
+  mapping. This lets `sendNext` re-send the cursor item cleanly, and makes the
+  boot-recovery "pending transient retry" guard (which re-arms only for an item
+  with `channelMessageId === undefined`) recognize it as pending rather than
+  treating the dead handle as a successful send.
+
+Throughout, this path is fail-soft: any unexpected error ends in skip + advance so
+the queue keeps moving.
 
 ## Typing injection before text
 
@@ -197,9 +273,16 @@ and the WhatsApp send path is proven end-to-end in
 
 - Transient-failure retry + WhatsApp out-of-window template re-prompt landed in
   Stage 10 (see [Rate limiting](./rate-limiting.md)); a `permanent` failure (incl.
-  any 5xx — double-send safety) is still skipped + advanced, and Messenger/Instagram
-  have no out-of-window mechanism to enforce.
-- Pre-send pacing is per-second only (no per-hour/per-day caps) — see
-  [Rate limiting](./rate-limiting.md).
+  any 5xx on the SYNCHRONOUS path — double-send safety) is still skipped + advanced,
+  and Messenger/Instagram have no out-of-window mechanism to enforce.
+- Pre-send pacing is per-second only; the per-hour/per-day counters are track-only
+  (warn/error logging), not a gating cap — see [Rate limiting](./rate-limiting.md).
+- **WhatsApp `sent`-then-`failed` ordering edge.** If a `sent` status advances the
+  queue (deleting the outbound-handle mapping) before a later `failed` for the same
+  wamid arrives, the late `failed` finds no mapping and is NOT routed to
+  retry/reprompt — the failure is still recorded in status history (observable on
+  `GET /admin/status/:messageId`), just not retried. The common WhatsApp failure is
+  a bare `failed` with no preceding `sent`, so this is an edge case. See
+  [Known gaps](../KNOWN-GAPS.md).
 
 See [Known gaps](../KNOWN-GAPS.md) and [Architecture](../ARCHITECTURE.md).

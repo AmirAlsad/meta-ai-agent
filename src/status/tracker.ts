@@ -18,6 +18,9 @@
  */
 
 import type { Channel, DeliveryStatus } from '../meta/types.js';
+// The display-bucket mapper lives in the limits layer (single source of truth
+// for the WhatsApp code → category mapping, shared with the retry classifier).
+import { whatsappFailureCategory } from '../limits/error-codes.js';
 import { STATUS_RANK, type StatusHistoryEntry, type StatusRecord } from './types.js';
 
 export interface StatusTracker {
@@ -86,6 +89,13 @@ export class InMemoryStatusTracker implements StatusTracker {
     // non-failure statuses (and `failed` carries the WhatsApp diagnostics).
     if (input.errorCode !== undefined) entry.errorCode = input.errorCode;
     if (input.errorTitle !== undefined) entry.errorTitle = input.errorTitle;
+    // Derive the human-readable failure bucket ONLY on a `failed` status — a
+    // success carries no error code, and computing a category for it would
+    // pollute the entry. `whatsappFailureCategory` tolerates an undefined code
+    // (→ `unknown`), so a `failed` with no diagnostics still gets a bucket.
+    if (input.status === 'failed') {
+      entry.errorCategory = whatsappFailureCategory(input.errorCode);
+    }
 
     const record: StatusRecord =
       existing ??
@@ -117,6 +127,15 @@ export class InMemoryStatusTracker implements StatusTracker {
     // while `history` still preserves both. See STATUS_RANK for the rationale.
     if (STATUS_RANK[input.status] >= STATUS_RANK[record.current]) {
       record.current = input.status;
+    }
+
+    // Mirror the failure bucket onto the record so a dashboard reads it without
+    // scanning `history`. `failed` is the top rank and Meta does not emit a
+    // success after a `failed` for the same id, so this matches `current`'s
+    // failure in practice; we set it whenever a `failed` is applied (the most
+    // recent failure's category) and never clear it on a non-failure status.
+    if (entry.errorCategory !== undefined) {
+      record.errorCategory = entry.errorCategory;
     }
 
     if (input.timestamp < record.firstSeenAt) record.firstSeenAt = input.timestamp;

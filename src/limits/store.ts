@@ -35,9 +35,33 @@ export interface LimitCounterStore {
    */
   acquireOutboundSlot(line: string, now: number, perSecond: number): Promise<number>;
 
+  /**
+   * Bump the fixed per-hour and per-day outbound counters for `line` and return
+   * the post-increment totals. TRACK-ONLY: the {@link "./tracker.js".LimitTracker}
+   * uses these for advisory warn/error logging as a line nears its messaging-tier
+   * cap; nothing here ever gates a send.
+   *
+   * Windows are FIXED calendar-ish buckets keyed off the wall clock —
+   * `floor(now / 3600000)` for the hour, `floor(now / 86400000)` for the day —
+   * not sliding windows. WHY fixed buckets: an O(1) `INCR + EXPIRE` per send
+   * (vs. an O(N) sorted-set sliding window) is the right cost for a coarse
+   * "how many this hour/day" signal, and it matches the production Redis store's
+   * Lua `INCR`/`EXPIRE` shape. A bucket self-expires after its window so the
+   * keyspace stays bounded.
+   */
+  incrementWindowCounters(
+    line: string,
+    now: number
+  ): Promise<{ hourCount: number; dayCount: number }>;
+
   /** Release any owned resources (Redis connection, etc.). Optional. */
   close?(): Promise<void>;
 }
+
+/** Window-bucket math shared by the in-memory and Redis stores (one definition
+ *  so the two impls bucket identically). */
+export const HOUR_MS = 3_600_000;
+export const DAY_MS = 86_400_000;
 
 /**
  * In-memory token-bucket pacer. Holds one `lastSlotMs` per line in a `Map`.
@@ -48,6 +72,15 @@ export interface LimitCounterStore {
  */
 export class InMemoryLimitCounterStore implements LimitCounterStore {
   private readonly lastSlotMs = new Map<string, number>();
+  /**
+   * Fixed-window counters keyed by `${line}:${bucket}`. Lazy entries created on
+   * first use; an entry whose bucket no longer matches the current `now` window
+   * is treated as expired and re-seeded at 1 (so memory is bounded by the small
+   * number of active lines × at most 2 live buckets each — old buckets are
+   * overwritten, never accumulated). The Redis store relies on a key TTL instead.
+   */
+  private readonly hourCounters = new Map<string, { bucket: number; count: number }>();
+  private readonly dayCounters = new Map<string, { bucket: number; count: number }>();
 
   async acquireOutboundSlot(line: string, now: number, perSecond: number): Promise<number> {
     if (perSecond <= 0) return 0;
@@ -57,4 +90,29 @@ export class InMemoryLimitCounterStore implements LimitCounterStore {
     this.lastSlotMs.set(line, slot);
     return Math.max(0, slot - now);
   }
+
+  async incrementWindowCounters(
+    line: string,
+    now: number
+  ): Promise<{ hourCount: number; dayCount: number }> {
+    return {
+      hourCount: bump(this.hourCounters, line, Math.floor(now / HOUR_MS)),
+      dayCount: bump(this.dayCounters, line, Math.floor(now / DAY_MS))
+    };
+  }
+}
+
+/**
+ * Increment the counter for `line` in `bucket`. A different bucket than the
+ * stored one means the window rolled over, so we RESET to 1 rather than carry
+ * the prior window's total — the entry for a line holds exactly one live bucket.
+ */
+function bump(map: Map<string, { bucket: number; count: number }>, line: string, bucket: number): number {
+  const existing = map.get(line);
+  if (!existing || existing.bucket !== bucket) {
+    map.set(line, { bucket, count: 1 });
+    return 1;
+  }
+  existing.count += 1;
+  return existing.count;
 }

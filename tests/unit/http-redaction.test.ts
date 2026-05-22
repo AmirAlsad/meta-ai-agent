@@ -516,6 +516,17 @@ describe('redactOutboundItem allow-list (fail-closed)', () => {
     expect(JSON.stringify(out)).not.toContain('447700900123');
   });
 
+  it('keeps retry bookkeeping (retryCount/nextRetryAt/asyncFailRetryCount) — non-PII numbers', () => {
+    // These are operational counters/timestamps an operator needs to see on
+    // GET /admin/conversations/:key; they carry no PII so the allow-list keeps them.
+    const out = redactOutboundItem(
+      makeOutbound({ retryCount: 2, nextRetryAt: 1_700_000_000_000, asyncFailRetryCount: 1 })
+    ) as Record<string, unknown>;
+    expect(out.retryCount).toBe(2);
+    expect(out.nextRetryAt).toBe(1_700_000_000_000);
+    expect(out.asyncFailRetryCount).toBe(1);
+  });
+
   it('reveal:true returns the item untouched', () => {
     const item = makeRichOutbound();
     const revealed = redactOutboundItem(item, { reveal: true });
@@ -570,6 +581,37 @@ describe('redactStatusRecord', () => {
     expect(out.recipientId).toBeUndefined();
     expect(out.conversationKey).toBeUndefined();
     expect(out.channelMessageId).toBe('wamid.OUT1');
+  });
+
+  it('surfaces errorCategory unmasked (bounded enum, not PII) — top-level and in history', () => {
+    const out = redactStatusRecord(
+      makeStatus({
+        current: 'failed',
+        errorCategory: 'recipient',
+        history: [
+          { status: 'sent', timestamp: 1_700_000_000_000 },
+          {
+            status: 'failed',
+            timestamp: 1_700_000_002_000,
+            errorCode: 131_026,
+            errorTitle: 'Message undeliverable',
+            errorCategory: 'recipient'
+          }
+        ]
+      })
+    ) as Record<string, unknown>;
+    // The bucket is allow-listed verbatim, not dropped by the fail-closed redactor.
+    expect(out.errorCategory).toBe('recipient');
+    expect(out.history).toEqual([
+      { status: 'sent', timestamp: 1_700_000_000_000 },
+      {
+        status: 'failed',
+        timestamp: 1_700_000_002_000,
+        errorCode: 131_026,
+        errorTitle: 'Message undeliverable',
+        errorCategory: 'recipient'
+      }
+    ]);
   });
 
   it('reveal:true returns the record untouched', () => {

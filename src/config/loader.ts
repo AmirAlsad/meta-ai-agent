@@ -154,6 +154,29 @@ export interface LimitsConfig {
   whatsappPerSecond: number;   // default 80
   messengerPerSecond: number;  // default 40
   instagramPerSecond: number;  // default 10
+  /**
+   * TRACK-ONLY per-hour / per-day outbound counters per channel. Unlike the
+   * per-second pacing above, these NEVER gate a send — the tracker only
+   * warn/error-logs as the line nears the cap, giving operators advance notice
+   * before Meta starts server-side rejecting at the messaging-tier cap. `0`
+   * disables that window (no logging).
+   *
+   * Defaults are deliberately conservative and Meta-aware. WhatsApp's caps are
+   * conversation-based (tiered: 1K/10K/100K/unlimited unique recipients in 24h
+   * AFTER business verification) rather than a flat message count, so a single
+   * per-hour/per-day MESSAGE count is only an advisory proxy — we default to a
+   * conservative WhatsApp 1000/h, 10000/d so an unverified or Tier-1 number gets
+   * an early warning. Messenger/Instagram have no comparable published per-day
+   * MESSAGE cap (their constraint is the 24h window + per-second throughput), so
+   * they default to `0` (disabled) — set them only if an operator wants a custom
+   * advisory ceiling. Per-hour MUST be <= per-day when both are > 0 (validated).
+   */
+  whatsappPerHour: number;     // default 1000
+  whatsappPerDay: number;      // default 10000
+  messengerPerHour: number;    // default 0 (disabled)
+  messengerPerDay: number;     // default 0 (disabled)
+  instagramPerHour: number;    // default 0 (disabled)
+  instagramPerDay: number;     // default 0 (disabled)
   /** Max transient-retry attempts after the first send. Default 3. */
   transientRetryMaxAttempts: number;
   /** Base backoff (ms) for transient retry. Default 1000. */
@@ -348,6 +371,22 @@ function loadPositiveInt(env: ConfigEnv, name: string, fallback: number): number
 }
 
 /**
+ * Parse a non-negative integer env var (value >= 0). Returns `fallback` when
+ * unset/empty; throws with the var name on a non-integer or negative value.
+ * Used for the track-only per-hour/per-day MESSAGE-count caps, where 0 is a
+ * meaningful value (disables that advisory window).
+ */
+function loadNonNegativeInt(env: ConfigEnv, name: string, fallback: number): number {
+  const raw = trimmed(env, name);
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || String(parsed) !== raw || parsed < 0) {
+    throw new Error(`Invalid ${name}: ${raw}. Expected a non-negative integer (>= 0).`);
+  }
+  return parsed;
+}
+
+/**
  * Parse a float env var constrained to `[min, max]` (inclusive). Returns
  * `fallback` when unset/empty; throws with the var name on a non-finite value
  * or one outside the range.
@@ -488,6 +527,12 @@ const LIMITS_DEFAULTS: LimitsConfig = {
   whatsappPerSecond: 80,
   messengerPerSecond: 40,
   instagramPerSecond: 10,
+  whatsappPerHour: 1000,
+  whatsappPerDay: 10000,
+  messengerPerHour: 0,
+  messengerPerDay: 0,
+  instagramPerHour: 0,
+  instagramPerDay: 0,
   transientRetryMaxAttempts: 3,
   transientRetryBaseMs: 1000,
   transientRetryMaxMs: 60000
@@ -515,10 +560,40 @@ function loadLimitsConfig(env: ConfigEnv): LimitsConfig {
     );
   }
 
+  // Track-only per-hour / per-day MESSAGE-count caps (0 disables the window).
+  const whatsappPerHour = loadNonNegativeInt(env, 'WHATSAPP_RATE_LIMIT_PER_HOUR', d.whatsappPerHour);
+  const whatsappPerDay = loadNonNegativeInt(env, 'WHATSAPP_RATE_LIMIT_PER_DAY', d.whatsappPerDay);
+  const messengerPerHour = loadNonNegativeInt(env, 'MESSENGER_RATE_LIMIT_PER_HOUR', d.messengerPerHour);
+  const messengerPerDay = loadNonNegativeInt(env, 'MESSENGER_RATE_LIMIT_PER_DAY', d.messengerPerDay);
+  const instagramPerHour = loadNonNegativeInt(env, 'INSTAGRAM_RATE_LIMIT_PER_HOUR', d.instagramPerHour);
+  const instagramPerDay = loadNonNegativeInt(env, 'INSTAGRAM_RATE_LIMIT_PER_DAY', d.instagramPerDay);
+
+  // Cross-field check per channel, mirroring the base<=max philosophy: an hourly
+  // cap above the daily cap is always a misconfiguration (the hour window would
+  // warn/error after the day window already did). Only enforced when BOTH are
+  // > 0, since 0 means "that window is disabled".
+  for (const { hourVar, hour, dayVar, day } of [
+    { hourVar: 'WHATSAPP_RATE_LIMIT_PER_HOUR', hour: whatsappPerHour, dayVar: 'WHATSAPP_RATE_LIMIT_PER_DAY', day: whatsappPerDay },
+    { hourVar: 'MESSENGER_RATE_LIMIT_PER_HOUR', hour: messengerPerHour, dayVar: 'MESSENGER_RATE_LIMIT_PER_DAY', day: messengerPerDay },
+    { hourVar: 'INSTAGRAM_RATE_LIMIT_PER_HOUR', hour: instagramPerHour, dayVar: 'INSTAGRAM_RATE_LIMIT_PER_DAY', day: instagramPerDay }
+  ]) {
+    if (hour > 0 && day > 0 && hour > day) {
+      throw new Error(
+        `Invalid ${hourVar}: ${hour} is greater than ${dayVar} (${day}). The per-hour cap must be <= the per-day cap.`
+      );
+    }
+  }
+
   return {
     whatsappPerSecond: loadNonNegativeFloat(env, 'WHATSAPP_RATE_LIMIT_PER_SECOND', d.whatsappPerSecond),
     messengerPerSecond: loadNonNegativeFloat(env, 'MESSENGER_RATE_LIMIT_PER_SECOND', d.messengerPerSecond),
     instagramPerSecond: loadNonNegativeFloat(env, 'INSTAGRAM_RATE_LIMIT_PER_SECOND', d.instagramPerSecond),
+    whatsappPerHour,
+    whatsappPerDay,
+    messengerPerHour,
+    messengerPerDay,
+    instagramPerHour,
+    instagramPerDay,
     transientRetryMaxAttempts: loadPositiveInt(env, 'TRANSIENT_RETRY_MAX_ATTEMPTS', d.transientRetryMaxAttempts),
     transientRetryBaseMs,
     transientRetryMaxMs

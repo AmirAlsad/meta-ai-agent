@@ -939,7 +939,13 @@ export class ConversationAgent {
           return undefined;
         }
 
-        const { items, skipped } = buildOutboundItems(r.actions, f => adapter.supports(f));
+        // Pass the turn's buffered inbound messages (the SAME array sent to the
+        // chat endpoint as `request.messages`) so symbolic reply/reaction
+        // `TargetRef`s (e.g. `{ alias: 'last' }`) resolve against what the user
+        // actually said this turn.
+        const { items, skipped } = buildOutboundItems(r.actions, f => adapter.supports(f), {
+          inboundMessages: prep.batch
+        });
         if (skipped.length > 0) {
           logger.debug({ conversationKey: key, skipped }, 'some chat actions were skipped/downgraded');
         }
@@ -1048,25 +1054,34 @@ export class ConversationAgent {
     // (e.g. `media:image`) so the per-kind send is visible; everything else uses
     // the bare item kind.
     let operation: string = item.kind;
+    // Whether this item makes a REAL Graph API send — `message`/`reply`/`template`/
+    // `media` AND `reaction` (a reaction is a Graph call too: it counts toward
+    // Meta's per-channel rate). EXCLUDED: `typing` (a best-effort UX side-effect)
+    // and `silence` (no send). This single flag gates BOTH pre-send pacing
+    // (acquireSendSlot) and post-send throughput accounting (recordOutbound), so
+    // the two stay in lock-step on exactly the items that hit the Graph API.
+    const makesGraphSend =
+      item.kind === 'message' ||
+      item.kind === 'reply' ||
+      item.kind === 'template' ||
+      item.kind === 'media' ||
+      item.kind === 'reaction';
+
     // PRE-SEND PACING (Stage 10): reserve a per-line pacing slot before any item
-    // that makes a real Graph API send — `message`/`reply`/`template`/`media` AND
-    // `reaction` (a reaction is a Graph call too: it counts toward Meta's per-channel
-    // rate, so a reaction-heavy turn left unpaced could contribute to app-level 429s).
-    // EXCLUDED: `typing` (a best-effort UX side-effect already spaced by its own
-    // pre-message delay; pacing it would only push back the real message) and
-    // `silence` (no send). The lock is HELD while acquireSendSlot awaits its internal
-    // pacing sleep — that delays ONLY this conversation (the lock is per-key), exactly
-    // like the typing-delay sleep above. acquireSendSlot is contractually fail-open
-    // (never throws), so no try/catch is needed here.
-    if (
-      this.limitTracker &&
-      (item.kind === 'message' ||
-        item.kind === 'reply' ||
-        item.kind === 'template' ||
-        item.kind === 'media' ||
-        item.kind === 'reaction')
-    ) {
+    // that makes a real Graph API send.
+    // The lock is HELD while acquireSendSlot awaits its internal pacing sleep —
+    // that delays ONLY this conversation (the lock is per-key), exactly like the
+    // typing-delay sleep above. acquireSendSlot is contractually fail-open (never
+    // throws), so no try/catch is needed here. We measure the wall-clock spent at
+    // the slot (the tracker sleeps internally to pace) and observe it as the
+    // pacing-delay histogram — 0 == the slot was free.
+    if (this.limitTracker && makesGraphSend) {
+      const acquireT0 = this.now();
       await this.limitTracker.acquireSendSlot(record.channel, record.channelScopedBusinessId);
+      this.metrics?.acquireSendSlotDelaySeconds.observe(
+        { channel: record.channel },
+        (this.now() - acquireT0) / 1000
+      );
     }
 
     // Time each adapter (Meta Graph API) call; injectable clock keeps it
@@ -1162,6 +1177,16 @@ export class ConversationAgent {
         { channel: record.channel, operation },
         (this.now() - sendT0) / 1000
       );
+
+      // TRACK-ONLY THROUGHPUT (Stage 10): bump the per-hour/day counters for this
+      // line ONLY for items that actually hit the Graph API (mirrors the
+      // acquireSendSlot gate via the shared `makesGraphSend` flag — typing/silence
+      // are excluded). recordOutbound is contractually FAIL-OPEN (never throws,
+      // never gates), so awaiting it here cannot break delivery; it is purely an
+      // accounting side-effect of a confirmed send.
+      if (this.limitTracker && makesGraphSend) {
+        await this.limitTracker.recordOutbound(record.channel, record.channelScopedBusinessId);
+      }
     } catch (error) {
       // On a Meta API failure, bound the error_code label to the known set.
       const errorCode = error instanceof MetaApiError ? normalizeErrorCodeLabel(error.errorCode) : 'other';
@@ -1190,10 +1215,12 @@ export class ConversationAgent {
       if (classification === 'transient') {
         const attempt = (item.retryCount ?? 0) + 1;
         if (attempt <= this.limitTracker!.transientRetryMaxAttempts()) {
+          this.metrics?.transientRetryTotal.inc({ channel: record.channel, outcome: 'scheduled' });
           await this.scheduleTransientRetry(key, attempt, item.id, traceId);
           return;
         }
-        // retries exhausted → fall through to skip+advance below.
+        // retries exhausted → record the exhaustion before falling through to skip.
+        this.metrics?.transientRetryTotal.inc({ channel: record.channel, outcome: 'exhausted' });
       }
       // Permanent error, or a transient error whose retries are exhausted:
       // Stage 5 fail-soft — mark the item skipped and advance so one bad send
@@ -1297,7 +1324,17 @@ export class ConversationAgent {
     if (!record) return;
 
     const delivered = record.outboundQueue[record.currentOutboundIndex];
-    if (delivered?.channelMessageId) record.deliveredMessageIds.push(delivered.channelMessageId);
+    // Only record a CONFIRMED delivery. A SKIPPED item — a permanent/exhausted
+    // async failure, or a window_closed fall-through to markSkippedAndAdvance —
+    // still carries the FAILED send's channelMessageId (kept for observability of
+    // which send failed), but it did NOT deliver, so it must never land in
+    // deliveredMessageIds (a field documented as confirmed delivered/sent).
+    // markSkippedAndAdvance stamps `skippedAt` before advancing, so guarding on it
+    // here fixes every skip path at the source. (Greptile review: permanent +
+    // window_closed async-fail paths recorded the failed wamid as delivered.)
+    if (delivered?.channelMessageId && delivered.skippedAt === undefined) {
+      record.deliveredMessageIds.push(delivered.channelMessageId);
+    }
 
     const advanced = advanceCursor({ items: record.outboundQueue, currentIndex: record.currentOutboundIndex });
     record.currentOutboundIndex = advanced.currentIndex;
@@ -1476,7 +1513,12 @@ export class ConversationAgent {
         await this.finalizeTurn(record, traceId);
         return;
       }
-      const { items } = buildOutboundItems(resp.actions, f => adapter.supports(f));
+      // Resolve symbolic targets against the SAME turn's buffered inbound
+      // messages (stashed on the original ChatRequest), so a re-prompt that
+      // reacts/replies to the user's message still resolves correctly.
+      const { items } = buildOutboundItems(resp.actions, f => adapter.supports(f), {
+        inboundMessages: original.messages
+      });
       if (items.length === 0) {
         await this.finalizeTurn(record, traceId);
         return;
@@ -1757,7 +1799,7 @@ export class ConversationAgent {
   /** Lock-free body of {@link handleStatus}. Assumes the per-key lock is held. */
   private async handleStatusImpl(status: StatusUpdate, opts?: HandleOptions): Promise<void> {
     const traceId = opts?.traceId;
-    const logger = opts?.logger ?? this.childLogger(traceId);
+    let logger = opts?.logger ?? this.childLogger(traceId);
     // Count every status callback we observe (mapped or not), labelled by
     // channel + status, before any advance/no-op decision.
     this.metrics?.statusCallbackTotal.inc({ channel: status.channel, status: status.status });
@@ -1768,6 +1810,15 @@ export class ConversationAgent {
         // benign — e.g. a `read` status arriving after the queue advanced.
         logger.debug({ channelMessageId: status.channelMessageId, status: status.status }, 'status for unmapped message');
         return;
+      }
+
+      // Stage-6/Wave-2 (#6): bind the originating inbound's trace id (persisted on
+      // the outbound-handle mapping at send time) onto a child logger so a LATE
+      // delivery/failed status — which arrives long after the inbound webhook that
+      // produced this outbound — correlates back to that turn in the logs. Prefer
+      // the mapping's traceId; fall back to this call's traceId when absent.
+      if (mapping.traceId !== undefined) {
+        logger = logger.child({ conversationTraceId: mapping.traceId });
       }
 
       const key = mapping.conversationKey;
@@ -1792,6 +1843,130 @@ export class ConversationAgent {
       // (WhatsApp sent/delivered) AND refers to the CURRENTLY in-flight item.
       if (statusAdvancesQueue(record.channel, status.status) && record.currentOutboundIndex === mapping.messageIndex) {
         await this.advanceAndContinue(key, status.channelMessageId, mapping.traceId ?? traceId);
+        return;
+      }
+
+      // ── ASYNC `failed` STATUS (Wave-2 #1): the PRIMARY FIX ──────────────────
+      // On WhatsApp the real rate-limit / closed-window failures usually surface
+      // ASYNCHRONOUSLY here as a `failed` delivery status (carrying status.errorCode),
+      // NOT on the synchronous send POST (which had returned 200/queued). Before this
+      // branch a `failed` status fell through to the "stale or non-advancing" debug
+      // log and was effectively ignored — so those failures were never retried and
+      // never triggered a template re-prompt. Mirror the synchronous catch's
+      // classification routing, but classify via `classifyStatusErrorCode`.
+      //
+      // FIRES ONLY for the CURRENTLY in-flight item (`currentOutboundIndex ===
+      // mapping.messageIndex`). A `failed` for an already-advanced index is a stale
+      // failure for a slot the queue has long since moved past — keep the existing
+      // no-op/debug behavior for it (falling through below) so we never re-process or
+      // double-advance the queue.
+      if (
+        status.status === 'failed' &&
+        record.currentOutboundIndex === mapping.messageIndex
+      ) {
+        // DOUBLE-SEND SAFETY IS INVERTED HERE — and that inversion is the whole
+        // point. The load-bearing "a 5xx after a POST may have already delivered, so
+        // don't retry" rule governs the SYNCHRONOUS send path, where a server error
+        // is ambiguous about whether Meta accepted the message. A `failed` DELIVERY
+        // STATUS is the OPPOSITE: it is Meta's DEFINITIVE statement that the message
+        // did NOT reach the user. Retrying a transient-classified async failure is
+        // therefore SAFE and correct (no double-send). Do NOT "fix" this back to
+        // skip-on-failed by analogy with the sync 5xx rule — the two situations are
+        // not the same.
+        const failedTraceId = mapping.traceId ?? traceId;
+        // The delivery-timeout fallback was ARMED for this item by the earlier
+        // successful send (sendNext's on_status tail). It MUST be cleared before we
+        // re-process or it could double-fire and advance the queue out from under
+        // the retry/re-prompt. (handleWindowClosed → markSkippedAndAdvance and
+        // scheduleTransientRetry both also clear it, but clear it HERE up front so
+        // the permanent/exhausted skip path below — markSkippedAndAdvance via
+        // advanceAndContinue — and any future edit are covered unconditionally.)
+        this.clearDeliveryTimeout(key);
+
+        const classification = this.limitTracker
+          ? this.limitTracker.classifyStatusErrorCode(record.channel, status.errorCode)
+          : 'permanent';
+
+        if (classification === 'window_closed') {
+          logger.warn(
+            { conversationKey: key, errorCode: status.errorCode },
+            'whatsapp failed status: window closed; re-prompting for template'
+          );
+          // Drop the dead wamid's handle mapping BEFORE re-prompting, consistent
+          // with the transient + permanent branches (which both clean it up).
+          // handleWindowClosed REPLACES the queue (a new template at the same
+          // index): leaving the stale mapping would let a DUPLICATE webhook for the
+          // dead wamid re-enter handleStatusImpl, match `currentOutboundIndex ===
+          // mapping.messageIndex`, and act against the NEW item at that index.
+          await this.store.deleteOutboundHandleMapping(status.channelMessageId);
+          await this.handleWindowClosed(key, failedTraceId);
+          return;
+        }
+
+        if (classification === 'transient' && this.limitTracker) {
+          const item = record.outboundQueue[record.currentOutboundIndex];
+          // CAP COUNTER MUST SURVIVE A SUCCESSFUL SEND. This async path fires only
+          // AFTER a send SUCCEEDED (then failed via a status webhook), and the
+          // success tail in sendNext DELETES `item.retryCount` for double-send
+          // safety. So `retryCount` is always absent here and would reset the attempt
+          // to 1 on every cycle — a re-send that keeps async-failing (e.g. a
+          // recurring 130429 rate-limit) would loop FOREVER, never tripping the cap.
+          // We therefore count async-failure retries on a DEDICATED
+          // `asyncFailRetryCount` that the success tail does NOT clear, so the cap
+          // actually trips. (The synchronous transient path is unaffected: there the
+          // send THROWS and never reaches the retryCount-clearing tail, so its
+          // `retryCount` accumulates correctly — see the sync catch above.)
+          const attempt = (item?.asyncFailRetryCount ?? 0) + 1;
+          if (item && attempt <= this.limitTracker.transientRetryMaxAttempts()) {
+            // Persist the surviving async-retry count BEFORE scheduling.
+            item.asyncFailRetryCount = attempt;
+            // DEAD-HANDLE RESET (load-bearing): the in-flight item carries the
+            // channelMessageId/sentAt of the FAILED send. That handle is dead — the
+            // message never reached the user. Clear it so (a) scheduleTransientRetry
+            // re-sends cleanly (sendNext re-sends the cursor item) and (b) the boot-
+            // recovery B1 guard — which re-arms a transient retry ONLY for an item
+            // with `channelMessageId === undefined` — recognizes this as a pending
+            // retry rather than treating the dead handle as a successful send. Also
+            // drop the outbound-handle mapping for the dead id (the retry mints a new
+            // id; the stale mapping would otherwise linger). scheduleTransientRetry
+            // then stamps retryCount/nextRetryAt and arms the backoff timer.
+            delete item.channelMessageId;
+            delete item.sentAt;
+            delete record.currentOutboundMessageId;
+            await this.store.setConversation(record);
+            await this.store.deleteOutboundHandleMapping(status.channelMessageId);
+            logger.warn(
+              { conversationKey: key, errorCode: status.errorCode, attempt },
+              'whatsapp failed status: transient; scheduling retry'
+            );
+            this.metrics?.transientRetryTotal.inc({ channel: record.channel, outcome: 'scheduled' });
+            await this.scheduleTransientRetry(key, attempt, item.id, failedTraceId);
+            return;
+          }
+          // Retries exhausted (or no item) → record exhaustion, fall through to skip.
+          this.metrics?.transientRetryTotal.inc({ channel: record.channel, outcome: 'exhausted' });
+        }
+
+        // `permanent`, or an exhausted transient: fail-soft skip + advance so one
+        // failed send never wedges the rest of the queue. (The dead outbound-handle
+        // mapping is cleaned up by advanceAndContinue, which is passed the failed id.)
+        logger.warn(
+          { conversationKey: key, errorCode: status.errorCode, errorTitle: status.errorTitle },
+          'whatsapp failed status: permanent (or retries exhausted); skipping item'
+        );
+        const item = record.outboundQueue[record.currentOutboundIndex];
+        if (item) {
+          item.skippedAt = this.now();
+          item.skipReason = status.errorTitle ?? `failed (code ${status.errorCode ?? 'unknown'})`;
+          await this.store.setConversation(record);
+        }
+        // Drop the dead outbound-handle mapping for the failed wamid. We pass
+        // `undefined` to advanceAndContinue (so it cleans up no live handle); its
+        // deliveredMessageIds push is guarded on the item NOT being skipped, so the
+        // failed wamid is never recorded as delivered — while the item keeps its
+        // channelMessageId so an operator can see WHICH send failed.
+        await this.store.deleteOutboundHandleMapping(status.channelMessageId);
+        await this.advanceAndContinue(key, undefined, failedTraceId);
         return;
       }
 
@@ -1830,7 +2005,7 @@ export class ConversationAgent {
     status: StatusUpdate,
     opts?: HandleOptions
   ): Promise<void> {
-    const logger = opts?.logger ?? this.childLogger(opts?.traceId);
+    let logger = opts?.logger ?? this.childLogger(opts?.traceId);
     // Count the read callback even when there's nothing to mark (no record / no
     // qualifying ids) — we still observed the webhook.
     this.metrics?.statusCallbackTotal.inc({ channel: status.channel, status: 'read' });
@@ -1839,6 +2014,13 @@ export class ConversationAgent {
       if (!record) {
         logger.debug({ conversationKey: key, watermark: status.timestamp }, 'read watermark for unknown conversation');
         return;
+      }
+
+      // Wave-2 (#6): a read watermark has no per-message mapping, but the record
+      // carries the originating turn's trace id — bind it so this late read log
+      // line correlates back to the inbound webhook that produced the outbound.
+      if (record.traceId !== undefined) {
+        logger = logger.child({ conversationTraceId: record.traceId });
       }
 
       // Concrete outbound ids sent at/before the watermark — the translation.

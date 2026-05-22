@@ -29,10 +29,16 @@ export interface StatusRecord {
 export interface StatusHistoryEntry {
   status: DeliveryStatus;
   timestamp: number;
-  errorCode?: number;   // WhatsApp-only, only on a `failed` entry
-  errorTitle?: string;  // WhatsApp-only, only on a `failed` entry
+  errorCode?: number;            // WhatsApp-only, only on a `failed` entry
+  errorTitle?: string;           // WhatsApp-only, only on a `failed` entry
+  errorCategory?: FailureCategory; // human-readable bucket, only on a `failed` entry
 }
 ```
+
+`StatusRecord` additionally mirrors `errorCategory?: FailureCategory` at the top
+level — the bucket of the **most recent** `failed` status — so a dashboard can read
+it off the record without scanning `history`. It is set once a `failed` status has
+been applied (WhatsApp-only) and is never cleared by a later non-failure status.
 
 ### Rank-based `current` — no regression
 
@@ -53,6 +59,40 @@ Meta does not guarantee status events arrive in lifecycle order and it redeliver
 
 A redelivered webhook must not double-append to `history`. `applyStatusUpdate` skips an exact `(status, timestamp)` duplicate before pushing the entry, so a redelivered status is idempotent on `(status, timestamp)`. `firstSeenAt` / `lastUpdatedAt` are widened to cover the observed timestamp on every call.
 
+### WhatsApp failure categories
+
+A bare error code (`131047`, `131026`, `190`, …) is opaque on a dashboard, so on a
+`failed` status the tracker derives a human-readable `FailureCategory` from
+`status.errorCode` via `whatsappFailureCategory(errorCode)` and stamps it on both
+the history entry and the record:
+
+```typescript
+export type FailureCategory =
+  | 'rate_limit'    // 4, 80007, 130429, 131056, 613
+  | 'window_closed' // 131047, 470
+  | 'policy'        // 131048, 131049, 368 (spam / quality throttles)
+  | 'unsupported'   // 131051 (unsupported message type)
+  | 'recipient'     // 131026, 131030, 131045 (undeliverable / not allow-listed)
+  | 'auth'          // 190, 10, 200 (token / permission)
+  | 'server'        // 131000, 1, 2 (Meta-side server error)
+  | 'unknown';      // undefined or any code not yet enumerated
+```
+
+`whatsappFailureCategory` and the code sets live in
+[`src/limits/error-codes.ts`](../../src/limits/error-codes.ts) — the **single
+source of truth** for the WhatsApp/Meta error-code groupings, shared with the retry
+classifier (`classifyError` / `classifyStatusErrorCode`) so the display bucket can
+never drift from the routing decision (e.g. whether `131047` is a window error).
+The mapper is total and never throws — `undefined` and any unrecognized code map to
+`unknown`, since Meta can emit codes the package does not yet enumerate. The
+category is computed only on a `failed` status (a success carries no error code),
+and a `failed` with no diagnostics still gets a bucket (`unknown`).
+
+`errorCategory` is a **bounded enum, not PII**, so it is allow-listed verbatim in
+the admin redactor (`redactStatusRecord` keeps the per-entry category inside each
+`history` object and the top-level mirror). See [Operational
+visibility](./operational-visibility.md).
+
 ### Per-channel model
 
 The two webhook shapes are handled by two methods on the `StatusTracker` interface ([`src/status/tracker.ts`](../../src/status/tracker.ts)):
@@ -62,7 +102,7 @@ The two webhook shapes are handled by two methods on the `StatusTracker` interfa
 | WhatsApp | per-message `statuses[]` (`sent`/`delivered`/`read`/`failed`) keyed by the real wamid | `applyStatusUpdate` (1:1) |
 | Messenger / Instagram | a READ WATERMARK timestamp (`message_reads` / `messaging_seen`), not a per-message id | `applyReadWatermark` |
 
-**WhatsApp** is direct: the agent's `handleStatusImpl` calls `applyStatusUpdate` with the wamid, status, timestamp, the resolved `conversationKey`, the user-side `recipientId`, and (on a `failed`) the `errorCode` / `errorTitle`. It records the status **before** the queue-advancement branch (which returns early) so the tracker captures the status whether or not it advances the queue, and the call is inside the handler's try/catch so a tracker error cannot break delivery.
+**WhatsApp** is direct: the agent's `handleStatus` calls `applyStatusUpdate` with the wamid, status, timestamp, the resolved `conversationKey`, the user-side `recipientId`, and (on a `failed`) the `errorCode` / `errorTitle` (the tracker derives `errorCategory` from the code itself). It records the status **up front** — before the outbound-handle mapping lookup and the per-key lock — so a `delivered`/`read` callback arriving after the first advancing status (`sent`) deleted the mapping is still captured (otherwise the history would stick at `sent`). The tracker is its own synchronous store, so recording needs no lock, and the call is inside a try/catch so a tracker error cannot break delivery.
 
 **Messenger / Instagram** carry no per-message id — `channelMessageId` on the status is a watermark timestamp. The agent translates the watermark into concrete message ids: in `handleReadWatermarkImpl` ([`src/conversation/agent.ts`](../../src/conversation/agent.ts)) it scans the conversation record's `outboundQueue` for items that were actually sent (`channelMessageId` set and `sentAt !== undefined`) at or before the watermark, then passes those ids to `applyReadWatermark`:
 
@@ -82,14 +122,15 @@ This watermark path is observability-only. Messenger/IG are advance-on-send (`st
 
 ### The admin route (redacted)
 
-`GET /admin/status/:messageId` returns the record for one outbound id, **PII-redacted by default**. The redactor `redactStatusRecord` ([`src/http/redaction.ts`](../../src/http/redaction.ts)) keeps the structural fields verbatim — `channelMessageId` (our send id), `channel`, `current`, the full `history` (status enums + timestamps + WhatsApp error codes/titles, none of which is PII), and `firstSeenAt` / `lastUpdatedAt` — and masks the two PII fields: `recipientId` via `maskId` (last-4 suffix) and the user segment of `conversationKey` via `maskConversationKey`. `?reveal=true` (authenticated only) returns the unmasked record. The route is token-gated and guarded at registration — when `ADMIN_API_TOKEN` is unset it is not mounted at all (404, not 401). See [Operational visibility](./operational-visibility.md) for the full route table and redaction policy.
+`GET /admin/status/:messageId` returns the record for one outbound id, **PII-redacted by default**. The redactor `redactStatusRecord` ([`src/http/redaction.ts`](../../src/http/redaction.ts)) keeps the structural fields verbatim — `channelMessageId` (our send id), `channel`, `current`, the full `history` (status enums + timestamps + WhatsApp error codes/titles + the bounded `errorCategory` bucket, none of which is PII), the top-level `errorCategory` mirror, and `firstSeenAt` / `lastUpdatedAt` — and masks the two PII fields: `recipientId` via `maskId` (last-4 suffix) and the user segment of `conversationKey` via `maskConversationKey`. `?reveal=true` (authenticated only) returns the unmasked record. The route is token-gated and guarded at registration — when `ADMIN_API_TOKEN` is unset it is not mounted at all (404, not 401). See [Operational visibility](./operational-visibility.md) for the full route table and redaction policy.
 
 ## Code files
 
 | File | Role |
 | --- | --- |
-| [`src/status/types.ts`](../../src/status/types.ts) | `StatusRecord`, `StatusHistoryEntry`, the `STATUS_RANK` map. |
-| [`src/status/tracker.ts`](../../src/status/tracker.ts) | `StatusTracker` interface + `InMemoryStatusTracker` (`applyStatusUpdate`, `applyReadWatermark`, `getStatus`, `listByConversation`). |
+| [`src/status/types.ts`](../../src/status/types.ts) | `StatusRecord`, `StatusHistoryEntry` (incl. `errorCategory`), the `STATUS_RANK` map. |
+| [`src/status/tracker.ts`](../../src/status/tracker.ts) | `StatusTracker` interface + `InMemoryStatusTracker` (`applyStatusUpdate`, `applyReadWatermark`, `getStatus`, `listByConversation`); derives `errorCategory` on a `failed` status. |
+| [`src/limits/error-codes.ts`](../../src/limits/error-codes.ts) | `FailureCategory`, `whatsappFailureCategory`, and the WhatsApp/Meta error-code sets — the single source of truth shared with the retry classifier. |
 | [`src/conversation/agent.ts`](../../src/conversation/agent.ts) | `handleStatusImpl` (WhatsApp 1:1) and `handleReadWatermarkImpl` (the watermark→message-id translation). |
 | [`src/http/app.ts`](../../src/http/app.ts) | `GET /admin/status/:messageId` route (token-gated, guarded at registration). |
 | [`src/http/redaction.ts`](../../src/http/redaction.ts) | `redactStatusRecord` — masks `recipientId` + the key user segment. |

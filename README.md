@@ -30,7 +30,7 @@ The server listens on `PORT` (default `3000`) and exposes:
 - `POST /webhook` — Signed webhook intake. Verifies `X-Hub-Signature-256` against the raw body, ACKs `200 EVENT_RECEIVED`, then dispatches by `req.body.object` (`whatsapp_business_account` / `page` / `instagram`).
 - `GET /health` — Liveness probe (uptime, package version, node version).
 - `GET /ready` — Readiness probe (scheduler + Redis-presence checks; 503 on a failed check).
-- `GET /metrics`, `GET /admin/conversations/:key`, `GET /admin/status/:messageId` — Stage 6 operational routes, token-gated and mounted only when `ADMIN_API_TOKEN` is set (see below).
+- `GET /metrics`, `GET /admin/conversations/:key`, `GET /admin/status/:messageId`, `GET /admin/queue`, `GET /admin/dedupe?messageId=<id>` — operational routes, token-gated and mounted only when `ADMIN_API_TOKEN` is set (see below).
 
 Stage 3 setup + capture tooling (real Meta App + ngrok required):
 
@@ -53,7 +53,7 @@ npm test            # unit + integration
 npm run typecheck   # tsc --noEmit
 ```
 
-For live testing against real devices (dev-only tooling — needs real Meta credentials + ngrok), `npm run dev:loop` boots the test chat endpoint, the real conversation agent, a tunnel, and webhook registration in one process so you can exercise the full conversation loop, and `npm run probe:outbound` fires each outbound send method at real recipients to confirm what Meta accepts. See [Testing](./docs/TESTING.md) for details and the 2026-05-20 live-verification milestone.
+For live testing against real devices (dev-only tooling — needs real Meta credentials + ngrok), `npm run dev:loop` boots the test chat endpoint, the real conversation agent, a tunnel, and webhook registration in one process so you can exercise the full conversation loop; `npm run probe:outbound` fires each outbound send method at real recipients to confirm what Meta accepts; and `npm run showcase` walks a scripted per-channel scenario matrix (text / reply / reaction / typing / media / template) at a real device against the full runtime, writing captures + a `summary.json` (`--list` prints the scenarios with no credentials). See [Testing](./docs/TESTING.md) for details and the 2026-05-20 live-verification milestone.
 
 ### Try it locally (no Meta account)
 

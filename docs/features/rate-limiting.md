@@ -1,11 +1,15 @@
 # Rate limiting, transient retry, and window enforcement
 
 Stage 10 adds the `LimitTracker` — the per-channel outbound layer the conversation
-agent leans on for three things: **pre-send pacing** (stay under Meta's per-channel
-rate), **transient-retry routing** (re-send a send that failed for a known-safe
-reason, with backoff), and **WhatsApp out-of-window handling** (re-prompt the chat
-endpoint for a template when the 24h customer-service window has closed). A boot-time
-`recoverPendingRetries` re-arms retries that were in flight across a restart.
+agent leans on for: **pre-send pacing** (stay under Meta's per-channel rate),
+**transient-retry routing** (re-send a send that failed for a known-safe reason,
+with backoff — on BOTH the synchronous send-catch path and the asynchronous
+WhatsApp `failed`-delivery-status path), **WhatsApp out-of-window handling**
+(re-prompt the chat endpoint for a template when the 24h customer-service window has
+closed), and **track-only per-hour / per-day throughput counters** (advisory
+warn/error logging as a line nears its configured cap — never gating a send). A
+boot-time `recoverPendingRetries` re-arms retries that were in flight across a
+restart.
 
 The single most load-bearing decision in this subsystem is the error
 classification: which send failures are safe to re-send. Because every send is a POST
@@ -15,16 +19,19 @@ by design — it mirrors the `GraphClient`'s existing "5xx-on-POST is not retrie
 rule.
 
 Source: [`src/limits/tracker.ts`](../../src/limits/tracker.ts) (`LimitTracker`,
-`createLimitTracker`, `classifyError`),
+`createLimitTracker`, `classifyError`, `classifyStatusErrorCode`, `recordOutbound`),
+[`src/limits/error-codes.ts`](../../src/limits/error-codes.ts) (the shared
+WhatsApp/Meta error-code sets + `whatsappFailureCategory`),
 [`src/limits/store.ts`](../../src/limits/store.ts) (`LimitCounterStore`,
-`InMemoryLimitCounterStore`),
+`InMemoryLimitCounterStore`, `incrementWindowCounters`),
 [`src/limits/redis-store.ts`](../../src/limits/redis-store.ts)
 (`RedisLimitCounterStore`),
 [`src/limits/retry.ts`](../../src/limits/retry.ts) (`transientRetryDelayMs`,
 `ErrorClassification`),
-[`src/conversation/agent.ts`](../../src/conversation/agent.ts) (`sendNext` pacing,
-`scheduleTransientRetry` / `armTransientRetryTimer` / `runTransientRetryImpl`,
-`handleWindowClosed`, `recoverPendingRetries`).
+[`src/conversation/agent.ts`](../../src/conversation/agent.ts) (`sendNext` pacing +
+`recordOutbound`, `scheduleTransientRetry` / `armTransientRetryTimer` /
+`runTransientRetryImpl`, `handleWindowClosed`, the async-`failed`-status routing in
+`handleStatusImpl`, `recoverPendingRetries`).
 
 Cross-links: [Ordered delivery](./ordered-delivery.md),
 [Outbound clients](./outbound-clients.md),
@@ -42,6 +49,15 @@ Cross-links: [Ordered delivery](./ordered-delivery.md),
 - **WhatsApp out-of-window re-prompt.** A WhatsApp send that fails with the 24h
   re-engagement error re-prompts the chat endpoint *once* per turn with
   `requiresTemplate: true`, then sends whatever it returns (ideally a template).
+- **Async `failed`-status routing.** A WhatsApp `failed` *delivery-status* webhook
+  for the in-flight item is classified by `classifyStatusErrorCode` and routed to
+  retry / re-prompt / skip — the same three-way bucketing as a synchronous send
+  catch, but driven by the bare `errorCode`. See [Ordered delivery → async
+  failure](./ordered-delivery.md#async-failure-from-a-failed-delivery-status) for
+  the agent-side flow and the inverted double-send rule.
+- **Track-only per-hour / per-day counters.** After each successful outbound,
+  `recordOutbound` bumps fixed hour/day window counters for the line and warn/error
+  logs as it nears the configured cap — advisory only, never gating a send.
 - **Boot recovery.** Transient retries persisted before a restart are re-armed at
   boot — but only against a durable (Redis) store.
 
@@ -104,6 +120,44 @@ delay.
 > to the `LimitTracker`. Both are conservative floors; an IG line is effectively
 > double-paced. See [Known gaps](../KNOWN-GAPS.md).
 
+## Track-only per-hour / per-day counters
+
+Separate from the per-second pacing, the tracker keeps **advisory** per-hour and
+per-day outbound counters per `{channel}:{businessId}` line. After each successful
+outbound the agent calls `limitTracker.recordOutbound(channel, businessId)`, which
+bumps the line's fixed hour/day window counters via
+`LimitCounterStore.incrementWindowCounters` (in-memory, or a Redis Lua `INCR` +
+`PEXPIRE` on hour/day buckets) and logs as the count crosses a threshold:
+
+- **warn** at exactly 80% of the configured cap (`count === floor(cap * 0.8)`),
+- **error** at exactly the cap (`count === cap`).
+
+The exact-crossing match (`===`, not `>=`) means a steady stream over the cap emits
+ONE warn + ONE error per window, not a log line on every send past the threshold.
+
+This is **track-only — it NEVER gates a send.** It exists so an operator gets advance
+notice before Meta starts server-side rejecting at the messaging-tier cap, not to
+enforce a limit locally. It is **fail-open**: a counter-store failure is logged and
+swallowed (the send already happened). A cap of `0` disables that window entirely
+(no counting, no logging).
+
+> **No Prometheus metric is emitted for a threshold crossing.** The limits layer is
+> deliberately decoupled from the metrics registry, so a crossing surfaces in warn/
+> error LOGS only — there is no `*_total` counter for it. Wiring a metric here is
+> deferred (see [Known gaps](../KNOWN-GAPS.md)).
+
+**Defaults (Meta-aware, deliberately conservative):** WhatsApp `1000/h`, `10000/d`;
+Messenger and Instagram `0/0` (disabled). WhatsApp's real caps are
+conversation-based (tiered: 1K/10K/100K/unlimited unique recipients in 24h after
+business verification) rather than a flat message count, so a single per-hour/per-day
+MESSAGE count is only an advisory proxy — the defaults give an unverified or Tier-1
+number an early warning. Messenger/Instagram have no comparable published per-day
+MESSAGE cap (their constraint is the 24h window + per-second throughput), so they
+default to disabled; set them only for a custom advisory ceiling. `loadConfig`
+enforces `perHour <= perDay` per channel **when both are > 0** (an hourly cap above
+the daily cap is always a misconfiguration). This is NOT the same as a true gating
+cap with WhatsApp conversation-unit accounting, which is still deferred.
+
 ## Transient retry
 
 On a send error, `sendNext` calls `limitTracker.classifyError(channel, error)` and
@@ -141,6 +195,35 @@ known NOT to have processed the request, so a re-send cannot double-deliver:
 - **`131051` is NOT a window code.** It is "Unsupported message type" (a
   malformed-payload bug), deliberately excluded from the window set so it falls through
   to `permanent` — a template re-prompt would not fix it and would keep failing.
+
+The code sets (`WHATSAPP_WINDOW_ERROR_CODES`, `META_RATE_LIMIT_ERROR_CODES`, and the
+display-only policy/recipient/auth/server groups) live in one leaf module,
+[`src/limits/error-codes.ts`](../../src/limits/error-codes.ts), so `classifyError`,
+`classifyStatusErrorCode`, and the `whatsappFailureCategory` display mapper (see
+[Status tracking](./status-tracking.md)) all share ONE definition and can never
+disagree about, say, whether `131047` is a window error.
+
+> **`131056` is transient but a 72-hour window — a documented tradeoff.** It is the
+> "(Business, Consumer) pair rate limit" and is classified `transient`, so it
+> retries. But it is a 72-HOUR moving per-recipient window, so retries are bounded
+> by `transientRetryMaxAttempts()` yet will exhaust uselessly against it (SAFE — no
+> double-send — but wasteful). It is kept in the transient set for consistency with
+> the rest of the rate-limit codes; see [Known gaps](../KNOWN-GAPS.md).
+
+### The async `failed`-status classifier
+
+`classifyStatusErrorCode(channel, errorCode)` is the async sibling of
+`classifyError`, used by the WhatsApp `failed`-delivery-status path. A status
+callback carries no `httpStatus`, so this can only key on the bare numeric
+`errorCode`: WhatsApp window codes → `window_closed`, a Meta rate-limit code →
+`transient`, everything else (including `undefined`) → `permanent`. It deliberately
+keeps the **same narrow, semantic set** as `classifyError` even though a `failed`
+status has **no** double-send risk (it could safely retry more aggressively — see
+[Ordered delivery → the inverted double-send
+rule](./ordered-delivery.md#the-double-send-safety-rule-is-inverted-on-this-path-load-bearing))
+— because a window-closed condition still needs a template re-prompt (not a plain
+re-send) and a blind re-send of a policy/recipient/auth failure would just fail
+again.
 
 ### The retry loop
 
@@ -266,10 +349,20 @@ are non-negative (`0` disables); the retry knobs are positive ints with a
 | --- | --- | --- |
 | `WHATSAPP_RATE_LIMIT_PER_SECOND` | `80` | WhatsApp outbound pacing (msgs/sec; `0` disables). |
 | `MESSENGER_RATE_LIMIT_PER_SECOND` | `40` | Messenger outbound pacing. |
-| `INSTAGRAM_RATE_LIMIT_PER_SECOND` | `2` | Instagram outbound pacing. |
+| `INSTAGRAM_RATE_LIMIT_PER_SECOND` | `10` | Instagram outbound pacing (`10` matches the IG media cap + the client's in-process floor; `2/s` is the general Graph baseline, not the messaging limit). |
+| `WHATSAPP_RATE_LIMIT_PER_HOUR` | `1000` | Track-only WhatsApp per-hour MESSAGE-count cap (advisory warn/error logging; `0` disables). |
+| `WHATSAPP_RATE_LIMIT_PER_DAY` | `10000` | Track-only WhatsApp per-day MESSAGE-count cap (advisory; `0` disables; per-hour must be `<=` per-day when both `> 0`). |
+| `MESSENGER_RATE_LIMIT_PER_HOUR` | `0` | Track-only Messenger per-hour cap (disabled by default). |
+| `MESSENGER_RATE_LIMIT_PER_DAY` | `0` | Track-only Messenger per-day cap (disabled by default). |
+| `INSTAGRAM_RATE_LIMIT_PER_HOUR` | `0` | Track-only Instagram per-hour cap (disabled by default). |
+| `INSTAGRAM_RATE_LIMIT_PER_DAY` | `0` | Track-only Instagram per-day cap (disabled by default). |
 | `TRANSIENT_RETRY_MAX_ATTEMPTS` | `3` | Max transient-retry attempts after the first send. |
 | `TRANSIENT_RETRY_BASE_MS` | `1000` | Base backoff for transient retry (must be `<=` max). |
 | `TRANSIENT_RETRY_MAX_MS` | `60000` | Max backoff for transient retry (must be `>=` base). |
+
+The per-hour/per-day values are non-negative ints (`0` disables that window); the
+per-second values are non-negative floats (`0` disables pacing); the retry knobs are
+positive ints with the `base <= max` cross-field check.
 
 The Redis path for the counter store is selected on `REDIS_URL` — see
 [Persistence](./persistence.md).
@@ -296,15 +389,21 @@ testing](./persistence.md#testing) and [Testing](../TESTING.md).
 
 ## Known limitations
 
-- Pacing is **per-second only.** There are no per-hour / per-day hard caps — Meta's
-  daily tier limits (and the IG hourly throughput model) are tracked by Meta, not
-  enforced here. See [Known gaps](../KNOWN-GAPS.md).
+- **Gating is per-second only.** The per-hour/per-day counters are **track-only**
+  (warn/error logging) — there is no true GATING cap, and no WhatsApp
+  conversation-unit accounting (the per-message count is an advisory proxy for
+  WhatsApp's conversation-based tiers). A true gating cap is still deferred. See
+  [Known gaps](../KNOWN-GAPS.md).
+- **No metric for a threshold crossing.** A per-hour/per-day crossing is log-only;
+  no Prometheus counter is emitted for it.
 - The Instagram client's own ~100ms in-process pacer still runs alongside the
   `LimitTracker` (double-paced; both conservative).
 - Window enforcement is WhatsApp-only — Messenger/Instagram have no reliable
   out-of-window mechanism for an automated bot, so there is nothing to enforce.
 - Boot recovery covers transient retries only (against a durable store) — not in-flight
   window re-prompts.
+- `131056` is retried (transient) even though it is a 72-hour per-recipient window,
+  so its retries exhaust uselessly (safe but wasteful — see above).
 
 See [Known gaps](../KNOWN-GAPS.md) for the full deferral list and
 [Architecture](../ARCHITECTURE.md) for where this layer sits in the runtime.

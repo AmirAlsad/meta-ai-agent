@@ -14,8 +14,9 @@
 
 import { randomUUID } from 'node:crypto';
 import type { ChatAction } from '../chat/types.js';
+import { resolveTargetRef } from '../chat/target-resolver.js';
 import type { ChannelFeature, TemplateComponent } from '../meta/shared/adapter.js';
-import type { Channel, DeliveryStatus } from '../meta/types.js';
+import type { Channel, DeliveryStatus, IncomingMessage } from '../meta/types.js';
 import type { OutboundItem, AdvancementMode, QueueState } from './types.js';
 
 /** Result of mapping a turn's actions into queueable items + skip notes. */
@@ -33,17 +34,26 @@ export interface BuildOutboundResult {
  * (`randomUUID`) used to correlate it across retries/persistence — distinct
  * from the `channelMessageId` Meta returns after a successful send.
  *
- * Skipped actions (unsupported features, the reply→message downgrade note, and
- * the silence no-op) are NOT thrown — they are returned in `skipped` so the
- * agent can log them. This mirrors the contract's "unsupported actions are
- * skipped, not errored" rule.
+ * `options.inboundMessages` is the turn's buffered inbound {@link
+ * IncomingMessage}[] (oldest first) — the candidate set against which a `reply`
+ * / `reaction` symbolic {@link TargetRef} target is resolved into a concrete
+ * `channelMessageId`. The param is OPTIONAL (defaults to `[]`) so the existing
+ * two-arg call sites still compile; without it, symbolic targets that need
+ * history simply fail to resolve and follow the unresolved-target paths below.
+ *
+ * Skipped actions (unsupported features, the reply→message downgrade note, the
+ * unresolved-target downgrade/skip, and the silence no-op) are NOT thrown —
+ * they are returned in `skipped` so the agent can log them. This mirrors the
+ * contract's "unsupported actions are skipped, not errored" rule.
  */
 export function buildOutboundItems(
   actions: ChatAction[],
-  supports: (feature: ChannelFeature) => boolean
+  supports: (feature: ChannelFeature) => boolean,
+  options?: { inboundMessages?: IncomingMessage[] }
 ): BuildOutboundResult {
   const items: OutboundItem[] = [];
   const skipped: Array<{ kind: string; reason: string }> = [];
+  const inboundMessages = options?.inboundMessages ?? [];
 
   for (const action of actions) {
     switch (action.type) {
@@ -51,13 +61,29 @@ export function buildOutboundItems(
         items.push({ id: randomUUID(), kind: 'message', text: action.text });
         break;
 
-      case 'reply':
+      case 'reply': {
+        // Resolve the symbolic-or-literal target first so the supports() check
+        // and the resolution check compose cleanly. A literal-string target
+        // passes through unchanged (see resolveTargetRef); a TargetRef resolves
+        // against the turn's inbound messages.
+        const resolution = resolveTargetRef(action.targetMessageId, inboundMessages);
+        if (!resolution.ok) {
+          // WHY downgrade rather than skip: same reasoning as the reply_to
+          // case below — the text still matters to the user even when we can't
+          // thread it. We deliver the body as a plain `message` and note that
+          // the target couldn't be resolved so the lost threading is
+          // observable, instead of dropping content the developer asked us to
+          // send.
+          items.push({ id: randomUUID(), kind: 'message', text: action.text });
+          skipped.push({ kind: 'reply', reason: `target unresolved: ${resolution.reason}; downgraded to message` });
+          break;
+        }
         if (supports('reply_to')) {
           items.push({
             id: randomUUID(),
             kind: 'reply',
             text: action.text,
-            targetMessageId: action.targetMessageId
+            targetMessageId: resolution.messageId
           });
         } else {
           // WHY downgrade rather than skip: the text content still matters to
@@ -69,19 +95,29 @@ export function buildOutboundItems(
           skipped.push({ kind: 'reply', reason: 'reply_to unsupported; downgraded to message' });
         }
         break;
+      }
 
-      case 'reaction':
-        if (supports('reaction')) {
-          items.push({
-            id: randomUUID(),
-            kind: 'reaction',
-            emoji: action.emoji,
-            targetMessageId: action.targetMessageId
-          });
-        } else {
+      case 'reaction': {
+        if (!supports('reaction')) {
           skipped.push({ kind: 'reaction', reason: 'reaction unsupported on this channel' });
+          break;
         }
+        // A reaction carries no text, so an unresolved target leaves NOTHING to
+        // deliver — there is no downgrade, we just skip with a note (unlike a
+        // reply, which still has a body worth sending as a plain message).
+        const resolution = resolveTargetRef(action.targetMessageId, inboundMessages);
+        if (!resolution.ok) {
+          skipped.push({ kind: 'reaction', reason: `target unresolved: ${resolution.reason}` });
+          break;
+        }
+        items.push({
+          id: randomUUID(),
+          kind: 'reaction',
+          emoji: action.emoji,
+          targetMessageId: resolution.messageId
+        });
         break;
+      }
 
       case 'typing':
         if (supports('typing_indicator')) {

@@ -75,6 +75,18 @@ export interface OutboundItem {
    * the retry timer for a `sending` turn that was interrupted by a restart.
    */
   nextRetryAt?: number;
+  /**
+   * Cumulative count of ASYNC-failure retries for this item — the retries driven
+   * by a WhatsApp `failed` DELIVERY STATUS webhook (as opposed to a synchronous
+   * send throw, which uses {@link retryCount}). This is a SEPARATE counter because
+   * the async path only fires after a send SUCCEEDED, and the success tail deletes
+   * `retryCount` for double-send safety — so `retryCount` can never accumulate
+   * across success→async-fail cycles and the cap would never trip (a recurring
+   * async failure would retry forever). `asyncFailRetryCount` is NOT cleared on a
+   * successful send, so it bounds the async-failure retry loop. Bounded by
+   * `LimitTracker.transientRetryMaxAttempts()`.
+   */
+  asyncFailRetryCount?: number;
 }
 
 /**

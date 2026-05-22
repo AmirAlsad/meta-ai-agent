@@ -12,6 +12,12 @@ function makeConfig(overrides: Partial<LimitsConfig> = {}): LimitsConfig {
     whatsappPerSecond: 80,
     messengerPerSecond: 40,
     instagramPerSecond: 2,
+    whatsappPerHour: 1000,
+    whatsappPerDay: 10000,
+    messengerPerHour: 0,
+    messengerPerDay: 0,
+    instagramPerHour: 0,
+    instagramPerDay: 0,
     transientRetryMaxAttempts: 3,
     transientRetryBaseMs: 1000,
     transientRetryMaxMs: 60000,
@@ -87,6 +93,9 @@ describe('createLimitTracker — pacing', () => {
     const slept: number[] = [];
     const throwingStore: LimitCounterStore = {
       async acquireOutboundSlot() {
+        throw new Error('redis down');
+      },
+      async incrementWindowCounters() {
         throw new Error('redis down');
       }
     };
@@ -164,6 +173,150 @@ describe('createLimitTracker — classifyError', () => {
   });
 });
 
+describe('createLimitTracker — classifyStatusErrorCode (async failed-status path)', () => {
+  const tracker = createLimitTracker({
+    store: new InMemoryLimitCounterStore(),
+    config: makeConfig(),
+    logger: silentLogger
+  });
+
+  it('classifies WhatsApp window codes (131047, 470) as window_closed', () => {
+    expect(tracker.classifyStatusErrorCode('whatsapp', 131047)).toBe('window_closed');
+    expect(tracker.classifyStatusErrorCode('whatsapp', 470)).toBe('window_closed');
+  });
+
+  it('does NOT treat 131051 as window_closed — it is permanent', () => {
+    expect(tracker.classifyStatusErrorCode('whatsapp', 131051)).toBe('permanent');
+  });
+
+  it('treats window codes as permanent on a non-whatsapp channel', () => {
+    expect(tracker.classifyStatusErrorCode('messenger', 131047)).toBe('permanent');
+    expect(tracker.classifyStatusErrorCode('instagram', 470)).toBe('permanent');
+  });
+
+  it('classifies Meta rate-limit codes as transient on ANY channel', () => {
+    for (const code of [4, 80007, 130429, 131056, 613]) {
+      expect(tracker.classifyStatusErrorCode('whatsapp', code)).toBe('transient');
+      expect(tracker.classifyStatusErrorCode('messenger', code)).toBe('transient');
+      expect(tracker.classifyStatusErrorCode('instagram', code)).toBe('transient');
+    }
+  });
+
+  it('classifies undefined (no code on the status) as permanent', () => {
+    expect(tracker.classifyStatusErrorCode('whatsapp', undefined)).toBe('permanent');
+    expect(tracker.classifyStatusErrorCode('messenger', undefined)).toBe('permanent');
+  });
+
+  it('classifies policy / recipient / unknown codes as permanent', () => {
+    // 131048 spam, 131026 undeliverable, 999999 unknown — none is retry-safe.
+    for (const code of [131048, 131026, 190, 999999]) {
+      expect(tracker.classifyStatusErrorCode('whatsapp', code)).toBe('permanent');
+    }
+  });
+});
+
+describe('createLimitTracker — recordOutbound (track-only per-hour/day counters)', () => {
+  /** Capture warn/error log lines via a pino destination-stream spy logger. */
+  function spyLogger(): { logger: pino.Logger; warns: unknown[]; errors: unknown[] } {
+    const warns: unknown[] = [];
+    const errors: unknown[] = [];
+    // pino merges the first-arg mergeObject (which carries our `window` field)
+    // into the emitted JSON line, so the captured object exposes `.window`.
+    const logger = pino(
+      { level: 'trace' },
+      {
+        write(line: string) {
+          const obj = JSON.parse(line) as { level: number };
+          if (obj.level === 40) warns.push(obj);
+          if (obj.level >= 50) errors.push(obj);
+        }
+      }
+    ) as pino.Logger;
+    return { logger, warns, errors };
+  }
+
+  it('warns exactly once at 80% of the hourly cap and errors exactly once at 100%', async () => {
+    const { logger, warns, errors } = spyLogger();
+    // hour cap 10 → warn at 8; day disabled (0) so only the hour window logs.
+    const tracker = createLimitTracker({
+      store: new InMemoryLimitCounterStore(),
+      config: makeConfig({ whatsappPerHour: 10, whatsappPerDay: 0 }),
+      logger,
+      now: () => 0
+    });
+    for (let i = 0; i < 12; i += 1) {
+      await tracker.recordOutbound('whatsapp', 'biz');
+    }
+    // Warn fires only on the EXACT crossing (count === 8), not on every send past it.
+    const hourWarns = warns.filter((w) => (w as { window?: string }).window === 'hour');
+    const hourErrors = errors.filter((e) => (e as { window?: string }).window === 'hour');
+    expect(hourWarns).toHaveLength(1);
+    expect(hourErrors).toHaveLength(1);
+  });
+
+  it('logs nothing when the window cap is 0 (disabled)', async () => {
+    const { logger, warns, errors } = spyLogger();
+    const tracker = createLimitTracker({
+      store: new InMemoryLimitCounterStore(),
+      config: makeConfig({ whatsappPerHour: 0, whatsappPerDay: 0 }),
+      logger,
+      now: () => 0
+    });
+    for (let i = 0; i < 50; i += 1) await tracker.recordOutbound('whatsapp', 'biz');
+    expect(warns).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+  });
+
+  it('tracks hour and day windows independently (day warn at its own 80%)', async () => {
+    const { logger, warns } = spyLogger();
+    // hour 100 (warn at 80, never reached), day 5 (warn at 4).
+    const tracker = createLimitTracker({
+      store: new InMemoryLimitCounterStore(),
+      config: makeConfig({ whatsappPerHour: 100, whatsappPerDay: 5 }),
+      logger,
+      now: () => 0
+    });
+    for (let i = 0; i < 4; i += 1) await tracker.recordOutbound('whatsapp', 'biz');
+    const dayWarns = warns.filter((w) => (w as { window?: string }).window === 'day');
+    const hourWarns = warns.filter((w) => (w as { window?: string }).window === 'hour');
+    expect(dayWarns).toHaveLength(1); // count hit 4 = floor(5*0.8)
+    expect(hourWarns).toHaveLength(0); // never reached 80
+  });
+
+  it('is fail-open: a throwing store never throws out of recordOutbound', async () => {
+    const throwingStore: LimitCounterStore = {
+      async acquireOutboundSlot() {
+        return 0;
+      },
+      async incrementWindowCounters() {
+        throw new Error('redis down');
+      }
+    };
+    const tracker = createLimitTracker({
+      store: throwingStore,
+      config: makeConfig({ whatsappPerHour: 10 }),
+      logger: silentLogger
+    });
+    await expect(tracker.recordOutbound('whatsapp', 'biz')).resolves.toBeUndefined();
+  });
+
+  it('keys windows by channel:businessId (distinct lines counted separately)', async () => {
+    const { logger, errors } = spyLogger();
+    // hour cap 2 → error at 2. Two different businesses each need 2 to error.
+    const tracker = createLimitTracker({
+      store: new InMemoryLimitCounterStore(),
+      config: makeConfig({ whatsappPerHour: 2, whatsappPerDay: 0 }),
+      logger,
+      now: () => 0
+    });
+    await tracker.recordOutbound('whatsapp', 'bizA'); // A=1
+    await tracker.recordOutbound('whatsapp', 'bizB'); // B=1 (independent line)
+    expect(errors.filter((e) => (e as { window?: string }).window === 'hour')).toHaveLength(0);
+    await tracker.recordOutbound('whatsapp', 'bizA'); // A=2 → error
+    expect(errors.filter((e) => (e as { window?: string }).window === 'hour')).toHaveLength(1);
+  });
+});
+
 describe('createLimitTracker — retry knobs', () => {
   it('retryDelayMs reflects config base/max and the injected RNG', () => {
     const tracker = createLimitTracker({
@@ -193,6 +346,9 @@ describe('createLimitTracker — retry knobs', () => {
     const store: LimitCounterStore = {
       async acquireOutboundSlot() {
         return 0;
+      },
+      async incrementWindowCounters() {
+        return { hourCount: 0, dayCount: 0 };
       },
       async close() {
         closed = true;

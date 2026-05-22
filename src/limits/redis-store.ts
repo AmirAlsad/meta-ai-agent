@@ -18,7 +18,7 @@
  */
 import type { Redis } from 'ioredis';
 import type { Logger } from 'pino';
-import type { LimitCounterStore } from './store.js';
+import { DAY_MS, HOUR_MS, type LimitCounterStore } from './store.js';
 
 /** Shared namespace so the limits keyspace can be flushed without clobbering
  *  conversation/dedupe state on a redeploy. */
@@ -48,6 +48,25 @@ redis.call('SET', key, slot, 'PX', ttl)
 local delay = slot - now
 if delay < 0 then delay = 0 end
 return delay
+`.trim();
+
+/**
+ * Atomic INCR + EXPIRE-on-first for a fixed-window counter.
+ *   KEYS[1] = the bucket key (`…:hour:{line}:{bucket}` or `…:day:{line}:{bucket}`)
+ *   ARGV[1] = TTL (ms) for the bucket key
+ * WHY a Lua EVAL and not a bare INCR + EXPIRE: the standalone two-call sequence
+ * has a failure mode under Redis eviction — if the key is evicted between the
+ * INCR (which recreates it WITHOUT a TTL) and the EXPIRE, the counter becomes
+ * immortal and the bucket never rolls over. EVAL is atomic Redis-side, so the
+ * EXPIRE always lands when INCR returns 1 (the first increment of a fresh
+ * window). The fixed `{bucket}` segment in the key (the wall-clock window index)
+ * means a new window naturally lands on a new key, so old windows expire on
+ * their own.
+ */
+const BUMP_WINDOW_LUA = `
+local v = redis.call('INCR', KEYS[1])
+if v == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return v
 `.trim();
 
 export interface RedisLimitCounterStoreOptions {
@@ -85,6 +104,30 @@ export class RedisLimitCounterStore implements LimitCounterStore {
     );
     const delay = typeof result === 'number' ? result : Number(result);
     return Number.isFinite(delay) ? Math.max(0, delay) : 0;
+  }
+
+  async incrementWindowCounters(
+    line: string,
+    now: number
+  ): Promise<{ hourCount: number; dayCount: number }> {
+    // Fixed wall-clock window indices so a new hour/day lands on a new key (the
+    // key TTL then evicts the prior window). Buckets are computed identically to
+    // the in-memory store via the shared HOUR_MS/DAY_MS constants.
+    const hourBucket = Math.floor(now / HOUR_MS);
+    const dayBucket = Math.floor(now / DAY_MS);
+    // TTL each bucket slightly past its own window so a counter survives the full
+    // window even if the first INCR lands late in the window, but still self-evicts.
+    const [hourCount, dayCount] = await Promise.all([
+      this.bumpWindow(`${KEY_PREFIX}:hour:${line}:${hourBucket}`, HOUR_MS * 2),
+      this.bumpWindow(`${KEY_PREFIX}:day:${line}:${dayBucket}`, DAY_MS * 2)
+    ]);
+    return { hourCount, dayCount };
+  }
+
+  private async bumpWindow(key: string, ttlMs: number): Promise<number> {
+    const result = await this.redis.eval(BUMP_WINDOW_LUA, 1, key, String(ttlMs));
+    const count = typeof result === 'number' ? result : Number(result);
+    return Number.isFinite(count) ? count : 0;
   }
 
   /** No-op: the redis client is borrowed; the runtime owns its lifecycle. */

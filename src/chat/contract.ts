@@ -14,9 +14,11 @@
 import { ChatEndpointError } from './errors.js';
 import type {
   ChatAction,
+  ChatActionTarget,
   ChatContractWarning,
   ChatResponse,
-  NormalizedChatResponse
+  NormalizedChatResponse,
+  TargetRef
 } from './types.js';
 
 export function normalizeChatResponse(payload: unknown): NormalizedChatResponse {
@@ -138,6 +140,16 @@ function invalid(path: string, reason: string): ValidationResult {
 /**
  * Validate one raw action against the {@link ChatAction} union. Returns the
  * typed action when valid, or an `invalid-action` warning when not.
+ *
+ * Field reading goes through {@link readAliasedString} / {@link readTarget} so
+ * we tolerate the common JSON drift an LLM endpoint produces: `content` for
+ * `text`, `media_url`/`url` for the media url, and snake_case spellings of
+ * camelCase fields (`target_message_id`, `mime_type`). The aliasing is
+ * permissive about INPUT spelling but always emits the canonical
+ * {@link ChatAction} shape — downstream code never sees an alias. We do NOT
+ * port the sibling's reaction-emoji-synonym coercion (heart→love etc.): that is
+ * iMessage Tapback-specific and has no Meta meaning. Unknown action TYPES still
+ * become warnings (not throws), preserving the strict-but-forgiving spirit.
  */
 function validateAction(value: unknown, path: string): ValidationResult {
   if (!isRecord(value) || typeof value.type !== 'string') {
@@ -146,13 +158,14 @@ function validateAction(value: unknown, path: string): ValidationResult {
 
   switch (value.type) {
     case 'message': {
-      const text = readNonEmptyString(value.text);
+      // `content` is the most common LLM alias for the message body.
+      const text = readAliasedString(value, ['text', 'content']);
       if (text === undefined) return invalid(path, 'message action requires a non-empty "text"');
       return { action: { type: 'message', text } };
     }
     case 'reply': {
-      const text = readNonEmptyString(value.text);
-      const targetMessageId = readNonEmptyString(value.targetMessageId);
+      const text = readAliasedString(value, ['text', 'content']);
+      const targetMessageId = readTarget(value);
       if (text === undefined) return invalid(path, 'reply action requires a non-empty "text"');
       if (targetMessageId === undefined) {
         return invalid(path, 'reply action requires a non-empty "targetMessageId"');
@@ -164,10 +177,10 @@ function validateAction(value: unknown, path: string): ValidationResult {
       // and Messenger sendReaction paths both treat emoji === '' as
       // remove-reaction, and ChatAction.reaction types emoji as `string` (which
       // permits ''). Accept any string here; only a missing/non-string emoji is
-      // invalid. readNonEmptyString would silently drop unreact before it ever
+      // invalid. readAliasedString would silently drop unreact before it ever
       // reached the adapter.
       const emoji = typeof value.emoji === 'string' ? value.emoji : undefined;
-      const targetMessageId = readNonEmptyString(value.targetMessageId);
+      const targetMessageId = readTarget(value);
       if (emoji === undefined) {
         return invalid(path, 'reaction action requires a string "emoji" (use "" to remove a reaction)');
       }
@@ -177,10 +190,12 @@ function validateAction(value: unknown, path: string): ValidationResult {
       return { action: { type: 'reaction', emoji, targetMessageId } };
     }
     case 'media': {
-      const url = readNonEmptyString(value.url);
+      // `media_url` and `url` are common aliases the endpoint may emit; `url`
+      // is the canonical field, so it is listed first.
+      const url = readAliasedString(value, ['url', 'media_url']);
       if (url === undefined) return invalid(path, 'media action requires a non-empty "url"');
       const caption = readNonEmptyString(value.caption);
-      const mimeType = readNonEmptyString(value.mimeType);
+      const mimeType = readAliasedString(value, ['mimeType', 'mime_type']);
       // `filename` (for documents) is optional; carry it through only when it is
       // a non-empty string. A non-string filename is simply ignored (not an
       // error) — the rest of the media action is still deliverable, and the
@@ -243,6 +258,80 @@ function hasContent(response: ChatResponse): boolean {
 
 function readNonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
+}
+
+/**
+ * Read the first non-empty string among a list of candidate keys, in priority
+ * order. The canonical key is listed first so it always wins when both it and
+ * an alias are present. Used to absorb LLM field-name drift (`content`↔`text`,
+ * `media_url`↔`url`, `mime_type`↔`mimeType`) without scattering `?? value.alias`
+ * chains through `validateAction`.
+ */
+function readAliasedString(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const found = readNonEmptyString(record[key]);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+/**
+ * Read a reply/reaction target, tolerating the snake_case
+ * `target_message_id` alias and accepting EITHER a literal id string OR a
+ * symbolic {@link TargetRef} object (the queue resolves the latter against the
+ * turn's inbound messages — see `src/chat/target-resolver.ts`). A bare empty
+ * string or an unrecognized object shape yields `undefined` (treated as a
+ * missing target by the caller). The canonical `targetMessageId` key wins over
+ * the alias when both are present.
+ */
+function readTarget(record: Record<string, unknown>): ChatActionTarget | undefined {
+  // Prefer the canonical key, then the snake_case alias; under each, accept a
+  // literal string or a structured TargetRef.
+  for (const key of ['targetMessageId', 'target_message_id']) {
+    const raw = record[key];
+    const literal = readNonEmptyString(raw);
+    if (literal !== undefined) return literal;
+    const ref = readTargetRef(raw);
+    if (ref !== undefined) return ref;
+  }
+  return undefined;
+}
+
+/**
+ * Validate a structured {@link TargetRef} object. Returns the typed ref only
+ * when it matches one of the union variants with a usable value; anything else
+ * (a non-object, an empty alias/content, a non-integer/`<1` occurrence) yields
+ * `undefined`. The variants are checked most-specific first so e.g. a
+ * `messageId` literal-escape-hatch wins over an incidental `content` field.
+ */
+function readTargetRef(value: unknown): TargetRef | undefined {
+  if (!isRecord(value)) return undefined;
+
+  const messageId = readNonEmptyString(value.messageId);
+  if (messageId !== undefined) return { messageId };
+
+  if (typeof value.alias === 'string') {
+    const alias = value.alias.trim().toLowerCase();
+    if (alias === 'last' || alias === 'previous' || alias === 'first') return { alias };
+    return undefined;
+  }
+
+  const contentIncludes = readNonEmptyString(value.contentIncludes);
+  if (contentIncludes !== undefined) {
+    // `occurrence` is an optional 1-based selector; carry it through only when
+    // it is a positive integer, else drop it (an ambiguous match then surfaces
+    // at resolve time rather than here).
+    const occurrence =
+      typeof value.occurrence === 'number' && Number.isInteger(value.occurrence) && value.occurrence >= 1
+        ? value.occurrence
+        : undefined;
+    return occurrence !== undefined ? { contentIncludes, occurrence } : { contentIncludes };
+  }
+
+  const content = readNonEmptyString(value.content);
+  if (content !== undefined) return { content };
+
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

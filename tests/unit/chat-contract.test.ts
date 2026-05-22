@@ -238,6 +238,113 @@ describe('normalizeChatResponse — invalid actions dropped with warning', () =>
   });
 });
 
+describe('normalizeChatResponse — defensive field aliasing', () => {
+  it('accepts `content` as an alias for a message action\'s `text`', () => {
+    const result = normalizeChatResponse({ actions: [{ type: 'message', content: 'hi there' }] });
+    expect(result).toEqual({ actions: [{ type: 'message', text: 'hi there' }] });
+  });
+
+  it('prefers canonical `text` over the `content` alias when both are present', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'message', text: 'canonical', content: 'alias' }]
+    });
+    expect(result.actions).toEqual([{ type: 'message', text: 'canonical' }]);
+  });
+
+  it('accepts `content` as an alias for a reply action\'s `text`', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'reply', content: 'sure', targetMessageId: 'wamid.1' }]
+    });
+    expect(result.actions).toEqual([{ type: 'reply', text: 'sure', targetMessageId: 'wamid.1' }]);
+  });
+
+  it('accepts `target_message_id` as a snake_case alias for `targetMessageId` (reply)', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'reply', text: 'ok', target_message_id: 'wamid.2' }]
+    });
+    expect(result.actions).toEqual([{ type: 'reply', text: 'ok', targetMessageId: 'wamid.2' }]);
+  });
+
+  it('accepts `target_message_id` as a snake_case alias for `targetMessageId` (reaction)', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'reaction', emoji: '👍', target_message_id: 'wamid.3' }]
+    });
+    expect(result.actions).toEqual([{ type: 'reaction', emoji: '👍', targetMessageId: 'wamid.3' }]);
+  });
+
+  it('accepts `media_url` as an alias for the media action\'s `url`', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'media', media_url: 'https://x/y.jpg' }]
+    });
+    expect(result.actions).toEqual([{ type: 'media', url: 'https://x/y.jpg' }]);
+  });
+
+  it('accepts a bare `url` for the media action (already canonical)', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'media', url: 'https://x/y.jpg' }]
+    });
+    expect(result.actions).toEqual([{ type: 'media', url: 'https://x/y.jpg' }]);
+  });
+
+  it('accepts `mime_type` as a snake_case alias for the media action\'s `mimeType`', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'media', url: 'https://x/r.pdf', mime_type: 'application/pdf' }]
+    });
+    expect(result.actions).toEqual([
+      { type: 'media', url: 'https://x/r.pdf', mimeType: 'application/pdf' }
+    ]);
+  });
+
+  it('still warns (does not throw) on an unknown action type', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'detonate', content: 'boom' }, { type: 'message', content: 'safe' }]
+    });
+    expect(result.actions).toEqual([{ type: 'message', text: 'safe' }]);
+    expect(result.warnings?.[0].code).toBe('invalid-action');
+    expect(result.warnings?.[0].message).toContain('detonate');
+  });
+
+  it('accepts a symbolic TargetRef object as a reply target (passed through for the queue)', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'reply', content: 'about that', targetMessageId: { alias: 'last' } }]
+    });
+    expect(result.actions).toEqual([
+      { type: 'reply', text: 'about that', targetMessageId: { alias: 'last' } }
+    ]);
+  });
+
+  it('accepts a contentIncludes TargetRef with an occurrence selector', () => {
+    const result = normalizeChatResponse({
+      actions: [
+        { type: 'reaction', emoji: '🔥', targetMessageId: { contentIncludes: 'order', occurrence: 2 } }
+      ]
+    });
+    expect(result.actions).toEqual([
+      { type: 'reaction', emoji: '🔥', targetMessageId: { contentIncludes: 'order', occurrence: 2 } }
+    ]);
+  });
+
+  it('normalizes an uppercase alias on a TargetRef object to the canonical lowercase form', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'reply', text: 'hi', targetMessageId: { alias: 'LAST' } }]
+    });
+    expect(result.actions).toEqual([
+      { type: 'reply', text: 'hi', targetMessageId: { alias: 'last' } }
+    ]);
+  });
+
+  it('drops a reply whose target object is an unknown TargetRef shape (missing target)', () => {
+    const result = normalizeChatResponse({
+      actions: [{ type: 'reply', text: 'hi', targetMessageId: { foo: 'bar' } }]
+    });
+    // No usable target → the reply is invalid (text alone isn't a valid reply
+    // here; the queue's downgrade only applies to a present-but-unresolvable
+    // target, not a structurally-missing one at the contract layer).
+    expect(result.actions).toEqual([]);
+    expect(result.warnings?.[0].message).toContain('targetMessageId');
+  });
+});
+
 describe('normalizeChatResponse — rejected payloads', () => {
   it('throws on null', () => {
     expect(() => normalizeChatResponse(null)).toThrow(ChatEndpointError);

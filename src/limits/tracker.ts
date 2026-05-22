@@ -3,16 +3,20 @@
  * messaging-window classification surface the conversation agent layers on top
  * of a {@link LimitCounterStore}.
  *
- * Three jobs:
+ * Four jobs:
  *  1. PACING — `acquireSendSlot` reserves a virtual-clock slot for the line and
  *     sleeps any required delay before the agent sends. It is FAIL-OPEN: a
  *     pacing failure must never block a reply, so any error is logged and
  *     swallowed.
- *  2. ERROR ROUTING — `classifyError` buckets a send error into
- *     transient / window_closed / permanent so the agent knows whether to
- *     retry, abandon, or surface a closed-window condition.
+ *  2. ERROR ROUTING — `classifyError` (synchronous send-catch) and
+ *     `classifyStatusErrorCode` (the async `failed`-status webhook) bucket a
+ *     failure into transient / window_closed / permanent so the agent knows
+ *     whether to retry, abandon, or surface a closed-window condition.
  *  3. RETRY MATH — `retryDelayMs` / `transientRetryMaxAttempts` expose the
  *     backoff schedule from config.
+ *  4. TRACK-ONLY THROUGHPUT — `recordOutbound` bumps fixed per-hour / per-day
+ *     window counters for the line and warn/error-logs as it nears the
+ *     configured cap. It NEVER gates a send (advisory only) and is FAIL-OPEN.
  *
  * DOUBLE-SEND SAFETY drives the transient set. The transient set is limited to:
  * network failures (`httpStatus 0`, never reached Meta) and HTTP `429` / Meta
@@ -30,44 +34,14 @@ import type pino from 'pino';
 import type { LimitsConfig } from '../config/loader.js';
 import { MetaApiError } from '../meta/shared/errors.js';
 import type { Channel } from '../meta/types.js';
+// Code SETS live in the leaf `error-codes` module so the synchronous
+// `classifyError`, the async `classifyStatusErrorCode`, and the display
+// `whatsappFailureCategory` mapper all share ONE definition and can never drift.
+import { META_RATE_LIMIT_ERROR_CODES, WHATSAPP_WINDOW_ERROR_CODES } from './error-codes.js';
 import { transientRetryDelayMs, type ErrorClassification } from './retry.js';
 import type { LimitCounterStore } from './store.js';
 
 export type { ErrorClassification } from './retry.js';
-
-/**
- * WhatsApp re-engagement / out-of-window error codes. When a send fails with
- * one of these on the `whatsapp` channel, the 24h customer-service window has
- * lapsed and only a pre-approved template can re-engage — a plain text re-send
- * will keep failing, so it is classified `window_closed` (NOT transient).
- *   - 131047 "Re-engagement message" — the live Cloud API send-call error for
- *     "more than 24h since the user last replied". This is the one that fires.
- *   - 470    legacy/On-Premises + message-status webhook "failed: >24h since the
- *     customer last replied". Kept as belt-and-suspenders for status-path/legacy
- *     surfaces; harmless on Cloud API where 131047 is authoritative.
- * NOTE: 131051 is "Unsupported message type" (a malformed-payload bug), NOT a
- * window condition — deliberately EXCLUDED so it falls through to `permanent`
- * (a template re-prompt would not fix it and would keep failing). Verified
- * against Meta's WhatsApp Cloud API error-code reference.
- */
-const WHATSAPP_WINDOW_ERROR_CODES = new Set<number>([131047, 470]);
-
-/**
- * Meta/WhatsApp RATE-LIMIT error codes that are safe to retry: Meta rejected the
- * request BEFORE processing it (so a re-send cannot double-deliver — unlike a
- * 5xx, which is ambiguous; see {@link LimitTracker.classifyError}). These surface
- * as a 4xx with a specific error CODE, NOT as HTTP 429, so they must be matched
- * by code, not status. Verified against Meta's rate-limiting + WhatsApp error
- * references:
- *   - 4      "Application request limit reached" (app-level Graph throttle)
- *   - 80007  "Rate limit issues" (WABA reached its rate limit)
- *   - 130429 "Rate limit hit" (Cloud API throughput)
- *   - 131056 "(Business, Consumer) pair rate limit hit"
- *   - 613    "Calls to this API have exceeded the rate limit"
- * Policy/quality throttles (131048 "Spam rate limit", 131049, 368) are NOT here —
- * they are permanent; retrying won't recover and can worsen account standing.
- */
-const META_RATE_LIMIT_ERROR_CODES = new Set<number>([4, 80007, 130429, 131056, 613]);
 
 export interface LimitTracker {
   /**
@@ -80,6 +54,22 @@ export interface LimitTracker {
    * 24h re-engagement) | `permanent` (abandon).
    */
   classifyError(channel: Channel, error: unknown): ErrorClassification;
+  /**
+   * Classify a WhatsApp ASYNC `failed`-status webhook by its bare numeric
+   * `errorCode` (status callbacks carry no `httpStatus`, so this can only key on
+   * the code). Same three-way bucketing as {@link classifyError}, so the agent's
+   * future async-failure path routes a `failed` status identically to a
+   * synchronous send-catch. See the impl for the double-send rationale.
+   */
+  classifyStatusErrorCode(channel: Channel, errorCode: number | undefined): ErrorClassification;
+  /**
+   * TRACK-ONLY (never gating) per-hour / per-day outbound counter bump. Bumps the
+   * fixed hour/day windows for the `${channel}:${businessId}` line and warn/error
+   * logs as the line nears its configured cap, giving operators advance notice
+   * before Meta starts server-side rejecting at the messaging-tier cap. FAIL-OPEN
+   * — a counter failure must NEVER affect delivery, so it never throws.
+   */
+  recordOutbound(channel: Channel, businessId: string): Promise<void>;
   /** Backoff delay (ms) for a 1-based transient-retry attempt. */
   retryDelayMs(attempt: number): number;
   /** Max transient retries AFTER the first send. */
@@ -118,6 +108,68 @@ function perSecondForChannel(config: LimitsConfig, channel: Channel): number {
     default:
       // Exhaustive over Channel today; an unknown channel is unpaced.
       return 0;
+  }
+}
+
+function perHourForChannel(config: LimitsConfig, channel: Channel): number {
+  switch (channel) {
+    case 'whatsapp':
+      return config.whatsappPerHour;
+    case 'messenger':
+      return config.messengerPerHour;
+    case 'instagram':
+      return config.instagramPerHour;
+    default:
+      // Unknown channel → 0 = window disabled (no logging).
+      return 0;
+  }
+}
+
+function perDayForChannel(config: LimitsConfig, channel: Channel): number {
+  switch (channel) {
+    case 'whatsapp':
+      return config.whatsappPerDay;
+    case 'messenger':
+      return config.messengerPerDay;
+    case 'instagram':
+      return config.instagramPerDay;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Warn-then-error threshold logging for ONE fixed window (hour or day).
+ *
+ * TRACK-ONLY: this NEVER gates a send — it only surfaces pressure. A cap of
+ * `<= 0` disables the window entirely (no logging). We log at the EXACT crossing
+ * (`count === floor(cap * 0.8)` warn, `count === cap` error) rather than `>=` so
+ * a steady stream over the cap emits ONE warn + ONE error per window, not a log
+ * line on every send past the threshold. A metric could be wired here later;
+ * the limits layer is deliberately decoupled from the metrics registry, so
+ * log-only is the deliverable for this pass.
+ */
+function logWindowThreshold(
+  logger: pino.Logger,
+  channel: Channel,
+  businessId: string,
+  window: 'hour' | 'day',
+  count: number,
+  cap: number
+): void {
+  if (cap <= 0) return;
+  const warnAt = Math.floor(cap * 0.8);
+  if (count === warnAt) {
+    logger.warn(
+      { channel, businessId, window, count, cap },
+      `outbound ${window} count reached 80% of the configured cap (track-only — sends are not gated)`
+    );
+  }
+  if (count === cap) {
+    logger.error(
+      { channel, businessId, window, count, cap },
+      `outbound ${window} count reached the configured cap (track-only — sends are not gated; Meta may begin server-side rejecting)`
+    );
   }
 }
 
@@ -184,6 +236,60 @@ export function createLimitTracker(deps: LimitTrackerDeps): LimitTracker {
       // AFTER Meta accepted the POST, so re-sending risks a double-send — classify
       // it `permanent` (skip + advance) rather than retry.
       return 'permanent';
+    },
+
+    classifyStatusErrorCode(channel: Channel, errorCode: number | undefined): ErrorClassification {
+      // WHY a `failed` status has NO double-send risk: a `failed` delivery-status
+      // webhook means Meta explicitly did NOT deliver the message, so a retry
+      // cannot double-send (unlike a synchronous 5xx, which is ambiguous about
+      // whether the POST took effect). We could therefore retry more aggressively
+      // here — but we KEEP THE SET NARROW AND SEMANTIC anyway, mirroring
+      // `classifyError`: a window-closed condition still needs a template
+      // re-prompt (not a plain re-send), and only rate-limit codes are worth a
+      // backoff retry. Everything else (policy throttles, recipient problems,
+      // auth, unsupported, server, AND `undefined`) is `permanent` — a blind
+      // re-send would just fail again.
+      if (
+        channel === 'whatsapp' &&
+        errorCode !== undefined &&
+        WHATSAPP_WINDOW_ERROR_CODES.has(errorCode)
+      ) {
+        return 'window_closed';
+      }
+      if (errorCode !== undefined && META_RATE_LIMIT_ERROR_CODES.has(errorCode)) {
+        return 'transient';
+      }
+      return 'permanent';
+    },
+
+    async recordOutbound(channel: Channel, businessId: string): Promise<void> {
+      // FAIL-OPEN: track-only counters must NEVER affect delivery. A store/Redis
+      // failure here is logged and swallowed — the send already happened.
+      try {
+        const line = `${channel}:${businessId}`;
+        const { hourCount, dayCount } = await deps.store.incrementWindowCounters(line, now());
+        logWindowThreshold(
+          deps.logger,
+          channel,
+          businessId,
+          'hour',
+          hourCount,
+          perHourForChannel(deps.config, channel)
+        );
+        logWindowThreshold(
+          deps.logger,
+          channel,
+          businessId,
+          'day',
+          dayCount,
+          perDayForChannel(deps.config, channel)
+        );
+      } catch (err) {
+        deps.logger.warn(
+          { err, channel },
+          'limit-tracker recordOutbound failed; window counters skipped (fail-open)'
+        );
+      }
     },
 
     retryDelayMs(attempt: number): number {

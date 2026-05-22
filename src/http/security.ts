@@ -62,6 +62,9 @@ interface MinimalLogger {
   error?: (obj: object, msg?: string) => void;
 }
 
+/** Reasons a request can be rejected at the signature-verification boundary. */
+export type SignatureRejectReason = 'missing_signature' | 'mismatch' | 'no_raw_body';
+
 /**
  * Express middleware factory that verifies X-Hub-Signature-256 on the request
  * and 401s if invalid. Requires that an earlier middleware has captured the raw
@@ -71,12 +74,31 @@ interface MinimalLogger {
  * request is accepted if its signature matches ANY of them — see
  * {@link verifyMetaSignature} for why (Instagram signs with its own
  * `INSTAGRAM_APP_SECRET`, not `META_APP_SECRET`).
+ *
+ * `onReject` (OPTIONAL) is invoked exactly once on each rejection path with a
+ * bounded {@link SignatureRejectReason}, so a caller can record a rejection
+ * metric. WHY a callback (not a metrics dep): keeps this module
+ * dependency-free — it has no knowledge of the metrics layer; the HTTP layer
+ * wires `metrics.webhookSecretRejectionsTotal.inc({ reason })` (Stage 10). It is
+ * optional and never required, so the existing call sites/tests (which omit it)
+ * still compile and behave identically. A throw FROM `onReject` is swallowed so
+ * a misbehaving metrics sink can never break signature rejection (the response
+ * is already being written on the rejection path).
  */
 export function createMetaSignatureVerifier(
   appSecret: string | readonly string[],
-  logger?: MinimalLogger
+  logger?: MinimalLogger,
+  onReject?: (reason: SignatureRejectReason) => void
 ): (req: Request, res: Response, next: NextFunction) => void {
   const secretsCount = typeof appSecret === 'string' ? 1 : appSecret.length;
+  const reject = (reason: SignatureRejectReason): void => {
+    if (!onReject) return;
+    try {
+      onReject(reason);
+    } catch {
+      /* never let a metrics-sink throw break the security path */
+    }
+  };
   return function metaSignatureVerifier(req: Request, res: Response, next: NextFunction): void {
     const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
     const signatureHeader = req.header('x-hub-signature-256');
@@ -90,6 +112,7 @@ export function createMetaSignatureVerifier(
       } else {
         logger?.warn(logFields, errMsg);
       }
+      reject('no_raw_body');
       res.status(400).json({ error: 'raw_body_unavailable' });
       return;
     }
@@ -100,14 +123,14 @@ export function createMetaSignatureVerifier(
         { path: req.path, signaturePresent, bodyBytes: rawBody.length, secretsCount },
         'meta webhook signature verification failed'
       );
-      // KNOWN GAP (Stage 6): a `webhook_received_total{result:'invalid_signature'}`
-      // counter is NOT incremented here. This verifier is a standalone middleware
-      // with no metrics dependency; the webhook counters are incremented in the
-      // dispatcher (POST /webhook handler), which only runs AFTER a valid
-      // signature. Wiring metrics into this factory was deliberately deferred to
-      // keep the security path dependency-free and avoid touching the existing
-      // signature tests — signature-rejection volume is still observable via this
-      // warn log. Revisit when metrics graduate to a required transport dep.
+      // Distinguish a missing/empty header from a present-but-wrong digest so the
+      // rejection counter can separate "Meta didn't sign / a probe with no
+      // signature" from "a real signature mismatch" — different operational
+      // signals. The webhook_secret_rejections_total counter is incremented by
+      // the HTTP layer via the onReject callback (it counts requests that never
+      // reach the dispatcher's webhook_received_total, which only runs AFTER a
+      // valid signature).
+      reject(signaturePresent ? 'mismatch' : 'missing_signature');
       res.status(401).json({ error: 'invalid_signature' });
       return;
     }

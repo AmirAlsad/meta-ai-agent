@@ -15,12 +15,16 @@ The whole surface is constructed in [`src/http/app.ts`](../../src/http/app.ts) (
 | `GET /metrics` | token | `ADMIN_API_TOKEN` set **and** a metrics collector wired |
 | `GET /admin/conversations/:key` | token | `ADMIN_API_TOKEN` set **and** a conversation store wired |
 | `GET /admin/status/:messageId` | token | `ADMIN_API_TOKEN` set **and** a status tracker wired |
+| `GET /admin/queue` | token | `ADMIN_API_TOKEN` set **and** a buffer scheduler wired |
+| `GET /admin/dedupe?messageId=<id>` | token | `ADMIN_API_TOKEN` set **and** a conversation store wired |
 
 - `GET /health` (always, unauthenticated) returns `{ status: 'ok', uptimeSeconds, version, nodeVersion }`.
 - `GET /ready` (always, unauthenticated) returns the readiness report (below). 503 when any check fails, 200 otherwise.
 - `GET /metrics` returns Prometheus text exposition (token-gated).
 - `GET /admin/conversations/:key` returns a PII-redacted `ConversationRecord` (token-gated; `?reveal=true` unmasks).
 - `GET /admin/status/:messageId` returns a PII-redacted `StatusRecord` (token-gated; `?reveal=true` unmasks). See [Status tracking](./status-tracking.md).
+- `GET /admin/queue` returns `{ kind, stats? }` from the buffer scheduler — `kind` is the impl (`in_memory` / `bullmq`) and `stats` carries the scheduler's job counts. **No PII** (counts only), so no redactor and no `?reveal`. `getStats()` is **timeout-raced** against `READY_REDIS_TIMEOUT_MS` (reused as the bound) so a wedged scheduler — e.g. a hung BullMQ `getJobCounts` against a stalled Redis — can't hang the route; on timeout/throw it 500s rather than leaving the client hanging.
+- `GET /admin/dedupe?messageId=<id>` returns `{ messageId, present, ttlSeconds? }` from `store.peekInboundHandle` — a non-destructive peek answering "did Meta's 7-day redelivery of this id get deduped?". **No PII** (a boolean + remaining TTL). The `messageId` query param is **required**: a missing/empty one is a **400** (not a silent `false`), so a typo'd probe is an obvious error rather than a misleading "not present".
 
 ### The registration guard: token unset → 404, not 401
 
@@ -86,8 +90,31 @@ The metrics layer is provider-agnostic and split into three pieces:
 | `buffer_flush_total` | counter | `result` |
 | `agent_up` | gauge | (none) |
 | `agent_build_info` | gauge | `version` |
+| `transient_retry_total` | counter | `channel`, `outcome` |
+| `acquire_send_slot_delay_seconds` | histogram | `channel` |
+| `webhook_secret_rejections_total` | counter | `reason` |
 
 `agent_up` (always 1 while serving) and `agent_build_info` (version in the label) are set at construction in [`src/index.ts`](../../src/index.ts), so a scrape right after boot already shows the process up with its version. The histograms use `DEFAULT_LATENCY_BUCKETS_SECONDS` (`0.005` … `30`).
+
+The three Stage-10 / limits-wave handles:
+
+- `transient_retry_total{channel,outcome}` — transient-retry outcomes for a failed
+  outbound send. `outcome` is `scheduled` (a retry was armed with backoff) or
+  `exhausted` (the retry budget ran out and the item was skipped). Emitted by the
+  agent on BOTH the synchronous send-catch path and the async `failed`-status path.
+- `acquire_send_slot_delay_seconds{channel}` — wall-clock seconds a send waited at the
+  per-channel pacing slot (`LimitTracker.acquireSendSlot`); `0` == the slot was free.
+  Emitted by `sendNext`'s pacing path.
+- `webhook_secret_rejections_total{reason}` — inbound webhooks **rejected at the
+  signature-verification boundary**, by `reason` (`missing_signature` / `mismatch` /
+  `no_raw_body`). It is the only `AgentMetrics` handle whose emit lives **outside the
+  agent**: the signature verifier ([`src/http/security.ts`](../../src/http/security.ts))
+  takes an optional `onReject(reason)` callback that the HTTP layer wires to this
+  counter. It counts the requests that never reach the dispatcher's
+  `webhook_received_total` (which only runs AFTER a valid signature), **resolving a
+  prior known gap** where signature rejections appeared in warn logs only. A throw
+  from `onReject` is swallowed so a misbehaving metrics sink can't break the security
+  path.
 
 ### Bounded labels (the cardinality guard)
 
@@ -106,7 +133,9 @@ This is load-bearing: metric labels must never carry raw ids or message text. Se
 - The validated (or minted) id is echoed in the `x-trace-id` response header.
 - A pino **child logger** (`logger.child({ traceId, route })`) is stored on `res.locals`; handlers pull both via `requestContextFromLocals(res)`.
 
-The middleware is mounted **after** `express.json` (so the raw-body `verify` hook still captures `req.rawBody` for signature verification) and **before** every route. The webhook dispatcher threads `{ traceId, logger }` into the agent's `handle*` calls, so a conversation's log lines — and the `traceId` it persists on the record — chain back to the originating webhook. Because the agent persists the `traceId`, a delivery/read status that lands minutes later can be tied back to the conversation that produced it.
+The middleware is mounted **after** `express.json` (so the raw-body `verify` hook still captures `req.rawBody` for signature verification) and **before** every route. The webhook dispatcher threads `{ traceId, logger }` into the agent's `handle*` calls, so a conversation's log lines — and the `traceId` it persists on the record — chain back to the originating webhook.
+
+Because the agent persists the `traceId` (on the conversation record AND the per-message outbound-handle mapping), a delivery/read status that lands minutes later — long after the request that produced the outbound has ended — can be tied back to the conversation that produced it. The status handlers stamp this as a distinct `conversationTraceId` field on their log lines: `handleStatusImpl` binds `mapping.traceId` (the originating inbound's trace, from the outbound-handle mapping) and `handleReadWatermarkImpl` binds `record.traceId` (the watermark has no per-message mapping, so it reads the turn's trace off the record). So a late `failed` / `delivered` / `read` log correlates to the originating inbound webhook's trace.
 
 ## Redaction (allow-list / fail-closed)
 
@@ -132,7 +161,8 @@ The policy is **allow-list / fail-closed**: the inbound/outbound/record/status r
 
 | File | Role |
 | --- | --- |
-| [`src/http/app.ts`](../../src/http/app.ts) | All routes + the registration guards + `buildReadinessReport`. |
+| [`src/http/app.ts`](../../src/http/app.ts) | All routes (incl. `/admin/queue`, `/admin/dedupe`) + the registration guards + `buildReadinessReport` + the `onReject` → `webhook_secret_rejections_total` wiring. |
+| [`src/http/security.ts`](../../src/http/security.ts) | The signature verifier + the optional `onReject(reason)` callback feeding the rejection counter. |
 | [`src/http/trace.ts`](../../src/http/trace.ts) | `traceMiddleware`, the `x-trace-id` injection guard, the pino child logger. |
 | [`src/http/auth.ts`](../../src/http/auth.ts) | `validateAdminToken` + constant-time `constantTimeStringEquals`. |
 | [`src/http/redaction.ts`](../../src/http/redaction.ts) | Allow-list / fail-closed redactors + the `mask*` helpers. |
@@ -156,8 +186,8 @@ See [Configuration](./configuration.md) for the full env reference (including th
 - **`/ready` Redis check does a real ping (Stage 10)** when the Redis-backed runtime injects a client; presence-only otherwise. See [Persistence](./persistence.md#the-ready-redis-ping).
 - **Per-dispatch webhook logs still emit channel-scoped ids at `info`** — Stage 6 redacts only the admin-route *output*, not the dispatch logs. Gating dispatch-log PII is still deferred.
 - **`contact.tags` / `customVariables` are not redacted** in admin output.
-- **Webhook signature-rejection metric is not wired** — rejections appear in warn logs only; `webhook_received_total` counts only signature-valid requests (the verifier 401s before the counter).
 - **Identity metric is coarse** (`resolved` / `none` / `disabled`).
+- **No metric for a per-hour/per-day throughput threshold crossing** — that surfaces in warn/error logs only (the limits layer is decoupled from the metrics registry). See [Rate limiting](./rate-limiting.md).
 - **In-memory metrics/status/contact stores are unbounded** (apart from the metric cardinality cap) — Stage 10 made the conversation store, buffer scheduler, and limit-counter store Redis-backed, but these three stores stay in-memory in both paths; their Redis swaps with TTL eviction are still deferred (see [Known gaps](../KNOWN-GAPS.md)).
 
 See [Known gaps](../KNOWN-GAPS.md), [Status tracking](./status-tracking.md), [Read receipts](./read-receipts.md), [Identity resolution](./identity-resolution.md), and [Configuration](./configuration.md).

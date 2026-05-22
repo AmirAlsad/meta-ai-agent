@@ -321,6 +321,11 @@ export function redactOutboundItem(item: OutboundItem, opts?: RedactionOptions):
   keep(out, src, 'templateLanguage');
   keep(out, src, 'skipReason');
   keep(out, src, 'skippedAt');
+  // Transient/async retry bookkeeping — non-PII numbers/timestamps. Allow-listed
+  // so an operator can see retry state on GET /admin/conversations/:key.
+  keep(out, src, 'retryCount');
+  keep(out, src, 'nextRetryAt');
+  keep(out, src, 'asyncFailRetryCount');
 
   // ── Masked: agent-authored free text. ──
   if (typeof item.text === 'string') out.text = maskText(item.text);
@@ -412,9 +417,13 @@ export function redactStatusRecord(record: StatusRecord, opts?: RedactionOptions
   keep(out, src, 'channelMessageId');
   keep(out, src, 'channel');
   keep(out, src, 'current');
-  // `history` is status enums + timestamps + WhatsApp error codes/titles — no
-  // PII — so it's allow-listed verbatim.
+  // `history` is status enums + timestamps + WhatsApp error codes/titles + the
+  // derived `errorCategory` bucket — all no-PII — so it's allow-listed verbatim
+  // (the per-entry `errorCategory` rides along inside each history object).
   keep(out, src, 'history');
+  // `errorCategory` is a BOUNDED ENUM (rate_limit/window_closed/recipient/…),
+  // NOT PII — safe to surface unmasked so the failure bucket shows on the record.
+  keep(out, src, 'errorCategory');
   keep(out, src, 'firstSeenAt');
   keep(out, src, 'lastUpdatedAt');
 
