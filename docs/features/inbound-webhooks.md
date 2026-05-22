@@ -149,9 +149,9 @@ The full inbound → agent → outbound pipeline runs today. The webhook route h
 | [`tests/integration/webhook-routing.test.ts`](../../tests/integration/webhook-routing.test.ts) | Channel-dispatch routing tests, handshake tests, signature-rejection paths, `/health` liveness, dispatcher defensive-catch coverage. |
 | [`tests/integration/end-to-end-flow.test.ts`](../../tests/integration/end-to-end-flow.test.ts) | Full inbound path with a real store/scheduler/queue/agent (only the chat endpoint + adapters faked): webhook → signature → parse → buffer flush → chat → ordered send. |
 
-## Planned next steps
+## Persistence and durability
 
-The inbound route and its agent routing are complete. The remaining work that touches this path is **Stage 10** hardening: swapping the in-memory dedupe/store for a Redis-backed implementation (atomic cross-replica `SET NX` dedupe) and the in-memory buffer scheduler for BullMQ, plus boot-time `recoverPendingRetries`. The route shape itself does not change.
+The inbound route and its agent routing are complete, and the Stage 10 hardening that touches this path has landed: the dedupe/store and buffer scheduler are now **dual-path** — selected on `REDIS_URL`. With Redis configured, `RedisConversationStore` provides atomic cross-replica `SET NX`-with-TTL dedupe, `BullMqBufferScheduler` replaces the in-memory buffer scheduler, and `recoverPendingRetries()` re-arms persisted transient retries at boot (fire-and-forget in `buildRuntime`). Without `REDIS_URL`, the in-memory store + scheduler run (per-process, lost on restart). The route shape itself does not change either way. See [Persistence](./persistence.md) and [Rate limiting](./rate-limiting.md).
 
 See [Architecture](../ARCHITECTURE.md) for the full module map and [`meta-ai-agent-implementation-plan.md`](../../meta-ai-agent-implementation-plan.md) for the staged roadmap.
 
@@ -167,6 +167,6 @@ See [Configuration](./configuration.md) for the full list.
 ## Known limitations
 
 - Unknown `object` values are logged but still ACKed. This is correct behavior — Meta could introduce new products under the same App in the future, and we should not retry-loop those into our queue.
-- Cross-payload dedupe (across Meta redeliveries) is the conversation agent's responsibility (`claimInboundHandle`) — the parser only dedupes within a single delivery. That claim store is in-memory and per-process today; the Redis-backed `SET NX` swap that makes dedupe cross-replica-safe is Stage 10.
-- The per-request `traceId` is in the logs but the per-dispatch webhook logs still emit channel-scoped user ids at `info` (debuggability over redaction on the hot path); gating that PII is an accepted Stage 10 gap. The admin-route output is already PII-redacted.
+- Cross-payload dedupe (across Meta redeliveries) is the conversation agent's responsibility (`claimInboundHandle`) — the parser only dedupes within a single delivery. The in-memory claim store is per-process; the Redis-backed `RedisConversationStore` (Stage 10, selected on `REDIS_URL`) makes that dedupe cross-replica-safe via atomic `SET NX` with native TTL eviction. See [Persistence](./persistence.md).
+- The per-request `traceId` is in the logs but the per-dispatch webhook logs still emit channel-scoped user ids at `info` (debuggability over redaction on the hot path); gating that PII remains an accepted gap. The admin-route output is already PII-redacted.
 - Fixtures driving the integration tests remain documentation-derived. The `npm run capture:guided` tooling promotes redacted live captures into `tests/fixtures/meta/captured/`.

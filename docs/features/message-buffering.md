@@ -132,11 +132,13 @@ chat call` asserts both forms: `messages` holds both entries in order and
 
 `BufferScheduler`
 ([`src/conversation/scheduler.ts`](../../src/conversation/scheduler.ts)) is the
-interface that arms the per-conversation flush timer. The runtime ships
-`InMemoryBufferScheduler` (setTimeout-based, single-process). The Redis-backed
-`'bullmq'` implementation is Stage 10; `kind` (`'in_memory' | 'bullmq'`) and
-`getStats()` are wired into the `/ready` route now so it and the BullMQ impl
-share one shape.
+interface that arms the per-conversation flush timer. It is **dual-path**, selected
+on `REDIS_URL` in `buildRuntime`: `InMemoryBufferScheduler` (setTimeout-based,
+single-process) by default, and the Redis-backed `BullMqBufferScheduler`
+(`kind: 'bullmq'`, Stage 10) when Redis is configured. Both expose `kind`
+(`'in_memory' | 'bullmq'`) and `getStats()`, which the `/ready` route reads so the
+two share one shape. The BullMQ impl is covered in
+[Persistence](./persistence.md).
 
 Behavior of the in-memory scheduler:
 
@@ -196,8 +198,12 @@ proven end-to-end with `vi.useFakeTimers()` in
 
 ## Known limitations
 
-- In-memory scheduler only; timers are per-process and lost on restart. BullMQ is
-  Stage 10.
+- The in-memory scheduler's timers are per-process and lost on restart (fine for
+  tests, local runs, and single-replica deploys). The Redis-backed
+  `BullMqBufferScheduler` (selected on `REDIS_URL`) is the durable production path —
+  see [Persistence](./persistence.md). Boot recovery re-arms flushes that were
+  in-flight across a restart on the durable path — see
+  [Conversation state → Boot recovery](./conversation-state.md#boot-recovery).
 - The scheduler's own `setTimeout` failure catch is uncounted at the scheduler
   level (the flush is instrumented at the agent level via `buffer_flush_total`).
 

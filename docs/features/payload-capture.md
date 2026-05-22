@@ -5,7 +5,7 @@
 Two capture modes for collecting real Meta webhook payloads:
 
 - **Passive (`fixture-capture`)** — "leave it running, see what arrives". Boots a tunnel + capture server, optionally registers webhooks, and writes every inbound webhook to disk with parser output and signature validity attached. Useful for discovering payload variants without a script in front of the developer.
-- **Guided (`guided-capture`)** — interactive scenario walker. Prints a per-scenario prompt ("Send an image now"), waits for a webhook matching that scenario's predicate, saves it with the scenario name baked into the filename and a self-describing JSON wrapper, advances to the next scenario. The output is the raw material for the `tests/fixtures/captured/` corpus replayed against the parser in [`tests/unit/parser-captured.test.ts`](../../tests/unit/parser-captured.test.ts) (and, later, against the conversation agent).
+- **Guided (`guided-capture`)** — interactive scenario walker. Prints a per-scenario prompt ("Send an image now"), waits for a webhook matching that scenario's predicate, saves it with the scenario name baked into the filename and a self-describing JSON wrapper, advances to the next scenario. The output is the raw material for the `tests/fixtures/meta/{channel}/captured/` corpus replayed against the parser in [`tests/unit/parser-captured.test.ts`](../../tests/unit/parser-captured.test.ts) (and, later, against the conversation agent).
 
 Both modes mount a separate Express app from the production runtime ([`scripts/lib/capture-server.ts`](../../scripts/lib/capture-server.ts)). The capture server mirrors production signature middleware so app-secret typos still fail fast, but it never dispatches to the conversation agent — captures are side-effect-free.
 
@@ -14,12 +14,15 @@ Both modes mount a separate Express app from the production runtime ([`scripts/l
 ```bash
 npm run capture:fixtures                       # Passive: capture everything
 npm run capture:guided                         # Guided: prompt → wait → save → next
+npm run capture:guided -- --list               # List the scenarios per channel and exit (no creds needed)
 npm run capture:guided -- --channel=whatsapp   # Restrict to one channel
 npm run capture:guided -- --channel=messenger
 npm run capture:guided -- --channel=instagram
 ```
 
-Append `-- --help` to either for the full flag list.
+Append `-- --help` to either for the full flag list. `capture:guided -- --list` is the
+zero-config inventory dump — it is resolved **before** `loadConfig()`, so it prints the
+available scenario ids grouped by channel without any `.env` / credentials.
 
 ### Shared flags
 
@@ -34,6 +37,7 @@ Defined in [`scripts/capture/fixture-capture.ts`](../../scripts/capture/fixture-
 | `--no-webhook-registration` | both | Skip the Meta webhook subscription POST. Use when subscriptions are already configured. |
 | `--channel=<x>` | guided only | `whatsapp` \| `messenger` \| `instagram` \| `all`. If omitted, you're prompted. |
 | `--scenarios=<a,b,c>` | guided only | Run only these scenarios for the chosen channel (by name). |
+| `--list` | guided only | Print the available scenario ids grouped by channel and exit. Resolved before `loadConfig()`, so it needs no `.env` / credentials. |
 | `--help`, `-h` | both | Print usage. |
 
 ## File output format
@@ -68,7 +72,7 @@ Body: a self-describing wrapper around the raw payload — annotations are sibli
 }
 ```
 
-Promoting a capture into `tests/fixtures/captured/` is a manual three-step process: read the file, redact `rawBody` (phone numbers, IGSIDs, PSIDs, profile names, message content, tokens), drop the redacted file (or just the `rawBody` sub-object) into `tests/fixtures/captured/{channel}/`.
+Promoting a capture into `tests/fixtures/meta/{channel}/captured/` is a manual three-step process: read the file, redact `rawBody` (phone numbers, IGSIDs, PSIDs, profile names, message content, tokens), drop the redacted file (or just the `rawBody` sub-object) into `tests/fixtures/meta/{channel}/captured/`.
 
 ## Per-channel guided scenarios
 

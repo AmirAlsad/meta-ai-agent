@@ -249,10 +249,9 @@ Notes on the cells:
   [Quoted replies](#quoted-replies-per-channel) and [Known gaps](../KNOWN-GAPS.md)).
   The conversation agent downgrades a `reply` action to a plain `message` so the
   user still receives the text.
-- Instagram's `read_receipt` is advertised `Yes` but is **pending fidelity
-  confirmation** against the Instagram-Login Send API (see the `mark_seen` flag in
-  the source). It is advertised true so the agent attempts it; flip to false if a
-  fidelity review proves it unsupported.
+- Instagram's `read_receipt` is `Yes`: `mark_seen` is **live-verified working** on
+  the Instagram-Login Send API (accepted on `graph.instagram.com` 2026-05-20 — see
+  the `markSeen` flag in the source).
 
 ## Quoted replies (per-channel)
 

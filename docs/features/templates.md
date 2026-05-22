@@ -7,7 +7,7 @@ user **outside** the 24-hour customer-service window. Templates are
 Instagram has no template messaging — see the
 [capability matrix](./outbound-clients.md#the-supports-capability-matrix)).
 
-The send method (`WhatsAppClient.sendTemplate`) landed in Stage 4; Stage 7 adds
+The send method (`WhatsAppClient.sendTemplate`) landed in Stage 4; Stage 7 added
 the `buildTemplateComponents` builder that assembles the `components` array the
 send method forwards, plus the `textParameter` / `payloadParameter` convenience
 helpers.
@@ -63,17 +63,19 @@ buildTemplateComponents({
 }): TemplateComponent[]
 ```
 
-- **Header** — emitted only when `headerParameters` is supplied →
-  `{ type: 'header', parameters }`.
-- **Body** — emitted only when `bodyParameters` is supplied →
+- **Header** — emitted only when `headerParameters` is supplied **and non-empty**
+  → `{ type: 'header', parameters }`.
+- **Body** — emitted only when `bodyParameters` is supplied **and non-empty** →
   `{ type: 'body', parameters }`.
 - **Buttons** — one `{ type: 'button', sub_type, index, parameters }` component
-  per `buttonParameters` entry.
+  per `buttonParameters` entry **whose `parameters` is non-empty**.
 
 Sections are omitted when absent (header/body) or when the list is empty
 (buttons), so `buildTemplateComponents({})` returns `[]`. Order follows Meta's
-documented layout: header, then body, then buttons. An explicit empty
-`parameters: []` for a section is preserved (distinct from omitting the section).
+documented layout: header, then body, then buttons. An **empty** `parameters: []`
+for any section is treated as a clean no-op (the section is skipped, not emitted):
+Meta rejects a template component carrying an empty `parameters` array with a 400
+at send time, so skipping it locally is the safe behavior.
 
 ### Component / sub_type / index shape
 
@@ -134,18 +136,20 @@ convenience helper for them, but they need none.
 
 ## Templates and the out-of-window mechanism
 
-Templates are the **(future) out-of-window mechanism** for WhatsApp: outside the
-24-hour customer-service window, only a pre-approved template can be sent. Stage 7
-ships the send method and the component builder, and the chat request already
-carries `context.windowOpen` (and `context.windowExpiresAt` when known) so the
-endpoint can *choose* a template when the window is closed.
+Templates are the **out-of-window mechanism** for WhatsApp: outside the 24-hour
+customer-service window, only a pre-approved template can be sent. Stage 7 shipped
+the send method and the component builder, and the chat request carries
+`context.windowOpen` (and `context.windowExpiresAt` when known) so the endpoint can
+*choose* a template when the window is closed.
 
-**Full out-of-window enforcement is NOT in Stage 7.** The agent does not block an
-out-of-window plain send or force a template fallback — a reply attempted after
-the window closes simply fails at the Meta API and is skipped fail-soft. Require-a-
-template-when-the-window-is-closed enforcement is Stage 10 (rate limiting +
-WhatsApp messaging-window awareness). See
-[Known gaps](../KNOWN-GAPS.md) and [Conversation state](./conversation-state.md).
+**Out-of-window enforcement landed for WhatsApp in Stage 10.** When a WhatsApp send
+fails with the 24h re-engagement error (`131047` / `470`), the agent re-prompts the
+chat endpoint **once per turn** with `context.requiresTemplate: true` and
+`windowOpen: false`, then replaces the outbound queue with whatever the endpoint
+returns (`handleWindowClosed`). It is fail-soft — any failure skips and advances.
+Messenger and Instagram have **no** reliable out-of-window mechanism for an
+automated bot. See [Rate limiting](./rate-limiting.md),
+[Known gaps](../KNOWN-GAPS.md), and [Conversation state](./conversation-state.md).
 
 ## Code references
 

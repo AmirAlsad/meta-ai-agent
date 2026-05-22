@@ -25,6 +25,11 @@ Branches are checked top to bottom; the first match wins:
 | `template`, or a closed 24h window (`context.windowOpen === false`) | `template` (`hello_world` / `en_US`) on WhatsApp; plain text elsewhere | gated on `template` |
 | anything else | echo, prefixed with the channel | — |
 
+The `reaction` action targets a literal `channelMessageId`; `targetMessageId`
+can also take a symbolic `TargetRef` (e.g. `{ alias: 'last' }`,
+`{ contentIncludes }`) that the agent resolves against the turn's inbound
+messages — see `TargetRef` in [`src/chat/types.ts`](../../src/chat/types.ts).
+
 ## Run it
 
 **Standalone** (listens on `PORT` or 4002, exposing `POST /` and `GET /health`):

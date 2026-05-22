@@ -53,13 +53,17 @@ counter store) by branching on `config.redisUrl`:
 | set | `RedisConversationStore` | `BullMqBufferScheduler` | `RedisLimitCounterStore` | one shared ioredis client |
 | unset | `InMemoryConversationStore` | `InMemoryBufferScheduler` | `InMemoryLimitCounterStore` | `undefined` |
 
-On the Redis path, ONE ioredis client (`new Redis(config.redisUrl, {
-maxRetriesPerRequest: null })`) backs both the conversation store and the
-limit-counter store. `maxRetriesPerRequest: null` is required because the same
-client class is reused with BullMQ-style long-lived-connection semantics; a finite
-retry budget would let long-lived blocking calls error out. The BullMQ scheduler is
-the exception — it owns its **own** connections (it needs a blocking one for the
-worker), so it takes the URL, not this client.
+On the Redis path, ONE ioredis client (`new Redis(config.redisUrl)`) backs both the
+conversation store and the limit-counter store. It is created with ioredis's
+**bounded default** retry budget — deliberately NOT `maxRetriesPerRequest: null`.
+That null option (which makes a command retry forever) is a BullMQ-connection
+requirement, not a data-path one: these stores issue only ordinary, non-blocking
+commands on the inbound/flush hot path, so the bounded default means a command
+**fails fast** during a Redis outage (caught by the agent's fail-soft handlers)
+rather than hanging the flush indefinitely. The BullMQ scheduler is the exception —
+it owns its **own** connections (it needs a blocking one for the worker, created
+with `maxRetriesPerRequest: null` as BullMQ requires), so it takes the URL, not this
+client.
 
 The Stage 6 metrics collector, status tracker, and contact-store cache stay
 in-memory in **both** paths — their Redis-backed swaps with TTL eviction are tracked
@@ -80,6 +84,16 @@ All keys are namespaced under the prefix `meta-ai-agent:`
 | `conversation:{key}` | the `ConversationRecord` as JSON | `SET ... EX conversationTtlSeconds` | `conversationTtlSeconds` (default 86400) |
 | `dedupe:inbound:{channelMessageId}` | `'1'` | `SET ... EX dedupeTtlSeconds NX` (atomic claim) | `dedupeTtlSeconds` (default 86400) |
 | `outbound:{channelMessageId}` | the `OutboundHandleMapping` as JSON | `SET ... EX conversationTtlSeconds` | `conversationTtlSeconds` |
+| `recovery:{claimToken}` | `'1'` | `SET ... EX ttl NX` (`claimRecovery`) | per-claim TTL (short — sized to the remaining retry delay + grace, min ~120 s) |
+
+`claimRecovery(claimToken, ttlSeconds)` is the atomic `SET NX EX` that makes
+multi-replica boot recovery double-send-safe: at boot every replica scans for
+recoverable conversations, but only the one that wins this claim re-arms the
+in-flight item (the rest get `null` and skip). The token is attempt-unique, so a
+later restart with a fresh retry attempt claims a new key. See
+[Rate limiting → boot recovery](./rate-limiting.md#boot-recovery). The rate-limiter's
+own Redis keys (`limits:slot:{line}`, `limits:hour:…`, `limits:day:…`) live under a
+sibling `meta-ai-agent:limits` prefix — see [Rate limiting](./rate-limiting.md).
 
 `{key}` is the `{channel}:{businessId}:{userId}` conversation key
 (see [Conversation state → keying](./conversation-state.md#conversation-keying)).
@@ -190,9 +204,10 @@ backs the deploy.
 | Env var | Default | Used for |
 | --- | --- | --- |
 | `REDIS_URL` | unset | Selects the Redis path. When set, `loadRedisUrl` validates it parses as a `redis:` / `rediss:` URL and throws otherwise (a typo'd or wrong-scheme paste fails at boot, not deep in the client). |
-| `CONVERSATION_TTL_SECONDS` | `86400` | TTL for Redis conversation records + outbound-handle mappings. |
-| `BUFFER_QUEUE_NAME` | `meta-ai-buffer-timers` | BullMQ queue name for the buffer-flush scheduler. |
-| `READY_REDIS_TIMEOUT_MS` | `2000` | Timeout for the `GET /ready` Redis ping. |
+| `CONVERSATION_TTL_SECONDS` | `86400` | TTL (seconds) for Redis conversation records + outbound-handle mappings (positive int). |
+| `BUFFER_QUEUE_NAME` | `meta-ai-buffer-timers` | BullMQ queue name for the buffer-flush scheduler (non-empty string). |
+| `BUFFER_WORKER_CONCURRENCY` | `10` | BullMQ Worker concurrency for buffer-flush jobs (positive int). `>1` so a slow chat call for one conversation does not serialize every other flush — see the scheduler section above. |
+| `READY_REDIS_TIMEOUT_MS` | `2000` | Timeout (ms) the `GET /ready` Redis `ping()` is raced against (positive int). |
 | `DEDUPE_TTL_SECONDS` | `86400` | TTL for the inbound dedupe claim (shared with the in-memory store; lives in `config.conversation`). |
 
 ## Testing

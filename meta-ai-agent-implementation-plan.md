@@ -6,6 +6,8 @@
 
 Modeled after [`sendblue-ai-agent`](https://github.com/AmirAlsad/sendblue-ai-agent) in structure, conventions, and philosophy: TypeScript ESM, Vitest, transport-focused with no model-provider coupling, dependency-injected `createApp(deps)`, `CLAUDE.md` for agent context, `docs/features/*.md` per feature, fixture-based testing, guided setup and capture tooling.
 
+> **Status (2026-05-21): all ten stages below are COMPLETE and merged to `main`, plus a post-plan cross-platform enhancement pass.** This document is the durable design spec — the stage breakdown and rationale are preserved as written; where the shipped code diverged from the original intent, an inline **"As shipped:"** note records the actual behavior. The enhancement pass (merged after Stage 10) added: async WhatsApp `failed`-status retry / window re-prompt (the double-send rule is deliberately INVERTED for a `failed` status — a definitive non-delivery is safe to re-send, bounded by `asyncFailRetryCount`); symbolic chat targets (`reply`/`reaction` `targetMessageId` accepts a literal id OR a `TargetRef` — `{alias:'last'|'previous'|'first'}` / `{contentIncludes,occurrence?}` / `{content}` / `{messageId}` — resolved against buffered inbound history, in `src/chat/target-resolver.ts`); track-only per-hour/per-day throughput counters; the `GET /admin/queue` + `GET /admin/dedupe` introspection routes; new metrics (`transient_retry_total`, `acquire_send_slot_delay_seconds`, `webhook_secret_rejections_total`); and the `npm run showcase` scripted scenario harness. The current suite is 1322 unit tests + 93 integration tests (22 of the integration tests are Redis-gated on `TEST_REDIS_URL` and skip by default, so default `npm test`/CI runs 1322 unit + 71 integration hardware-free).
+
 ---
 
 ## Platform Context for the Implementing Engineer
@@ -30,7 +32,7 @@ WhatsApp uses `entry[].changes[].value.messages[]` with a `metadata` block conta
 
 Key differences that affect parser design:
 
-- **WhatsApp**: message ID format is `wamid.HBg...`. Status updates arrive as `statuses[]` within the same `changes[].value` block. Read receipts are `status: "read"` in `statuses[]`. Reactions are a `reaction` message type. Reply-to uses `context.message_id`. Typing indicators are sent as `type: "typing_indicator"` with the inbound `message_id`.
+- **WhatsApp**: message ID format is `wamid.HBg...`. Status updates arrive as `statuses[]` within the same `changes[].value` block. Read receipts are `status: "read"` in `statuses[]`. Reactions are a `reaction` message type. Reply-to uses `context.message_id`. Typing indicators are sent as `type: "typing_indicator"` with the inbound `message_id`. (**As shipped:** there is no standalone WhatsApp typing-on message — `sendTypingIndicator` POSTs a COMBINED `{ messaging_product:'whatsapp', status:'read', message_id:<inbound wamid>, typing_indicator:{ type:'text' } }`, which marks the inbound message read AND attaches the typing bubble in one request; without an inbound `message_id` it logs a warn and skips. The `type:"typing_indicator"` standalone-message description here is incorrect.)
 - **Messenger**: message ID format is `m_xxxxx`. Read receipts arrive as separate `message_reads` webhook events. Reactions arrive as `message_reactions` events. Reply-to uses `message.reply_to.mid`. Typing indicators use a separate `sender_action: "typing_on"` request. Business-sent message echoes have `is_echo: true`.
 - **Instagram**: nearly identical to Messenger in shape, but GIFs and stickers do **not** fire inbound webhooks (Meta's docs are explicit: "Messages with gifs and stickers are not supported. If a person sends a message with a gif or sticker a webhook will not be triggered."). Story replies include `reply_to.story`. No Get Started button (uses Ice Breakers instead).
 
@@ -54,9 +56,13 @@ The send adapter must expose messaging-window awareness as a first-class concept
 - **Messenger**: standard Graph API rate limits per app/page. No documented per-second hard cap for normal messaging.
 - **Instagram**: 2 calls/sec per IG Professional account for messaging endpoints. Hourly outbound rate = 200 × number of active conversations.
 
+> **As shipped:** the `2 calls/sec` figure above is the GENERAL Graph baseline, not the IG messaging send limit (IG messaging allows ~100/s text, ~10/s media). Using `2/s` for the messaging pacer would over-throttle, so the shipped Instagram per-second default is **`10`** (`LIMITS_DEFAULTS.instagramPerSecond` in `src/config/loader.ts`), aligned with the IG media cap and the `InstagramClient`'s own ~10/s in-process pacer floor. WhatsApp and Messenger per-second defaults are `80` and `40`. Per-channel per-second pacing is a fail-open token bucket (in-memory or Redis Lua-atomic); `0` disables it. The hourly cap shipped as a TRACK-ONLY advisory counter (see the Stage 10 note below), never a hard gate.
+
 ### Graph API versioning
 
 Pin to `v23.0` (matches Meta's current WhatsApp samples). Store version in a single env var (`META_GRAPH_API_VERSION`). Meta supports each version for ~24 months. v19 expires May 21, 2026; v20 expires Sept 24, 2026.
+
+> **As shipped:** the default is **`v25.0`** (`loadGraphApiVersion` in `src/config/loader.ts`), the latest stable at release — newer than the `v23.0` in the original note. The single-env-var approach and the `^v\d+\.\d+$` format validation shipped as planned; bump the default when a newer version stabilizes.
 
 ### Retry behavior
 
@@ -757,6 +763,8 @@ Routes (all gated by `ADMIN_API_TOKEN`):
 
 With `REDIS_URL`: conversation state, deduplicate (`SET NX` with TTL), outbound-handle → conversation-key map, BullMQ-delayed buffer processing. Without: in-memory maps and timers for tests/local.
 
+> **As shipped:** the dual-path is selected on `REDIS_URL` in `buildRuntime` — `RedisConversationStore` + `BullMqBufferScheduler` + `RedisLimitCounterStore` over ONE borrowed ioredis client when set, the in-memory trio otherwise. The BullMQ jobId is `buffer-<base64url(conversationKey)>` (NOT a raw `buffer:{key}`): BullMQ forbids `:` in a custom job id and conversation keys are all colons (`{channel}:{businessId}:{userId}`), so the base64url form is a colon-free, stable id that a re-schedule REPLACES (one outstanding flush per conversation). The Queue and Worker run on two separate connections with `attempts: 1` (the agent owns retry). New config: `bufferWorkerConcurrency` (default 10), `conversationTtlSeconds` (default 86400), `readyRedisTimeoutMs` (default 2000). The shared ioredis client is BORROWED, so the Redis store/limit-store `close()` are no-ops; the runtime's aggregate `close()` disconnects the client once.
+
 **`src/limits/tracker.ts`:**
 
 - Per-channel rate limiting respecting Meta's limits (WhatsApp tier-based, Instagram 2/sec/account, Messenger standard Graph API limits).
@@ -764,13 +772,22 @@ With `REDIS_URL`: conversation state, deduplicate (`SET NX` with TTL), outbound-
 - Transient error retry (5xx, 429, rate limit errors) with exponential backoff.
 - WhatsApp messaging window tracking: when a message is sent outside the 24h window without a template, the error is caught and the conversation agent is notified (it can then prompt the chat endpoint to respond with a template action).
 
+> **As shipped:**
+> - Per-second pacing defaults are WhatsApp `80`, Messenger `40`, **Instagram `10`** (not `2/s` — see the Rate limits note above). Pacing is a fail-open token bucket; `0` disables it. Per-hour/per-day caps shipped as TRACK-ONLY advisory counters (`recordOutbound` warn/error-logs as a line nears its cap but NEVER gates a send): WhatsApp defaults `1000/h` + `10000/d`, Messenger/Instagram default `0` (disabled).
+> - Transient-retry classification is double-send-SAFE and the safe set is NARROW: `classifyError` returns `transient` ONLY for a pre-response network failure (`MetaApiError.httpStatus === 0`), HTTP `429`, or a Meta rate-limit error CODE in `{4, 80007, 130429, 131056, 613}` (`META_RATE_LIMIT_ERROR_CODES`). **`5xx` is DELIBERATELY classified `permanent`, NOT retried** — a 5xx after a POST is ambiguous (Meta may have already delivered) and the messages endpoint has no idempotency key, so re-sending could double-send. This contradicts the "5xx, 429, rate limit errors" bullet above: 5xx is intentionally excluded to mirror the GraphClient's "5xx-on-POST is not retried" rule. WhatsApp window codes are `{131047, 470}` (`window_closed`); `131051` is excluded (it is "Unsupported message type", a payload bug). The code sets live in `src/limits/error-codes.ts` (the single source of truth) alongside `whatsappFailureCategory()`.
+> - The async path: a WhatsApp `failed` delivery-status webhook drives async retry / window re-prompt via `classifyStatusErrorCode`, where the double-send rule is INVERTED (a `failed` status is a definitive non-delivery, so it is safe to re-send), bounded by `asyncFailRetryCount`.
+
 **Boot-time recovery** — `ConversationAgent.recoverPendingRetries()`: on startup, scan Redis for conversations in `'sending'` state with pending retries. Re-arm timers. Same pattern as the SendBlue repo's `recoverPendingRetries`.
+
+> **As shipped:** recovery is fired fire-and-forget in `buildRuntime` and does real work ONLY against a durable store (the in-memory store wipes on restart → `{ transientRetriesResumed: 0 }`). It is multi-replica-guarded: before re-arming, each replica makes an atomic `store.claimRecovery(...)` (`SET NX EX`) claim so exactly one replica re-arms a given pending retry, preventing an N-replica double-send.
 
 **Config validation hardening** — `loadConfig` throws on:
 - Missing `META_APP_SECRET` (always required for signature verification).
 - No channels enabled (at least one channel's tokens must be configured).
 - Invalid token format (WhatsApp System User tokens are long alphanumeric strings; Page Access Tokens start with `EAA`; Instagram tokens start with `IGQ`).
 - `META_GRAPH_API_VERSION` not matching `v\d+\.\d+` pattern.
+
+> **As shipped (deliberate deviation):** `loadConfig` does NOT throw on invalid token format — it **WARNS**. Meta token formats vary and a false reject would break a working deploy, so the token-shape checks are advisory: `loadConfig` stays pure and fail-fast, and the exported pure `tokenFormatWarnings(config)` helper produces warnings (Messenger Page token usually `EAA…`, Instagram token usually `IGQ…`, WhatsApp token ≥20 chars) that `createApp` logs at startup. The other three throws shipped as written. `REDIS_URL`, by contrast, IS hard-validated (`loadRedisUrl` throws on a non-`redis:`/`rediss:` scheme). `ADMIN_API_TOKEN` also throws when set but shorter than 16 chars.
 
 ---
 
@@ -825,7 +842,7 @@ The full list, organized by category, with defaults and validation rules. Refere
 - `INSTAGRAM_USER_ID`, `INSTAGRAM_ACCESS_TOKEN`
 
 ### Optional runtime
-- `META_GRAPH_API_VERSION` (default `v23.0`)
+- `META_GRAPH_API_VERSION` (default `v25.0` as shipped; the original plan said `v23.0`)
 - `PORT` (default `3000`)
 - `PUBLIC_BASE_URL` (for webhook registration scripts)
 - `REDIS_URL` (enables Redis persistence)

@@ -26,6 +26,11 @@ given `conversationKey`:
 | `name` | "Amir" | pickup confirmation with the full order | `message` |
 | `done` | _anything_ | nudge to say "restart" | `message` |
 
+The `reaction` / `reply` steps target a literal `channelMessageId`;
+`targetMessageId` also accepts a symbolic `TargetRef` (e.g. `{ alias: 'last' }`,
+`{ contentIncludes }`) the agent resolves against the turn's inbound messages —
+see `TargetRef` in [`src/chat/types.ts`](../../src/chat/types.ts).
+
 Cross-cutting behaviors (checked before the step machine):
 
 - **Dedupe → silence.** A repeated inbound `channelMessageId` for the same

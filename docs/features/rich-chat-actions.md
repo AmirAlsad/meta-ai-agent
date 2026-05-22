@@ -34,6 +34,7 @@ developer's endpoint receives for one (possibly buffered) turn:
 | `capabilities` | `ChannelFeature[]` | The responding adapter's `supports()` truth set, so the endpoint can tailor its `actions[]` to what the channel can actually do. |
 | `context.windowOpen` | `boolean` | Whether the 24h customer-service window is currently open. |
 | `context.windowExpiresAt` | `number?` | Unix ms the window closes, when known. |
+| `context.requiresTemplate` | `boolean?` | Set `true` ONLY when the agent re-prompts after a WhatsApp send failed because the 24h window is closed — signals the endpoint to reply with a `template` action (a free-form text would fail again). Absent on a normal turn. See [Rate limiting → out-of-window re-prompt](./rate-limiting.md#whatsapp-out-of-window-re-prompt). |
 
 `capabilities` is built by filtering every `ChannelFeature` through the adapter's
 `supports()` (`capabilitiesOf` in
@@ -186,7 +187,7 @@ you react/reply to what the **user** said, oldest→newest) inside
 | `{ alias: 'last' }` | the most recent inbound (also the **default** when no target is given) |
 | `{ alias: 'first' }` | the oldest inbound |
 | `{ alias: 'previous' }` | the second-most-recent inbound (needs ≥2 messages, else `not_found`) |
-| `{ contentIncludes, occurrence? }` | substring match; `occurrence` (1-based) disambiguates >1 match; ambiguous (>1 match, no `occurrence`) is `not_found`/`ambiguous` |
+| `{ contentIncludes, occurrence? }` | substring match; `occurrence` (1-based) disambiguates >1 match; >1 match with no `occurrence` resolves to `ambiguous`; an `occurrence` past the match count is `invalid` |
 | `{ content }` | exact (trim+lowercase) text match (first match wins) |
 | `{ messageId }` | an explicit literal id — the escape-hatch form, equivalent to a bare string |
 
@@ -195,11 +196,22 @@ endpoint may legitimately know an id from a prior turn the buffer no longer hold
 the adapter is the authority on whether an id is sendable). Symbolic forms require
 non-empty history.
 
-On a resolution failure the behaviour matches the unsupported-feature handling: an
+`resolveTargetRef` is pure (no I/O, no clock, no randomness) and returns a
+discriminated outcome:
+
+| Outcome | When |
+| --- | --- |
+| `{ ok: true, messageId }` | a candidate matched (or a literal id passed through) |
+| `{ ok: false, reason: 'not_found' }` | no candidate matched, or the history was empty for a symbolic form (incl. `previous` on a single-message turn) |
+| `{ ok: false, reason: 'ambiguous' }` | a `contentIncludes` matched >1 message and no `occurrence` was given |
+| `{ ok: false, reason: 'invalid' }` | structurally malformed — an empty literal id, an empty/unknown alias or content, or an out-of-range `occurrence` |
+
+On any `ok: false` outcome the behaviour matches the unsupported-feature handling: an
 **unresolvable reaction is skipped** (with a note), while an **unresolvable reply is
 downgraded to a plain message** (the text still matters to the user even when the
 threading target can't be found). When `targetMessageId` is absent entirely it
-defaults to `{ alias: 'last' }`.
+defaults to `{ alias: 'last' }` (the same default the contract aliasing layer and
+the resolver itself apply).
 
 ## The HTTP client
 

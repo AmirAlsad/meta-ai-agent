@@ -127,6 +127,6 @@ See [Configuration](./configuration.md).
 - **Fail-open is total** — a misbehaving lookup endpoint can never stall or break the conversation, but it also means failures are silent past the warn log.
 - **Coarse metric** — `resolved | none | disabled` only; no hit/cached/error split (deferred).
 - **`tags` / `customVariables` are not redacted** in admin output (developer-supplied; see [Known gaps](../KNOWN-GAPS.md)).
-- **In-memory cache now; shared/bounded store in Stage 10** — `InMemoryContactStore` is per-process, unbounded, and lost on restart. A TTL/Redis-backed cache (shared across replicas, bounded/expired) is deferred.
+- **Contact store is still in-memory (Stage 10 did NOT swap it)** — `InMemoryContactStore` is per-process, unbounded, and lost on restart, in both the in-memory and Redis runtime paths. Stage 10 made the conversation store, buffer scheduler, and limit-counter store Redis-backed, but left the contact store (along with the metrics collector and status tracker) for a later pass; a TTL/Redis-backed cache (shared across replicas, bounded/expired) is still deferred (see [Known gaps](../KNOWN-GAPS.md)).
 
 See [Operational visibility](./operational-visibility.md), [Conversation state](./conversation-state.md), and [Known gaps](../KNOWN-GAPS.md).

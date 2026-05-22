@@ -145,7 +145,7 @@ Also defined in [`src/meta/types.ts`](../../src/meta/types.ts). Produced for out
 
 ## What's intentionally NOT in scope yet
 
-- **WhatsApp `statuses[].conversation` / `pricing` blocks** are preserved on `raw` but not extracted. Pulling `conversation.expiration_timestamp` and `pricing.category` (for messaging-window awareness and billing observability) is deferred to Stage 10 — see [Known gaps](../KNOWN-GAPS.md).
+- **WhatsApp `statuses[].conversation` / `pricing` blocks** are preserved on `raw` but not extracted. Pulling `conversation.expiration_timestamp` and `pricing.category` (for messaging-window awareness and billing observability) remains deferred — Stage 10's WhatsApp window handling drives the out-of-window template re-prompt off the live send error (`131047` / `470`), not off a parsed `expiration_timestamp`. See [Known gaps](../KNOWN-GAPS.md).
 - **Order, contact-card, reel, and template-fallback attachments** are surfaced as `'unknown'`. First-class normalized variants are deferred (revisit when real captures surface `reel` / `payment` / order shapes worth modeling) — see [Known gaps](../KNOWN-GAPS.md).
 - **Cross-payload dedupe** is the conversation agent's job. The parser only dedupes within a single delivery.
 - **Page-linked Instagram routing** is unsupported. This package targets the Instagram Business Login path (`object: 'instagram'`) only.

@@ -205,14 +205,18 @@ The lock has one rule that future edits must preserve: **entry points acquire,
 internal helpers stay lock-free.**
 
 - **Acquire** (true entry points, each fired OUTSIDE any held lock):
-  `handleInbound`, `handleStatus`, and the delivery-timeout callback.
+  `handleInbound`, `handleStatus`, the delivery-timeout callback, the
+  transient-retry timer callback, and `recoverPendingRetries` (per-key, at boot).
   `handleReaction` does NOT acquire — it delegates to `handleInbound`, which
   acquires, so it inherits the lock; acquiring again would deadlock (a holder
   calling a same-key acquirer).
 - **Do not acquire** (internal; only ever reached from within a holder):
   `sendNext`, `advanceAndContinue`, `markSkippedAndAdvance`, `transitionToIdle`,
   `finalizeTurn`, `interruptSending`, `onDeliveryTimeoutImpl`,
-  `handleInboundImpl`, `handleStatusImpl`.
+  `handleInboundImpl`, `handleStatusImpl`, and the Stage 10 send-error helpers
+  `scheduleTransientRetry`, `runTransientRetryImpl`, `handleWindowClosed` (each
+  called from `sendNext` / the async-`failed` path / a timer's `runExclusive`, so
+  the lock is already held).
 - **Segmented (the batching fix):** `flushImpl` is fired by the scheduler outside
   any held lock and acquires the lock *itself*, but only around its record
   read-modify-write segments — see below.
@@ -322,6 +326,75 @@ single bad send, the error is classified (Stage 10): a known-safe transient fail
 is retried with backoff, a WhatsApp closed-window failure re-prompts for a template,
 and everything else is marked skipped and the queue advances (see
 [Ordered delivery](./ordered-delivery.md) and [Rate limiting](./rate-limiting.md)).
+
+## Send-error routing (synchronous and asynchronous)
+
+A failing outbound send reaches the agent on **two** paths, and both end in the
+same classification-driven routing. See [Rate limiting](./rate-limiting.md) for the
+classifier and the backoff math, and
+[Ordered delivery](./ordered-delivery.md#async-failure-from-a-failed-delivery-status)
+for the per-path mechanics.
+
+- **Synchronous** — the adapter's send call *throws* (`sendNext`'s catch). The
+  error runs through `LimitTracker.classifyError`: `window_closed` →
+  `handleWindowClosed` (one template re-prompt per turn), `transient` →
+  `scheduleTransientRetry` with backoff (bounded by `retryCount` on the
+  `OutboundItem`), anything else (including any 5xx — double-send safety) →
+  skip + advance.
+- **Asynchronous** (#6, the primary WhatsApp case) — the send POST returns
+  `200`/queued, and Meta later emits a `failed` **delivery-status** webhook
+  carrying `status.errorCode`. `handleStatusImpl` routes a `failed` status for the
+  *currently in-flight* item through `LimitTracker.classifyStatusErrorCode`, with
+  the same three outcomes. Two things differ from the synchronous path and are
+  load-bearing:
+  - **The double-send rule is INVERTED here.** A `failed` delivery status is Meta's
+    *definitive* statement that the message did NOT reach the user, so retrying a
+    transient-classified async failure is safe — the opposite of the synchronous
+    "a 5xx after a POST may have already delivered, so don't retry" rule. Do not
+    "fix" it back to skip-on-failed by analogy with the sync path.
+  - **A dedicated `asyncFailRetryCount` bounds the loop.** The async path fires
+    only after a send SUCCEEDED, and `sendNext`'s success tail deletes
+    `item.retryCount` for double-send safety — so `retryCount` is always absent
+    here and would reset to 1 every cycle (an endless retry loop). The count is
+    therefore kept on a separate `asyncFailRetryCount` that the success tail does
+    NOT clear, so the `transientRetryMaxAttempts()` cap actually trips.
+
+A `failed` status for an already-advanced (non-current) item is a stale failure
+for a slot the queue moved past — it stays a no-op (still recorded in status
+history). Both paths are fully fail-soft: any unexpected error ends in skip +
+advance so the queue never wedges.
+
+## Boot recovery
+
+`recoverPendingRetries()` (Stage 10) is a public entry point the runtime fires
+once at boot (fire-and-forget in `buildRuntime`) to un-wedge conversations
+stranded by a process restart that killed the in-process timers
+([`src/conversation/agent.ts`](../../src/conversation/agent.ts)). It scans
+`store.listConversationKeys()` and, under each key's lock (it is an entry point),
+fail-softly handles three cases:
+
+- **`sending` mid-retry** — an in-flight item with `nextRetryAt` + `retryCount > 0`
+  whose backoff timer died with the old process is re-armed with the remaining
+  delay. A load-bearing `channelMessageId === undefined` guard ensures this
+  re-send fires ONLY for an item that was not yet sent (double-send safety).
+- **`sending` awaiting a WhatsApp delivery status** — an `on_status` item that was
+  sent (`currentOutboundMessageId` set) but whose delivery-timeout fallback died
+  with the process: the timer is re-armed so the queue advances *past* the
+  already-sent item (no re-send, no double-send).
+- **`processing` stranded** — the chat call was in flight when the process died, so
+  nothing will ever flush this record. Any persisted `lateArrivals` are folded back
+  into `inboundBuffer` and a flush is rescheduled; if there are none, the record is
+  reset to `idle`. The original (snapshotted, never-persisted) chat-call batch is
+  lost — an inherent at-least-once limitation of the snapshot-clears-buffer design.
+
+Recovery does real work only against a **durable** store: the in-memory store wipes
+state on restart, so it returns all-zero counts. On a shared Redis every replica
+runs recovery at boot and the per-process lock is not distributed, so each action
+is gated behind an atomic `store.claimRecovery(token, ttl)` — exactly one replica
+acts, preventing an N-replica double-send/double-recovery. The `processing` claim
+token carries the per-turn `processingNonce` (stamped in `flushImpl`) so a later
+processing turn is never blocked by a stale claim from an earlier one. See
+[Persistence](./persistence.md) and [Known gaps](../KNOWN-GAPS.md).
 
 ## In-memory or Redis (dual-path)
 

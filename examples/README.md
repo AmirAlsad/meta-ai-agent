@@ -276,3 +276,10 @@ Every example implements the same chat-endpoint contract: receive a
 (`message` / `messages` / `silence` / `actions[]`), per-channel capability
 gating, and how responses are normalized into ordered outbound actions — lives
 in [`docs/features/rich-chat-actions.md`](../docs/features/rich-chat-actions.md).
+
+A `reply` / `reaction` action's `targetMessageId` accepts either a literal
+channel message id (what these examples pass) **or** a symbolic `TargetRef` the
+agent resolves against the turn's inbound messages — `{ alias: 'last' |
+'previous' | 'first' }` (default `{ alias: 'last' }`), `{ contentIncludes, occurrence? }`,
+`{ content }`, or `{ messageId }`. See `TargetRef` in
+[`src/chat/types.ts`](../src/chat/types.ts).

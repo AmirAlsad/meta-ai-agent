@@ -21,6 +21,14 @@ Curated reference list for engineers working on `meta-ai-agent`. Prefer these so
   Payload shapes for inbound `messages[]`, `statuses[]`, `errors[]` blocks inside `entry[].changes[].value`. Message ID format is `wamid.HBg...`; reactions are a `reaction` message type; reply-to lives on `context.message_id`.
 - **Message templates** — https://developers.facebook.com/docs/whatsapp/business-management-api/message-templates
   Template categories, approval flow, component structure. **Out-of-window messaging requires templates** and templates are paid since 2025-07-01.
+- **Cloud API error codes** — https://developers.facebook.com/docs/whatsapp/cloud-api/support/error-codes
+  The authoritative WhatsApp error-code reference. Backs the code sets in [`src/limits/error-codes.ts`](../src/limits/error-codes.ts): the window code `131047` ("Re-engagement message", the live 24h-window error), the rate-limit codes `80007` / `130429` / `131056`, the policy/quality throttles `131048` / `131049` / `368`, recipient codes `131026` / `131030` / `131045`, and server codes `131000`. Each membership decision in that module cites this reference; the Stage 10 `LimitTracker.classifyError` and `whatsappFailureCategory` consume them. Verify a code's meaning here before changing how a send failure is classified (transient vs. window-closed vs. permanent).
+- **Rate limits (Graph API)** — https://developers.facebook.com/docs/graph-api/overview/rate-limiting
+  App-level and BUC (business-use-case) rate-limiting model. Backs the rate-limit error codes `4` ("Application request limit reached") and `613` in `src/limits/error-codes.ts`, and the per-second pacing defaults in [Rate limiting](./features/rate-limiting.md). Note the general Graph baseline (~2/s) is NOT the messaging throughput limit — see the messaging-throughput note in the rate-limiting feature doc.
+- **Messaging limits / messaging tiers** — https://developers.facebook.com/docs/whatsapp/cloud-api/overview/messaging-limits
+  The conversation-based tier model (1K / 10K / 100K / unlimited unique recipients per rolling 24h, raised after business verification + quality). This is why the package's per-hour/per-day counters are **track-only advisory proxies**, not true gating caps — the real limit is conversation-based and enforced server-side by Meta. Backs the WhatsApp `1000/h` / `10000/d` advisory defaults in `config.limits`.
+- **Conversation-based pricing / per-message pricing** — https://developers.facebook.com/docs/whatsapp/pricing
+  The 2025 shift to per-message pricing (PMP) replacing the older 24h conversation-pricing window (effective 2025-07-01). Backs the `value.statuses[].pricing` block (`pricing_model: "PMP"`, `category`) documented in [META-PAYLOAD-STRUCTURES.md](./META-PAYLOAD-STRUCTURES.md) — relevant if a future cost-observability pass consumes `pricing.category`.
 
 ## Messenger Platform
 
@@ -70,7 +78,7 @@ Curated reference list for engineers working on `meta-ai-agent`. Prefer these so
 - **Graph API versions index** — https://developers.facebook.com/docs/graph-api/changelog/versions
   Lists every supported version, release date, and end-of-life date. Pin a version in code and bump deliberately.
 - **Platform deprecation policy** — https://developers.facebook.com/docs/graph-api/changelog
-  Each version is supported for ~24 months; v19 EOL is 2026-05-21, v20 is 2026-09-24. Plan upgrades around these dates.
+  Each version is supported for ~24 months with ~6 months' deprecation notice. The package defaults to `v25.0` (`META_GRAPH_API_VERSION`); check the live versions index for the current EOL dates and plan upgrades around them rather than relying on dates baked into this doc.
 
 ## Outdated / deprecated — avoid
 
@@ -94,5 +102,5 @@ Curated reference list for engineers working on `meta-ai-agent`. Prefer these so
 
 1. Bookmark the Graph API changelog and check it before bumping `META_GRAPH_API_VERSION`.
 2. Subscribe to release notes for each product (WhatsApp / Messenger / Instagram subtrees each publish their own).
-3. When `meta-ai-agent` ships a new minor version, scan the changelog for the supported Graph API version and update [META-PAYLOAD-STRUCTURES.md](./META-PAYLOAD-STRUCTURES.md) (populated in Stage 3) from fresh captures.
+3. When `meta-ai-agent` ships a new minor version, scan the changelog for the supported Graph API version and update [META-PAYLOAD-STRUCTURES.md](./META-PAYLOAD-STRUCTURES.md) from fresh captures.
 4. Treat any third-party article older than 6 months as suspect — verify against the live docs and recent captures.

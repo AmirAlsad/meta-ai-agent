@@ -201,12 +201,16 @@ separate functions ([`src/meta/shared/media.ts`](../../src/meta/shared/media.ts)
 The metadata MIME is authoritative; the response `Content-Type` is the fallback.
 
 **Token-leak-on-redirect:** the resolved URL is the terminal lookaside URL and we
-do not expect a cross-origin 3xx. Even if the CDN ever redirected cross-origin,
-`fetch`/undici strips the `Authorization` header on a cross-origin redirect, so
-the Bearer is not leaked to a foreign origin (verified to hold in current undici;
-documented in a load-bearing comment). If that strip behavior ever changes, the
-GET should switch to `redirect: 'manual'` and re-resolve rather than auto-follow
-with the token attached.
+do not expect a 3xx. The token-bearing binary GET uses `redirect: 'manual'` so the
+Bearer is **never auto-forwarded** across a redirect — rather than relying on
+undici's (non-standard, version-dependent) cross-origin `Authorization`-strip
+behavior. If the CDN ever does redirect, the helper follows the `Location` **once,
+WITHOUT** the token (the target is a pre-signed URL that does not need it); a 3xx
+with no `Location` header is surfaced as an error rather than followed. This fully
+closes the leak regardless of undici's redirect behavior. (A separate single-hop
+helper, `downloadWhatsAppMediaFromUrl`, carries the same auth/redirect safety but
+skips the `GET /{mediaId}` metadata resolve — used by the inbound media hydrator,
+which already resolved the metadata for its `file_size` pre-flight.)
 
 ### Messenger / Instagram — pre-signed, no token
 
@@ -259,11 +263,13 @@ Every media send is counted in `outbound_send_total` / `outbound_send_duration`
 with `operation: 'media:<kind>'`.
 
 **Fail-soft:** the media `sendMedia` call sits inside `sendNext`'s per-item
-try/catch. A send that throws — e.g. a Meta rejection of a non-PDF / oversized
-Instagram `file`, or an out-of-window send — is caught, the item is marked skipped
-with the error message, and the queue advances. A bad media item never crashes or
-wedges the queue; it is skipped exactly like any other send error. (There is no
-retry yet — Stage 10.)
+try/catch. A send that throws is routed by the Stage 10 error classifier exactly
+like any other send error: a **permanent** failure — e.g. a Meta rejection of a
+non-PDF / oversized Instagram `file` — marks the item skipped with the error
+message and advances the queue; a **transient** failure (429 / pre-response
+network error) is retried with backoff. A WhatsApp `window_closed` error re-prompts
+the chat endpoint once for a template. A bad media item never crashes or wedges the
+queue. See [Rate limiting](./rate-limiting.md) for the classification + retry rules.
 
 ## Supply a mimeType
 
@@ -283,7 +289,7 @@ bug — see [Known gaps](../KNOWN-GAPS.md).
 
 Source:
 
-- [`src/meta/shared/media.ts`](../../src/meta/shared/media.ts) — `inferMediaKind`, `uploadWhatsAppMedia`, `getWhatsAppMediaUrl`, `downloadWhatsAppMedia`, `downloadAttachmentUrl` (+ its `maxBytes` cap), `MEDIA_OVER_CAP`.
+- [`src/meta/shared/media.ts`](../../src/meta/shared/media.ts) — `inferMediaKind`, `uploadWhatsAppMedia`, `getWhatsAppMediaUrl`, `downloadWhatsAppMedia`, `downloadWhatsAppMediaFromUrl` (the single-hop variant for an already-resolved URL), `downloadAttachmentUrl` (+ its `maxBytes` cap), `MEDIA_OVER_CAP`.
 - [`src/meta/shared/media-hydrator.ts`](../../src/meta/shared/media-hydrator.ts) — `HttpMediaHydrator` / `NoopMediaHydrator` (inbound media hydration; see [Inbound media hydration](./media-hydration.md)).
 - [`src/meta/shared/adapter.ts`](../../src/meta/shared/adapter.ts) — `MediaSendInput`, the `ChannelAdapter.sendMedia` method, `MediaKind`.
 - [`src/meta/whatsapp/client.ts`](../../src/meta/whatsapp/client.ts) — `sendImage` / `sendAudio` / `sendVideo` / `sendDocument` / `uploadMedia` / `sendMedia` (+ the `mediaRef` id-vs-URL switch and `deriveFilename`).

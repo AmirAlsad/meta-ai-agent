@@ -196,12 +196,31 @@ known NOT to have processed the request, so a re-send cannot double-deliver:
   malformed-payload bug), deliberately excluded from the window set so it falls through
   to `permanent` — a template re-prompt would not fix it and would keep failing.
 
-The code sets (`WHATSAPP_WINDOW_ERROR_CODES`, `META_RATE_LIMIT_ERROR_CODES`, and the
-display-only policy/recipient/auth/server groups) live in one leaf module,
-[`src/limits/error-codes.ts`](../../src/limits/error-codes.ts), so `classifyError`,
-`classifyStatusErrorCode`, and the `whatsappFailureCategory` display mapper (see
-[Status tracking](./status-tracking.md)) all share ONE definition and can never
-disagree about, say, whether `131047` is a window error.
+### `error-codes.ts` — the single source of truth
+
+The code sets live in one **leaf module** (no imports of its own, so both the
+limits and status layers can depend on it),
+[`src/limits/error-codes.ts`](../../src/limits/error-codes.ts). Centralizing them
+means `classifyError`, `classifyStatusErrorCode`, and the display mapper can never
+disagree about, say, whether `131047` is a window error. It exports:
+
+- **`WHATSAPP_WINDOW_ERROR_CODES`** = `{131047, 470}` — drives the `window_closed`
+  verdict (and excludes `131051`).
+- **`META_RATE_LIMIT_ERROR_CODES`** = `{4, 80007, 130429, 131056, 613}` — drives the
+  `transient` verdict (on a 4xx-with-code, not HTTP 429).
+- **`whatsappFailureCategory(errorCode)`** → a **`FailureCategory`** enum
+  (`rate_limit` | `window_closed` | `policy` | `unsupported` | `recipient` | `auth`
+  | `server` | `unknown`) — a bounded, human-readable display bucket surfaced on
+  `GET /admin/status/:id` and failure dashboards (it is an enum, NOT free text, so it
+  is safe to show unmasked in the PII-redacted admin output). The window and
+  rate-limit buckets REUSE the two exported sets above (so the mapper can never drift
+  from the retry classifier); the remaining display-only groups
+  (`WHATSAPP_POLICY_ERROR_CODES` `{131048, 131049, 368}`, recipient
+  `{131026, 131030, 131045}`, auth `{190, 10, 200}`, unsupported `{131051}`, server
+  `{131000, 1, 2}`) are private to the module and have no retry semantics. An
+  `undefined` or unrecognized code maps to `unknown` — the mapper never throws,
+  because Meta can emit codes the package does not yet enumerate. See
+  [Status tracking](./status-tracking.md).
 
 > **`131056` is transient but a 72-hour window — a documented tradeoff.** It is the
 > "(Business, Consumer) pair rate limit" and is classified `transient`, so it
@@ -224,6 +243,12 @@ rule](./ordered-delivery.md#the-double-send-safety-rule-is-inverted-on-this-path
 — because a window-closed condition still needs a template re-prompt (not a plain
 re-send) and a blind re-send of a policy/recipient/auth failure would just fail
 again.
+
+The async `failed`-status retries are bounded by a SEPARATE per-item counter,
+`asyncFailRetryCount` (distinct from the synchronous-path `retryCount`), and that
+counter is deliberately NOT cleared on a subsequent successful send — so a
+`failed`-status that keeps flapping cannot retry forever even if interleaved sends
+succeed. See [Ordered delivery → async failure](./ordered-delivery.md#async-failure-from-a-failed-delivery-status).
 
 ### The retry loop
 
@@ -291,7 +316,9 @@ scans `store.listConversationKeys()` and, for any conversation in state `sending
 in-flight item carries `nextRetryAt` and `retryCount > 0`, re-arms the transient-retry
 timer with the *remaining* delay (`max(0, nextRetryAt - now)`, so an overdue retry fires
 promptly). Each per-key scan runs under `runExclusive` and is fail-soft so one bad
-record can't sink recovery. It returns `{ transientRetriesResumed }`.
+record can't sink recovery. It returns `{ transientRetriesResumed, processingReset,
+deliveryTimeoutsRearmed }` (the latter two cover the stranded-`processing` and the
+WhatsApp first-send-crash delivery-timeout cases described below).
 
 **Multi-replica double-send guard (load-bearing).** On a shared Redis, EVERY replica
 runs `recoverPendingRetries()` at boot (a rolling redeploy restarts them near-simultaneously),
@@ -326,8 +353,10 @@ until its TTL. Recovery (claim-guarded, so one replica acts) folds any persisted
 resets the record to `idle` so the next inbound starts fresh. The recovery is claim-guarded
 with a token carrying a per-turn `processingNonce` (stamped on the record when it enters
 `processing`), so concurrent recoveries of the SAME crash dedupe to one replica while a
-LATER processing turn (new nonce) is never blocked by a stale claim. It returns
-`{ transientRetriesResumed, processingReset }`. **Inherent limitation:** the original
+LATER processing turn (new nonce) is never blocked by a stale claim. `recoverPendingRetries`
+returns `{ transientRetriesResumed, processingReset, deliveryTimeoutsRearmed }` — the third
+count covers the WhatsApp first-send-crash delivery-timeout re-arms described just above.
+**Inherent limitation:** the original
 in-flight batch (snapshotted into a local var in `flushImpl` segment 1, never persisted)
 is lost on a hard crash mid-chat-call — an at-least-once tradeoff of the
 snapshot-clears-buffer design; see [Known gaps](../KNOWN-GAPS.md).
@@ -338,6 +367,21 @@ all-zero counts. Recovery covers transient retries + stranded `processing` recor
 in-flight window re-prompts (the `pendingRequests` map is in-memory and lost on restart)
 and not buffer-flush timers (those are durable in their own right via the BullMQ
 scheduler — see [Persistence](./persistence.md#the-bullmq-buffer-scheduler)).
+
+## Metrics
+
+The Stage 10 hardening added two limits-layer metrics to the agent metrics
+registry ([`src/metrics/registry.ts`](../../src/metrics/registry.ts)). Unlike the
+track-only per-hour/per-day threshold crossings (which are LOG-only — see the note
+above), these two ARE Prometheus series:
+
+| Metric | Type | Labels | Emitted |
+| --- | --- | --- | --- |
+| `acquire_send_slot_delay_seconds` | histogram | `channel` | `sendNext` observes the wall-clock seconds a send actually waited at the pacing slot (the delay returned by `acquireSendSlot`). A line approaching its per-second cap shows up as a rising delay distribution. |
+| `transient_retry_total` | counter | `channel`, `outcome` | Incremented when a transient retry is `scheduled` (a backoff retry was armed) or `exhausted` (attempts ran out → skip+advance). Emitted on BOTH the synchronous send-catch path and the async `failed`-status path. |
+
+There is still NO metric for a per-hour/per-day threshold crossing (it stays
+log-only). See [Operational visibility](./operational-visibility.md).
 
 ## Configuration
 
@@ -374,10 +418,14 @@ The Redis path for the counter store is selected on `REDIS_URL` — see
   short-circuit).
 - `tests/unit/limits-retry.test.ts` — `transientRetryDelayMs` backoff schedule, the cap,
   the ±20% jitter bounds, and `attempt < 1 → 0`.
-- `tests/unit/limits-tracker.test.ts` — `classifyError` over the full code matrix
-  (network/429/rate-limit-codes → transient; 5xx/non-Meta → permanent; WhatsApp
-  131047/470 → window_closed; the 131051 / policy-throttle exclusions), the fail-open
-  pacing path, and the retry-delay/max-attempts passthrough.
+- `tests/unit/limits-tracker.test.ts` — `classifyError` and `classifyStatusErrorCode`
+  over the full code matrix (network/429/rate-limit-codes → transient; 5xx/non-Meta →
+  permanent; WhatsApp 131047/470 → window_closed; the 131051 / policy-throttle
+  exclusions), the fail-open pacing path, the track-only `recordOutbound` warn/error
+  threshold logging, and the retry-delay/max-attempts passthrough.
+- `tests/unit/limits-error-codes.test.ts` — the `error-codes.ts` code sets and
+  `whatsappFailureCategory` → `FailureCategory` mapping (every bucket, plus the
+  `undefined`/unknown-code fallthrough).
 - `tests/integration/limits-redis-store.test.ts` — `RedisLimitCounterStore`'s Lua-atomic
   slot reservation against a real Redis (gated on `TEST_REDIS_URL`).
 - The agent's pacing call, classification-driven routing, transient-retry loop,

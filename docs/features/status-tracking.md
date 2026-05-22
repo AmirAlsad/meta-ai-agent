@@ -2,7 +2,7 @@
 
 ## What it does
 
-Stage 6 accumulates a per-outbound-message delivery-status history so an operator can answer "did this reply actually arrive / get read?" The history feeds the [`GET /admin/status/:messageId`](./operational-visibility.md) admin route and the `status_callback_total` metric. It is observability only — it never drives the conversation state machine or the outbound queue.
+The tracker accumulates a per-outbound-message delivery-status history so an operator can answer "did this reply actually arrive / get read?" The history feeds the [`GET /admin/status/:messageId`](./operational-visibility.md) admin route and the `status_callback_total` metric. The tracker itself is observability only — recording a status never drives the conversation state machine or the outbound queue. (A WhatsApp `failed` delivery-status webhook *can* drive an async retry / template re-prompt, but that decision is the **agent's**, not the tracker's — see [Async-failure interaction](#async-failure-interaction-the-agent-owns-retry) below.)
 
 The vocabulary is Meta's four-value `DeliveryStatus` enum (`sent` / `delivered` / `read` / `failed`) reused from the parser, so there is exactly one status vocabulary across the package.
 
@@ -93,6 +93,40 @@ the admin redactor (`redactStatusRecord` keeps the per-entry category inside eac
 `history` object and the top-level mirror). See [Operational
 visibility](./operational-visibility.md).
 
+### Async-failure interaction (the agent owns retry)
+
+On WhatsApp the real rate-limit / closed-window failures usually surface
+**asynchronously** as a `failed` delivery-status webhook (carrying
+`status.errorCode`) *after* the synchronous send POST already returned 200/queued —
+not on the send call itself. Two distinct concerns split across two layers on that
+path, and keeping them separate is load-bearing:
+
+- **The tracker records the failure (observability).** In `handleStatus`
+  ([`src/conversation/agent.ts`](../../src/conversation/agent.ts)), the per-message
+  status — including a `failed` with its `errorCode` / `errorTitle` — is recorded
+  **up front** via `applyStatusUpdate`, before the outbound-handle mapping lookup
+  and the per-key lock. The tracker derives the `FailureCategory` from the code and
+  stamps it on the history entry + the record mirror. This is pure bookkeeping: the
+  tracker takes no retry action.
+- **The agent owns the retry decision.** Separately, when a `failed` status refers
+  to the **currently in-flight** queue item (`currentOutboundIndex ===
+  mapping.messageIndex`), the agent classifies `status.errorCode` via
+  `LimitTracker.classifyStatusErrorCode` (the async sibling of the synchronous
+  `classifyError`) and routes it: `window_closed` → a once-per-turn template
+  re-prompt; `transient` → a backoff retry counted on a dedicated
+  `asyncFailRetryCount` (a separate counter from the synchronous `retryCount`,
+  because a successful send clears `retryCount`); `permanent` / exhausted → skip +
+  advance so one bad send can't wedge the queue. Each outcome emits
+  `transient_retry_total{outcome}` (`scheduled` / `exhausted`). See [Rate
+  limiting](./rate-limiting.md) for the classification + backoff math.
+
+The double-send-safety reasoning is **inverted** versus the synchronous send path: a
+5xx after a POST is ambiguous (Meta may have delivered), so the sync path does not
+retry; a `failed` *delivery status* is Meta's definitive statement the message did
+NOT reach the user, so retrying a transient-classified async failure is safe. The
+tracker's recording is unaffected by either decision — it logs every `failed` it
+sees regardless of how the agent then routes it.
+
 ### Per-channel model
 
 The two webhook shapes are handled by two methods on the `StatusTracker` interface ([`src/status/tracker.ts`](../../src/status/tracker.ts)):
@@ -131,7 +165,7 @@ This watermark path is observability-only. Messenger/IG are advance-on-send (`st
 | [`src/status/types.ts`](../../src/status/types.ts) | `StatusRecord`, `StatusHistoryEntry` (incl. `errorCategory`), the `STATUS_RANK` map. |
 | [`src/status/tracker.ts`](../../src/status/tracker.ts) | `StatusTracker` interface + `InMemoryStatusTracker` (`applyStatusUpdate`, `applyReadWatermark`, `getStatus`, `listByConversation`); derives `errorCategory` on a `failed` status. |
 | [`src/limits/error-codes.ts`](../../src/limits/error-codes.ts) | `FailureCategory`, `whatsappFailureCategory`, and the WhatsApp/Meta error-code sets — the single source of truth shared with the retry classifier. |
-| [`src/conversation/agent.ts`](../../src/conversation/agent.ts) | `handleStatusImpl` (WhatsApp 1:1) and `handleReadWatermarkImpl` (the watermark→message-id translation). |
+| [`src/conversation/agent.ts`](../../src/conversation/agent.ts) | `handleStatus` (records the status up front), `handleStatusImpl` (WhatsApp 1:1 + the async `failed`-status retry/re-prompt routing via `classifyStatusErrorCode`) and `handleReadWatermarkImpl` (the watermark→message-id translation). |
 | [`src/http/app.ts`](../../src/http/app.ts) | `GET /admin/status/:messageId` route (token-gated, guarded at registration). |
 | [`src/http/redaction.ts`](../../src/http/redaction.ts) | `redactStatusRecord` — masks `recipientId` + the key user segment. |
 
@@ -141,7 +175,7 @@ The status tracker itself has no env vars. The admin route that reads it is gate
 
 ## Known limitations
 
-- **In-memory now; Redis-backed in Stage 10.** `InMemoryStatusTracker` is a plain `Map` and is **unbounded** — no TTL, no sweeper. This is acceptable for Stage 6 because the production path is the Redis-backed tracker (Stage 10) where a TTL evicts records; an in-memory sweeper would be per-process state the Redis TTL supersedes. The `StatusTracker` interface is the contract the Redis impl will honor.
+- **Still in-memory (Stage 10 did NOT swap this store).** `InMemoryStatusTracker` is a plain `Map` and is **unbounded** — no TTL, no sweeper — in both the in-memory and Redis runtime paths. Stage 10 made the conversation store, buffer scheduler, and limit-counter store Redis-backed, but the status tracker (along with the metrics collector and contact store) was left for a later pass; a Redis-backed tracker with TTL eviction is still deferred (see [Known gaps](../KNOWN-GAPS.md)). The `StatusTracker` interface is the contract that Redis impl will honor.
 - **Watermark translation depends on the in-memory conversation record.** The Messenger/IG read path reads the outbound queue off the conversation record, so it surfaces reads only while that record (and its sent items) are still present.
 
 See [Read receipts](./read-receipts.md), [Operational visibility](./operational-visibility.md), [Ordered delivery](./ordered-delivery.md), and [Known gaps](../KNOWN-GAPS.md).

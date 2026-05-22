@@ -242,6 +242,55 @@ response. See
 [Conversation state](./conversation-state.md#the-state-machine) for the full
 transition table.
 
+## Symbolic target resolution (`TargetRef`)
+
+A `reply` / `reaction` action's `targetMessageId` is typed `ChatActionTarget`
+(`string | TargetRef`): either a literal channel message id or a symbolic selector
+(`{ alias }`, `{ contentIncludes, occurrence? }`, `{ content }`, `{ messageId }`).
+`buildOutboundItems` resolves it *while building the queue*, via `resolveTargetRef`
+([`src/chat/target-resolver.ts`](../../src/chat/target-resolver.ts)) against the
+turn's **buffered inbound** `IncomingMessage[]` (passed in as
+`options.inboundMessages` — the same array sent to the chat endpoint as
+`request.messages`, oldest→newest). The natural target is what the *user* said, so
+the candidate set is that inbound history. A bare string and `{ messageId }` pass
+through without consulting history; symbolic forms require non-empty history. When
+no target is supplied at all, it defaults to `{ alias: 'last' }`. The full variant
+table and resolution outcomes (`ok` / `not_found` / `ambiguous` / `invalid`) live
+in [Rich chat actions](./rich-chat-actions.md#symbolic-replyreaction-targets).
+
+Resolution is **fail-soft**, and the unresolved behaviour mirrors the
+unsupported-feature handling:
+
+- An **unresolved `reply`** is *downgraded* to a plain `message` item — the text
+  still matters to the user even when the threading target can't be found — and the
+  miss is noted in the `skipped` list (`reason: target unresolved: <reason>;
+  downgraded to message`).
+- An **unresolved `reaction`** has no text to fall back on, so it is simply
+  *skipped* with a note (`reason: target unresolved: <reason>`).
+
+The same resolution runs on the WhatsApp out-of-window re-prompt path
+(`handleWindowClosed` rebuilds the queue with `inboundMessages: original.messages`),
+so a re-prompt that reacts/replies to the user's message still resolves correctly.
+
+## Outbound-item retry bookkeeping
+
+Beyond the action fields, an `OutboundItem` carries delivery bookkeeping the agent
+sets as the item moves through the queue
+([`src/delivery/types.ts`](../../src/delivery/types.ts)):
+
+| Field | Set when | Meaning |
+| --- | --- | --- |
+| `channelMessageId` | a send succeeds | the channel-scoped id Meta returned (cleared on the async dead-handle reset before a re-send) |
+| `sentAt` | a send succeeds | Unix ms the send returned |
+| `skippedAt` / `skipReason` | a permanent/exhausted send failure (`markSkippedAndAdvance`) | the item was skipped at send time, not delivered (guards it out of `deliveredMessageIds`) |
+| `retryCount` | a *synchronous* transient retry is scheduled | attempts already made; **deleted** by `sendNext`'s success tail (double-send safety) and bounded by `transientRetryMaxAttempts()` |
+| `nextRetryAt` | a transient retry is scheduled | Unix ms the backoff timer fires; persisted so boot recovery can re-arm it |
+| `asyncFailRetryCount` | an *asynchronous* `failed`-status retry is scheduled | the separate counter that survives a successful send so the async retry loop is bounded (see above) |
+
+`channelMessageId` / `nextRetryAt` / `retryCount` are persisted on the record so
+`recoverPendingRetries` can re-arm an interrupted retry at boot — see
+[Conversation state → Boot recovery](./conversation-state.md#boot-recovery).
+
 ## Fail-soft sends
 
 A send that throws (`MetaApiError` or anything else) does not wedge the queue. When

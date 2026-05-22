@@ -1,6 +1,6 @@
 # Meta App Setup Guide
 
-The authoritative end-to-end procedure for going from "I just cloned this repo" to a populated `.env` and a verified live messaging loop across WhatsApp, Messenger, and Instagram under a single Meta App. Stage 3 of the implementation plan landed the verify + capture tooling that automates most of this — the steps below are the Dashboard work that still requires a human, plus the one-time decisions only the developer can make.
+The authoritative end-to-end procedure for going from "I just cloned this repo" to a populated `.env` and a verified live messaging loop across WhatsApp, Messenger, and Instagram under a single Meta App. The package is **feature-complete** — all ten implementation-plan stages are merged (transport, the conversation agent, the operational surface, the platform-specific setup surfaces, and the Stage 10 production-hardening layer: Redis-backed persistence, per-channel rate limiting, transient retry, and out-of-window handling). The Stage 3 verify + capture tooling automates most of the onboarding below — the steps that remain are the Dashboard work that still requires a human, plus the one-time decisions only the developer can make.
 
 Read [TRUSTED-SOURCES.md](./TRUSTED-SOURCES.md) alongside this guide. It tracks which Meta doc pages are authoritative and which (e.g. the legacy Page-linked Instagram flow) to skip.
 
@@ -237,10 +237,60 @@ Pinning a static domain eliminates that churn. Every ngrok account (including th
 
 - Missing `META_APP_SECRET`.
 - `META_VERIFY_TOKEN` shorter than 16 characters.
-- Missing `CHAT_ENDPOINT_URL`.
+- Missing `CHAT_ENDPOINT_URL` (or a value that does not parse as a URL).
 - A partially-configured channel (e.g. `WHATSAPP_PHONE_NUMBER_ID` set but `WHATSAPP_ACCESS_TOKEN` empty).
 - All three channel blocks empty.
 - `META_GRAPH_API_VERSION` not matching `^v\d+\.\d+$`.
+- Missing or malformed `NGROK_DOMAIN` (must be a bare hostname — no scheme, no path, must contain a `.`).
+- A set-but-invalid `USER_LOOKUP_URL` (must parse as a URL when present).
+- A set-but-invalid `REDIS_URL` (must use the `redis://` or `rediss://` scheme when present).
+- `ADMIN_API_TOKEN` shorter than 16 characters (when set).
+
+### Runtime configuration (persistence, rate limiting, media hydration)
+
+Everything in this subsection is **optional** — every var has a default, and a deployment with just the credentials above runs fine. These knobs tune the Stage 5–10 runtime (the conversation agent, durable persistence, and outbound pacing). The full annotated list lives in [`.env.example`](../.env.example); the authoritative defaults and validation live in [`src/config/loader.ts`](../src/config/loader.ts). See [Configuration](./features/configuration.md), [Persistence](./features/persistence.md), and [Rate limiting](./features/rate-limiting.md) for the complete reference.
+
+#### Redis persistence (optional — in-memory fallback)
+
+**Redis is OPTIONAL.** With `REDIS_URL` unset, the agent uses an in-memory conversation store + buffer scheduler + rate-limit counter store — perfectly fine for local development, the Stage 9 examples, and **single-replica** deployments. Set `REDIS_URL` only when you need **durability across restarts** or a **multi-replica** deployment (where every replica must share one view of conversation state, dedupe, and the rate-limit clock). When set, it selects the Redis-backed store + a BullMQ buffer scheduler + a Lua-atomic Redis rate-limit counter store, all sharing one connection.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `REDIS_URL` | _(unset)_ | Enables Stage 10 durable persistence. Must be a `redis://` or `rediss://` (TLS) URL — the scheme is hard-validated (throws otherwise). Unset = in-memory fallback. |
+| `CONVERSATION_TTL_SECONDS` | `86400` | TTL (seconds) for Redis conversation records + outbound-handle maps (1 day). |
+| `BUFFER_QUEUE_NAME` | `meta-ai-buffer-timers` | BullMQ queue name for the buffer-flush scheduler. |
+| `BUFFER_WORKER_CONCURRENCY` | `10` | BullMQ worker concurrency for flush jobs (`> 1` so a slow chat call for one conversation doesn't block others). |
+| `READY_REDIS_TIMEOUT_MS` | `2000` | Timeout (ms) for the `GET /ready` Redis ping. |
+
+#### Per-channel rate limiting + transient retry
+
+Per-second values **gate** outbound sends (a fail-open pre-send pacer); the per-hour/per-day values are **track-only** (advisory warn/error logging — they never gate a send). `0` disables that window. WhatsApp's real caps are conversation-based tiers, so the per-hour/per-day message count is only an advisory proxy.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `WHATSAPP_RATE_LIMIT_PER_SECOND` | `80` | WhatsApp outbound pacing (msgs/sec; `0` disables pacing). |
+| `MESSENGER_RATE_LIMIT_PER_SECOND` | `40` | Messenger outbound pacing (msgs/sec; `0` disables). |
+| `INSTAGRAM_RATE_LIMIT_PER_SECOND` | `10` | Instagram outbound pacing (msgs/sec; `0` disables). |
+| `WHATSAPP_RATE_LIMIT_PER_HOUR` | `1000` | Track-only WhatsApp per-hour message-count cap (`0` disables; per-hour must be `<=` per-day when both `> 0`). |
+| `WHATSAPP_RATE_LIMIT_PER_DAY` | `10000` | Track-only WhatsApp per-day message-count cap (`0` disables). |
+| `MESSENGER_RATE_LIMIT_PER_HOUR` | `0` | Track-only Messenger per-hour cap (disabled by default). |
+| `MESSENGER_RATE_LIMIT_PER_DAY` | `0` | Track-only Messenger per-day cap (disabled by default). |
+| `INSTAGRAM_RATE_LIMIT_PER_HOUR` | `0` | Track-only Instagram per-hour cap (disabled by default). |
+| `INSTAGRAM_RATE_LIMIT_PER_DAY` | `0` | Track-only Instagram per-day cap (disabled by default). |
+| `TRANSIENT_RETRY_MAX_ATTEMPTS` | `3` | Max transient-retry attempts after the first send. |
+| `TRANSIENT_RETRY_BASE_MS` | `1000` | Base backoff (ms) for transient retry (must be `<=` max). |
+| `TRANSIENT_RETRY_MAX_MS` | `60000` | Max backoff (ms) for transient retry (must be `>=` base). |
+
+#### Inbound media hydration (opt-in)
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `INBOUND_MEDIA_DOWNLOAD` | `false` | When `true`, the transport downloads inbound media (it holds the access token the chat endpoint lacks) and attaches it to the chat request as a base64 `data:` URL — so the endpoint can "see" WhatsApp images, which arrive as a bare media id. OFF by default: base64 inflates each media-bearing request body ~33%. |
+| `INBOUND_MEDIA_MAX_BYTES` | `5242880` | Max bytes of a single inbound attachment to hydrate (5 MiB). Larger media is left as id/url (logged, not base64-attached). |
+
+#### Operational visibility + conversation tuning
+
+The admin/metrics surface and the Stage 5 conversation buffering/typing/delivery knobs are also configurable — `ADMIN_API_TOKEN` (≥16 chars; gates the PII-bearing `/metrics` and `/admin/*` routes), `USER_LOOKUP_URL` + `USER_LOOKUP_TIMEOUT_MS` (optional fail-open identity enrichment), and the `BUFFER_*` / `TYPING_*` / `READ_RECEIPTS_ENABLED` / `OUTBOUND_DELIVERY_TIMEOUT_MS` / `CHAT_ENDPOINT_TIMEOUT_MS` / `DEDUPE_TTL_SECONDS` family. See [Configuration](./features/configuration.md) and [Operational visibility](./features/operational-visibility.md) for the full set.
 
 ## 4. Generate `META_VERIFY_TOKEN`
 

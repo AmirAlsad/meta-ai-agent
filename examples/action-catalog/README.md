@@ -31,7 +31,10 @@ words are ignored). The first match wins.
 
 Rich actions that reference a prior message (`reaction`, `reply`) target
 `req.messages.at(-1)?.channelMessageId` — the most recent inbound — falling back
-to a placeholder when the turn carried no id.
+to a placeholder when the turn carried no id. (`targetMessageId` also accepts a
+symbolic `TargetRef` instead of a literal id — e.g. `{ alias: 'last' }`,
+`{ contentIncludes }` — which the agent resolves against the turn's inbound
+messages; see `TargetRef` in [`src/chat/types.ts`](../../src/chat/types.ts).)
 
 ## Run it
 
