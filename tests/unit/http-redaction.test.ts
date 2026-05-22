@@ -516,6 +516,17 @@ describe('redactOutboundItem allow-list (fail-closed)', () => {
     expect(JSON.stringify(out)).not.toContain('447700900123');
   });
 
+  it('keeps retry bookkeeping (retryCount/nextRetryAt/asyncFailRetryCount) — non-PII numbers', () => {
+    // These are operational counters/timestamps an operator needs to see on
+    // GET /admin/conversations/:key; they carry no PII so the allow-list keeps them.
+    const out = redactOutboundItem(
+      makeOutbound({ retryCount: 2, nextRetryAt: 1_700_000_000_000, asyncFailRetryCount: 1 })
+    ) as Record<string, unknown>;
+    expect(out.retryCount).toBe(2);
+    expect(out.nextRetryAt).toBe(1_700_000_000_000);
+    expect(out.asyncFailRetryCount).toBe(1);
+  });
+
   it('reveal:true returns the item untouched', () => {
     const item = makeRichOutbound();
     const revealed = redactOutboundItem(item, { reveal: true });

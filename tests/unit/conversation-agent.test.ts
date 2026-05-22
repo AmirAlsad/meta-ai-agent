@@ -3128,6 +3128,12 @@ describe('ConversationAgent', () => {
       expect(record!.currentOutboundIndex).toBe(1);
       expect(record!.outboundQueue[0]!.skippedAt).toBeDefined();
       expect(record!.outboundQueue[0]!.skipReason).toContain('Message undeliverable');
+      // DATA INTEGRITY (review P1): the FAILED wamid must NOT be recorded as
+      // delivered, and the dead handle on the skipped item is cleared + its mapping
+      // dropped — so a failed send never masquerades as a confirmed delivery.
+      expect(record!.deliveredMessageIds).not.toContain(sentId);
+      expect(record!.outboundQueue[0]!.channelMessageId).toBeUndefined();
+      expect(await h.store.getOutboundHandleMapping(sentId)).toBeUndefined();
       // The second item was sent after the advance.
       expect(adapter.sendText).toHaveBeenCalledTimes(2);
       expect(adapter.sendText).toHaveBeenLastCalledWith('user-1', 'two');

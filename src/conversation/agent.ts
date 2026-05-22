@@ -1941,9 +1941,21 @@ export class ConversationAgent {
         if (item) {
           item.skippedAt = this.now();
           item.skipReason = status.errorTitle ?? `failed (code ${status.errorCode ?? 'unknown'})`;
+          // DEAD-HANDLE CLEAR (data integrity): the item still carries the FAILED
+          // send's channelMessageId. advanceAndContinue pushes the current item's
+          // channelMessageId into `deliveredMessageIds` (a field documented as
+          // CONFIRMED delivered) — so without clearing it first, a FAILED wamid would
+          // be recorded as delivered. Mirrors the synchronous markSkippedAndAdvance
+          // path, which advances with no handle.
+          delete item.channelMessageId;
+          delete item.sentAt;
           await this.store.setConversation(record);
         }
-        await this.advanceAndContinue(key, status.channelMessageId, failedTraceId);
+        // Drop the dead outbound-handle mapping explicitly. We pass `undefined` to
+        // advanceAndContinue below (so it records no bogus delivery), which means the
+        // mapping cleanup it normally performs for a live handle must happen here.
+        await this.store.deleteOutboundHandleMapping(status.channelMessageId);
+        await this.advanceAndContinue(key, undefined, failedTraceId);
         return;
       }
 
