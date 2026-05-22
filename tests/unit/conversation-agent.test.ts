@@ -3060,6 +3060,10 @@ describe('ConversationAgent', () => {
       expect(adapter.sendTemplate).toHaveBeenCalledTimes(1);
       record = await h.store.getConversation(key);
       expect(record!.windowReprompted).toBe(true);
+      // The dead wamid's handle mapping is cleaned up before the re-prompt (so a
+      // DUPLICATE webhook for it can't re-enter the handler against the template
+      // that replaced it at the same queue index).
+      expect(await h.store.getOutboundHandleMapping(sentId)).toBeUndefined();
 
       // Drain the template (on_status) so the turn completes.
       const templateId = (await (adapter.sendTemplate!.mock.results[0]!.value as Promise<SendResult>)).messageId;

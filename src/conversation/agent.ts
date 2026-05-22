@@ -1892,6 +1892,13 @@ export class ConversationAgent {
             { conversationKey: key, errorCode: status.errorCode },
             'whatsapp failed status: window closed; re-prompting for template'
           );
+          // Drop the dead wamid's handle mapping BEFORE re-prompting, consistent
+          // with the transient + permanent branches (which both clean it up).
+          // handleWindowClosed REPLACES the queue (a new template at the same
+          // index): leaving the stale mapping would let a DUPLICATE webhook for the
+          // dead wamid re-enter handleStatusImpl, match `currentOutboundIndex ===
+          // mapping.messageIndex`, and act against the NEW item at that index.
+          await this.store.deleteOutboundHandleMapping(status.channelMessageId);
           await this.handleWindowClosed(key, failedTraceId);
           return;
         }
