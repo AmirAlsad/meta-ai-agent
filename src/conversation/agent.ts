@@ -1324,7 +1324,17 @@ export class ConversationAgent {
     if (!record) return;
 
     const delivered = record.outboundQueue[record.currentOutboundIndex];
-    if (delivered?.channelMessageId) record.deliveredMessageIds.push(delivered.channelMessageId);
+    // Only record a CONFIRMED delivery. A SKIPPED item — a permanent/exhausted
+    // async failure, or a window_closed fall-through to markSkippedAndAdvance —
+    // still carries the FAILED send's channelMessageId (kept for observability of
+    // which send failed), but it did NOT deliver, so it must never land in
+    // deliveredMessageIds (a field documented as confirmed delivered/sent).
+    // markSkippedAndAdvance stamps `skippedAt` before advancing, so guarding on it
+    // here fixes every skip path at the source. (Greptile review: permanent +
+    // window_closed async-fail paths recorded the failed wamid as delivered.)
+    if (delivered?.channelMessageId && delivered.skippedAt === undefined) {
+      record.deliveredMessageIds.push(delivered.channelMessageId);
+    }
 
     const advanced = advanceCursor({ items: record.outboundQueue, currentIndex: record.currentOutboundIndex });
     record.currentOutboundIndex = advanced.currentIndex;
@@ -1941,19 +1951,13 @@ export class ConversationAgent {
         if (item) {
           item.skippedAt = this.now();
           item.skipReason = status.errorTitle ?? `failed (code ${status.errorCode ?? 'unknown'})`;
-          // DEAD-HANDLE CLEAR (data integrity): the item still carries the FAILED
-          // send's channelMessageId. advanceAndContinue pushes the current item's
-          // channelMessageId into `deliveredMessageIds` (a field documented as
-          // CONFIRMED delivered) — so without clearing it first, a FAILED wamid would
-          // be recorded as delivered. Mirrors the synchronous markSkippedAndAdvance
-          // path, which advances with no handle.
-          delete item.channelMessageId;
-          delete item.sentAt;
           await this.store.setConversation(record);
         }
-        // Drop the dead outbound-handle mapping explicitly. We pass `undefined` to
-        // advanceAndContinue below (so it records no bogus delivery), which means the
-        // mapping cleanup it normally performs for a live handle must happen here.
+        // Drop the dead outbound-handle mapping for the failed wamid. We pass
+        // `undefined` to advanceAndContinue (so it cleans up no live handle); its
+        // deliveredMessageIds push is guarded on the item NOT being skipped, so the
+        // failed wamid is never recorded as delivered — while the item keeps its
+        // channelMessageId so an operator can see WHICH send failed.
         await this.store.deleteOutboundHandleMapping(status.channelMessageId);
         await this.advanceAndContinue(key, undefined, failedTraceId);
         return;

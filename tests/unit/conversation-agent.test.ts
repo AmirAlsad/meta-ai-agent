@@ -3068,6 +3068,35 @@ describe('ConversationAgent', () => {
       await h.agent.close();
     });
 
+    it('window_closed fallthrough: a failed re-prompt does NOT record the failed wamid as delivered', async () => {
+      // When the window re-prompt chat call fails, handleWindowClosed falls through
+      // to markSkippedAndAdvance. The original failed item still carries its (dead)
+      // wamid, so advanceAndContinue must NOT push it into deliveredMessageIds —
+      // the deliveredMessageIds push is guarded on the item NOT being skipped.
+      // (Greptile review: window_closed async-fail path recorded a failed wamid as
+      // delivered when the re-prompt fell through to skip.)
+      const limitTracker = makeLimitTracker();
+      const chatImpl = async (request: ChatRequest): Promise<NormalizedChatResponse> => {
+        if (request.context.requiresTemplate) throw new Error('reprompt boom');
+        return textResponse('free-form text');
+      };
+      const { h, key, sentId } = await sendWhatsAppAndAwaitStatus({
+        responses: [textResponse('free-form text')],
+        limitTracker,
+        chatImpl
+      });
+
+      await h.agent.handleStatus(failedStatus(sentId, 131047, 'Re-engagement message'));
+
+      const record = await h.store.getConversation(key);
+      // Re-prompt failed → item skipped → queue drained to idle, and the FAILED
+      // wamid is NOT recorded as delivered (the data-integrity bug Greptile found).
+      expect(record!.state).toBe('idle');
+      expect(record!.deliveredMessageIds).not.toContain(sentId);
+      expect(record!.outboundQueue[0]!.skippedAt).toBeDefined();
+      await h.agent.close();
+    });
+
     it('transient: a `failed` status with a rate-limit code schedules a retry that re-sends the item', async () => {
       const RETRY_MS = 30_000;
       const limitTracker = makeLimitTracker({ delayMs: RETRY_MS, maxAttempts: 3 });
@@ -3129,10 +3158,12 @@ describe('ConversationAgent', () => {
       expect(record!.outboundQueue[0]!.skippedAt).toBeDefined();
       expect(record!.outboundQueue[0]!.skipReason).toContain('Message undeliverable');
       // DATA INTEGRITY (review P1): the FAILED wamid must NOT be recorded as
-      // delivered, and the dead handle on the skipped item is cleared + its mapping
-      // dropped — so a failed send never masquerades as a confirmed delivery.
+      // delivered. advanceAndContinue guards its deliveredMessageIds push on the
+      // item NOT being skipped, so the skipped item KEEPS its channelMessageId (for
+      // observability of which send failed) yet never masquerades as delivered. The
+      // dead outbound-handle mapping is dropped.
       expect(record!.deliveredMessageIds).not.toContain(sentId);
-      expect(record!.outboundQueue[0]!.channelMessageId).toBeUndefined();
+      expect(record!.outboundQueue[0]!.channelMessageId).toBe(sentId);
       expect(await h.store.getOutboundHandleMapping(sentId)).toBeUndefined();
       // The second item was sent after the advance.
       expect(adapter.sendText).toHaveBeenCalledTimes(2);
