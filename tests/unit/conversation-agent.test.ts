@@ -270,17 +270,22 @@ function makeHarness(opts: {
 
 /**
  * A fully-controllable fake {@link LimitTracker}. `classify` decides the
- * verdict per error; `acquireSendSlot` is a spy with no real delay (so tests
- * stay timer-free for pacing). `retryDelayMs` is fixed at `delayMs` for
- * deterministic timer math; `transientRetryMaxAttempts` is configurable.
+ * verdict per error; `classifyStatus` decides the verdict per `failed`-status
+ * error code (Wave-2 async-retry path); `acquireSendSlot` is a spy with no real
+ * delay (so tests stay timer-free for pacing). `retryDelayMs` is fixed at
+ * `delayMs` for deterministic timer math; `transientRetryMaxAttempts` is
+ * configurable. `recordOutbound` is a spy (fail-open, no-op).
  */
 function makeLimitTracker(opts: {
   classify?: (channel: Channel, error: unknown) => ErrorClassification;
+  classifyStatus?: (channel: Channel, errorCode: number | undefined) => ErrorClassification;
   maxAttempts?: number;
   delayMs?: number;
 } = {}): LimitTracker & {
   acquireSendSlot: ReturnType<typeof vi.fn>;
   classifyError: ReturnType<typeof vi.fn>;
+  classifyStatusErrorCode: ReturnType<typeof vi.fn>;
+  recordOutbound: ReturnType<typeof vi.fn>;
 } {
   const delayMs = opts.delayMs ?? 1000;
   const maxAttempts = opts.maxAttempts ?? 3;
@@ -292,9 +297,25 @@ function makeLimitTracker(opts: {
       error instanceof MetaApiError && (error.httpStatus === 429 || error.httpStatus === 0)
         ? 'transient'
         : 'permanent');
+  // Default fake status classifier mirrors the REAL tracker's `classifyStatusErrorCode`
+  // shape: a WhatsApp window code → window_closed, a rate-limit code → transient,
+  // else permanent. Tests override via `classifyStatus` to drive each branch.
+  const classifyStatus =
+    opts.classifyStatus ??
+    ((channel: Channel, errorCode: number | undefined): ErrorClassification => {
+      if (channel === 'whatsapp' && (errorCode === 131047 || errorCode === 470)) return 'window_closed';
+      if (errorCode === 4 || errorCode === 80007 || errorCode === 130429 || errorCode === 131056 || errorCode === 613) {
+        return 'transient';
+      }
+      return 'permanent';
+    });
   return {
     acquireSendSlot: vi.fn(async () => undefined),
     classifyError: vi.fn((channel: Channel, error: unknown) => classify(channel, error)),
+    classifyStatusErrorCode: vi.fn((channel: Channel, errorCode: number | undefined) =>
+      classifyStatus(channel, errorCode)
+    ),
+    recordOutbound: vi.fn(async () => undefined),
     retryDelayMs: () => delayMs,
     transientRetryMaxAttempts: () => maxAttempts
   };
@@ -2999,6 +3020,442 @@ describe('ConversationAgent', () => {
       await agent.close();
     });
   });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Wave-2 #1: async retry / window re-prompt from a WhatsApp `failed` status */
+  /* ────────────────────────────────────────────────────────────────────── */
+  describe('Wave-2: WhatsApp `failed` delivery status (async retry/re-prompt)', () => {
+    it('window_closed: a `failed` status with a window code re-prompts ONCE for a template', async () => {
+      // The original text was SENT successfully (200/queued), then a `failed` status
+      // arrives with the 24h-window code 131047. The async-failed branch must classify
+      // it window_closed → re-prompt → send the template.
+      const limitTracker = makeLimitTracker();
+      const chatImpl = async (request: ChatRequest): Promise<NormalizedChatResponse> => {
+        if (request.context.requiresTemplate) {
+          return { actions: [{ type: 'template', name: 'reengage', language: 'en_US' }] } as NormalizedChatResponse;
+        }
+        return textResponse('free-form text');
+      };
+      const { h, key, sentId } = await sendWhatsAppAndAwaitStatus({
+        responses: [textResponse('free-form text')],
+        limitTracker,
+        chatImpl
+      });
+      const adapter = h.adapters.whatsapp!;
+
+      // Original send happened; queue is waiting on the WhatsApp status.
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      let record = await h.store.getConversation(key);
+      expect(record!.state).toBe('sending');
+
+      // The async `failed` status (window code) → re-prompt → template sent.
+      await h.agent.handleStatus(failedStatus(sentId, 131047, 'Re-engagement message'));
+      expect(limitTracker.classifyStatusErrorCode).toHaveBeenCalledWith('whatsapp', 131047);
+      expect(h.chat.complete).toHaveBeenCalledTimes(2);
+      // The chatImpl override replaces the fake's `complete`, so read the 2nd call's
+      // request straight off the mock (h.chat.calls is only populated by the default impl).
+      const repromptReq = h.chat.complete.mock.calls[1]![0] as ChatRequest;
+      expect(repromptReq.context.requiresTemplate).toBe(true);
+      expect(repromptReq.context.windowOpen).toBe(false);
+      expect(adapter.sendTemplate).toHaveBeenCalledTimes(1);
+      record = await h.store.getConversation(key);
+      expect(record!.windowReprompted).toBe(true);
+
+      // Drain the template (on_status) so the turn completes.
+      const templateId = (await (adapter.sendTemplate!.mock.results[0]!.value as Promise<SendResult>)).messageId;
+      await h.agent.handleStatus(status(templateId, 'delivered'));
+      expect((await h.store.getConversation(key))!.state).toBe('idle');
+      await h.agent.close();
+    });
+
+    it('transient: a `failed` status with a rate-limit code schedules a retry that re-sends the item', async () => {
+      const RETRY_MS = 30_000;
+      const limitTracker = makeLimitTracker({ delayMs: RETRY_MS, maxAttempts: 3 });
+      const { h, key, sentId } = await sendWhatsAppAndAwaitStatus({
+        responses: [textResponse('hello')],
+        limitTracker
+      });
+      const adapter = h.adapters.whatsapp!;
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+
+      // The async `failed` status (rate-limit code 130429) → transient → schedule retry.
+      await h.agent.handleStatus(failedStatus(sentId, 130429, 'Rate limit hit'));
+      expect(limitTracker.classifyStatusErrorCode).toHaveBeenCalledWith('whatsapp', 130429);
+
+      let record = await h.store.getConversation(key);
+      expect(record!.state).toBe('sending');
+      expect(record!.currentOutboundIndex).toBe(0);
+      const item = record!.outboundQueue[0]!;
+      // DEAD-HANDLE RESET: the failed handle is cleared so the retry re-sends cleanly
+      // and the B1 recovery guard recognizes it as pending (channelMessageId undefined).
+      expect(item.channelMessageId).toBeUndefined();
+      expect(item.sentAt).toBeUndefined();
+      expect(item.retryCount).toBe(1);
+      expect(item.nextRetryAt).toBe(FIXED_NOW + RETRY_MS);
+      expect(record!.currentOutboundMessageId).toBeUndefined();
+      // The dead outbound-handle mapping was dropped.
+      expect(await h.store.getOutboundHandleMapping(sentId)).toBeUndefined();
+
+      // Fire the retry timer → re-send → WhatsApp waits on status again.
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      expect(adapter.sendText).toHaveBeenCalledTimes(2);
+      record = await h.store.getConversation(key);
+      expect(record!.state).toBe('sending'); // awaiting the re-sent item's status
+      const reSentId = record!.currentOutboundMessageId!;
+      expect(reSentId).not.toBe(sentId);
+
+      // Deliver the re-send's status → queue advances → idle.
+      await h.agent.handleStatus(status(reSentId, 'delivered'));
+      expect((await h.store.getConversation(key))!.state).toBe('idle');
+      await h.agent.close();
+    });
+
+    it('permanent: a `failed` status with a non-retryable code skips+advances the item', async () => {
+      const limitTracker = makeLimitTracker();
+      // Two messages: the first fails permanently and is skipped; the second sends.
+      const { h, key, sentId } = await sendWhatsAppAndAwaitStatus({
+        responses: [{ actions: [{ type: 'message', text: 'one' }, { type: 'message', text: 'two' }] }],
+        limitTracker
+      });
+      const adapter = h.adapters.whatsapp!;
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+
+      // Permanent code 131026 (undeliverable) → skip + advance to item 1.
+      await h.agent.handleStatus(failedStatus(sentId, 131026, 'Message undeliverable'));
+      expect(limitTracker.classifyStatusErrorCode).toHaveBeenCalledWith('whatsapp', 131026);
+
+      const record = await h.store.getConversation(key);
+      expect(record!.currentOutboundIndex).toBe(1);
+      expect(record!.outboundQueue[0]!.skippedAt).toBeDefined();
+      expect(record!.outboundQueue[0]!.skipReason).toContain('Message undeliverable');
+      // The second item was sent after the advance.
+      expect(adapter.sendText).toHaveBeenCalledTimes(2);
+      expect(adapter.sendText).toHaveBeenLastCalledWith('user-1', 'two');
+      await h.agent.close();
+    });
+
+    it('exhausted transient: a `failed` rate-limit code at the cap skips instead of retrying', async () => {
+      const limitTracker = makeLimitTracker({ delayMs: 30_000, maxAttempts: 2 });
+      const { h, key, sentId } = await sendWhatsAppAndAwaitStatus({
+        responses: [textResponse('hello')],
+        limitTracker
+      });
+      const adapter = h.adapters.whatsapp!;
+
+      // Pre-stamp the in-flight item at asyncFailRetryCount === maxAttempts so the
+      // next async transient failure is at the cap and must skip rather than
+      // reschedule. (The async path's cap counts asyncFailRetryCount, NOT retryCount,
+      // because retryCount is wiped on every successful send — see the natural-loop
+      // regression test below.)
+      const pre = await h.store.getConversation(key);
+      pre!.outboundQueue[0]!.asyncFailRetryCount = 2; // == maxAttempts
+      await h.store.setConversation(pre!);
+
+      await h.agent.handleStatus(failedStatus(sentId, 130429, 'Rate limit hit'));
+
+      const record = await h.store.getConversation(key);
+      // No reschedule (attempt 3 > cap of 2) → skipped + advanced to completion (idle).
+      expect(record!.state).toBe('idle');
+      expect(record!.currentOutboundIndex).toBe(1);
+      expect(record!.outboundQueue[0]!.skippedAt).toBeDefined();
+      // Only the ORIGINAL send happened — the cap blocked a re-send.
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+      await h.agent.close();
+    });
+
+    it('exhausted transient (natural loop): repeated async failures eventually skip, never loop forever', async () => {
+      // REGRESSION (review HIGH): the async-`failed` retry cap must SURVIVE a
+      // successful re-send. Each re-send succeeds synchronously — which deletes
+      // `retryCount` for double-send safety — and then fails again via a status
+      // webhook. If the cap counted `retryCount`, it would reset to 1 every cycle
+      // and retry FOREVER. `asyncFailRetryCount` (never cleared on success) bounds
+      // the loop. With maxAttempts=2 we expect exactly 2 retries (3 sends) then a
+      // skip — and crucially we DO NOT pre-stamp any counter, so this exercises the
+      // real accumulation mechanism end to end.
+      const RETRY_MS = 30_000;
+      const limitTracker = makeLimitTracker({ delayMs: RETRY_MS, maxAttempts: 2 });
+      const { h, key, sentId } = await sendWhatsAppAndAwaitStatus({
+        responses: [textResponse('hello')],
+        limitTracker
+      });
+      const adapter = h.adapters.whatsapp!;
+      expect(adapter.sendText).toHaveBeenCalledTimes(1);
+
+      // Cycle 1: fail the original send → retry #1 → re-send (succeeds, clearing retryCount).
+      await h.agent.handleStatus(failedStatus(sentId, 130429, 'Rate limit hit'));
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      expect(adapter.sendText).toHaveBeenCalledTimes(2);
+      let record = await h.store.getConversation(key);
+      expect(record!.outboundQueue[0]!.asyncFailRetryCount).toBe(1);
+      const reSentId1 = record!.currentOutboundMessageId!;
+
+      // Cycle 2: fail the re-send → retry #2 (at the cap) → re-send again.
+      await h.agent.handleStatus(failedStatus(reSentId1, 130429, 'Rate limit hit'));
+      await vi.advanceTimersByTimeAsync(RETRY_MS);
+      expect(adapter.sendText).toHaveBeenCalledTimes(3);
+      record = await h.store.getConversation(key);
+      expect(record!.outboundQueue[0]!.asyncFailRetryCount).toBe(2);
+      const reSentId2 = record!.currentOutboundMessageId!;
+
+      // Cycle 3: fail again → attempt 3 > cap(2) → EXHAUSTED → skip + advance → idle.
+      await h.agent.handleStatus(failedStatus(reSentId2, 130429, 'Rate limit hit'));
+      record = await h.store.getConversation(key);
+      expect(record!.state).toBe('idle');
+      expect(record!.outboundQueue[0]!.skippedAt).toBeDefined();
+      // No 4th send — the cap stopped the runaway loop.
+      expect(adapter.sendText).toHaveBeenCalledTimes(3);
+      await h.agent.close();
+    });
+
+    it('a `failed` status for a NON-current (already-advanced) item is a no-op', async () => {
+      // Send two WhatsApp messages: deliver item0, so the cursor is on item1. A
+      // `failed` status for item0 (now stale, behind the cursor) must NOT retry,
+      // re-prompt, or double-advance.
+      const limitTracker = makeLimitTracker();
+      const { h, key, sentId: firstId } = await sendWhatsAppAndAwaitStatus({
+        responses: [{ actions: [{ type: 'message', text: 'one' }, { type: 'message', text: 'two' }] }],
+        limitTracker
+      });
+      const adapter = h.adapters.whatsapp!;
+
+      // Deliver item0 → cursor advances to item1 (which is then sent).
+      await h.agent.handleStatus(status(firstId, 'delivered'));
+      let record = await h.store.getConversation(key);
+      expect(record!.currentOutboundIndex).toBe(1);
+      const secondId = record!.currentOutboundMessageId!;
+      const sendCountBefore = adapter.sendText.mock.calls.length;
+
+      // A late `failed` for the already-advanced item0 → no-op (stale-index guard).
+      await h.agent.handleStatus(failedStatus(firstId, 130429, 'Rate limit hit'));
+      record = await h.store.getConversation(key);
+      // Cursor unchanged, item1 still in flight, no extra send, no chat re-prompt.
+      expect(record!.currentOutboundIndex).toBe(1);
+      expect(record!.currentOutboundMessageId).toBe(secondId);
+      expect(adapter.sendText.mock.calls.length).toBe(sendCountBefore);
+      expect(h.chat.complete).toHaveBeenCalledTimes(1); // no re-prompt
+      await h.agent.close();
+    });
+
+    it('the WhatsApp delivery timeout is CLEARED on the failed path (no spurious fire)', async () => {
+      // After a successful WhatsApp send the delivery-timeout is armed. A `failed`
+      // status that triggers a transient retry must clear it so it can't double-fire
+      // and advance the queue out from under the retry. RETRY_MS is set well beyond
+      // the delivery-timeout (default 30s) so we can advance past the timeout window
+      // WITHOUT firing the retry — proving the timeout was cleared, not just outraced.
+      const RETRY_MS = 90_000;
+      const limitTracker = makeLimitTracker({ delayMs: RETRY_MS, maxAttempts: 3 });
+      const { h, key, sentId } = await sendWhatsAppAndAwaitStatus({
+        responses: [textResponse('hello')],
+        limitTracker
+      });
+      const adapter = h.adapters.whatsapp!;
+      const timeoutMs = makeConfig().conversation.outboundDeliveryTimeoutMs;
+
+      await h.agent.handleStatus(failedStatus(sentId, 130429, 'Rate limit hit'));
+
+      // Advance PAST the delivery-timeout window but NOT to the retry: if the timeout
+      // had survived, it would have fired here and advanced the queue. It must not.
+      expect(timeoutMs).toBeLessThan(RETRY_MS);
+      await vi.advanceTimersByTimeAsync(timeoutMs);
+      const record = await h.store.getConversation(key);
+      expect(record!.state).toBe('sending');
+      expect(record!.currentOutboundIndex).toBe(0); // NOT advanced by a stale timeout
+      expect(adapter.sendText).toHaveBeenCalledTimes(1); // retry hasn't fired yet
+
+      // Now fire the retry → re-send.
+      await vi.advanceTimersByTimeAsync(RETRY_MS - timeoutMs);
+      expect(adapter.sendText).toHaveBeenCalledTimes(2);
+      await h.agent.close();
+    });
+
+    it('emits transient_retry_total{outcome:scheduled} on the async-failed transient path', async () => {
+      const limitTracker = makeLimitTracker({ delayMs: 30_000, maxAttempts: 3 });
+      const { h, key, sentId } = await sendWhatsAppAndAwaitStatus({
+        responses: [textResponse('hello')],
+        limitTracker,
+        withMetrics: true
+      });
+      void key;
+      await h.agent.handleStatus(failedStatus(sentId, 130429, 'Rate limit hit'));
+      expect(
+        counterValue(h.collector!, 'transient_retry_total', { channel: 'whatsapp', outcome: 'scheduled' })
+      ).toBe(1);
+      await h.agent.close();
+    });
+
+    it('emits transient_retry_total{outcome:exhausted} when the async-failed retry is at the cap', async () => {
+      const limitTracker = makeLimitTracker({ delayMs: 30_000, maxAttempts: 1 });
+      const { h, key, sentId } = await sendWhatsAppAndAwaitStatus({
+        responses: [textResponse('hello')],
+        limitTracker,
+        withMetrics: true
+      });
+      const pre = await h.store.getConversation(key);
+      pre!.outboundQueue[0]!.asyncFailRetryCount = 1; // == maxAttempts → next is over the cap
+      await h.store.setConversation(pre!);
+
+      await h.agent.handleStatus(failedStatus(sentId, 130429, 'Rate limit hit'));
+      expect(
+        counterValue(h.collector!, 'transient_retry_total', { channel: 'whatsapp', outcome: 'exhausted' })
+      ).toBe(1);
+      await h.agent.close();
+    });
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Wave-2 #8: recordOutbound throughput accounting on successful sends      */
+  /* ────────────────────────────────────────────────────────────────────── */
+  describe('Wave-2: recordOutbound on successful Graph sends', () => {
+    it('is called once per REAL send (message + reaction), NOT for typing/silence', async () => {
+      const limitTracker = makeLimitTracker();
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const h = makeHarness({
+        responses: [
+          {
+            actions: [
+              { type: 'message', text: 'one' },
+              { type: 'reaction', emoji: '👍', targetMessageId: 'm_x' },
+              { type: 'typing' }
+            ]
+          }
+        ],
+        adapters: { messenger: adapter },
+        limitTracker
+      });
+
+      await h.agent.handleInbound(
+        inbound({ channel: 'messenger', channelMessageId: 'm_ro1', channelScopedUserId: 'fb-user' })
+      );
+      await flushBuffer();
+
+      // recordOutbound mirrors acquireSendSlot's gate: message + reaction (2), NOT typing.
+      const recordOutbound = (limitTracker as ReturnType<typeof makeLimitTracker>).recordOutbound;
+      expect(recordOutbound).toHaveBeenCalledTimes(2);
+      expect(recordOutbound).toHaveBeenCalledWith('messenger', 'biz-1');
+      await h.agent.close();
+    });
+
+    it('is NOT called when a send FAILS (only confirmed sends count)', async () => {
+      const limitTracker = makeLimitTracker();
+      const adapter = makeAdapter('messenger', messengerSupports);
+      adapter.sendText.mockRejectedValueOnce(metaError(400)); // permanent → skip
+      const h = makeHarness({
+        responses: [textResponse('boom')],
+        adapters: { messenger: adapter },
+        limitTracker
+      });
+      await h.agent.handleInbound(
+        inbound({ channel: 'messenger', channelMessageId: 'm_ro2', channelScopedUserId: 'fb-user' })
+      );
+      await flushBuffer();
+      const recordOutbound = (limitTracker as ReturnType<typeof makeLimitTracker>).recordOutbound;
+      expect(recordOutbound).not.toHaveBeenCalled();
+      await h.agent.close();
+    });
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Wave-2 #5: acquireSendSlotDelaySeconds histogram                         */
+  /* ────────────────────────────────────────────────────────────────────── */
+  describe('Wave-2: acquire_send_slot_delay_seconds histogram', () => {
+    it('observes the pacing delay per real send (message), labelled by channel', async () => {
+      const limitTracker = makeLimitTracker();
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const h = makeHarness({
+        responses: [textResponse('paced')],
+        adapters: { messenger: adapter },
+        limitTracker,
+        withMetrics: true
+      });
+      await h.agent.handleInbound(
+        inbound({ channel: 'messenger', channelMessageId: 'm_sl1', channelScopedUserId: 'fb-user' })
+      );
+      await flushBuffer();
+      expect(histogramCount(h.collector!, 'acquire_send_slot_delay_seconds', { channel: 'messenger' })).toBe(1);
+      await h.agent.close();
+    });
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Wave-2 #6: conversationTraceId on late status/read log lines             */
+  /* ────────────────────────────────────────────────────────────────────── */
+  describe('Wave-2: conversationTraceId on status-handler logs', () => {
+    it('binds the originating inbound trace id onto the failed-status log line', async () => {
+      // Spy on the agent's logger.child so we can assert the conversationTraceId
+      // binding the status handler derives from the persisted outbound-handle mapping.
+      const childBindings: Array<Record<string, unknown>> = [];
+      const baseLogger = pino({ level: 'silent' });
+      const spyLogger = {
+        ...baseLogger,
+        child: (bindings: Record<string, unknown>) => {
+          childBindings.push(bindings);
+          // Return a logger whose own .child also records (the status handler may
+          // chain a second .child for the conversationTraceId).
+          const inner = baseLogger.child(bindings);
+          return Object.assign(inner, {
+            child: (b2: Record<string, unknown>) => {
+              childBindings.push(b2);
+              return baseLogger.child({ ...bindings, ...b2 });
+            }
+          });
+        }
+      } as unknown as pino.Logger;
+
+      const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+      const store = new InMemoryConversationStore({ dedupeTtlSeconds: 60 });
+      const agent = new ConversationAgent({
+        store,
+        scheduler: new InMemoryBufferScheduler(),
+        chatClient: makeChatClient([textResponse('hi')]),
+        adapters: { whatsapp: adapter } as Partial<Record<Channel, ChannelAdapter>>,
+        config: makeConfig(),
+        logger: spyLogger,
+        random: () => 0.5,
+        now: () => FIXED_NOW,
+        sleep: async () => undefined,
+        limitTracker: makeLimitTracker()
+      });
+
+      const key = 'whatsapp:biz-1:user-1';
+      await agent.handleInbound(inbound({ channelMessageId: 'wamid.tr1' }), { traceId: 'trace-xyz' });
+      await flushBuffer();
+      const sentId = (await store.getConversation(key))!.currentOutboundMessageId!;
+
+      await agent.handleStatus(failedStatus(sentId, 131026, 'undeliverable'), { traceId: 'trace-xyz' });
+
+      // The handler bound conversationTraceId from the persisted mapping's traceId.
+      expect(childBindings.some(b => b.conversationTraceId === 'trace-xyz')).toBe(true);
+      await agent.close();
+    });
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Wave-2 #3: buildOutboundItems receives the turn's inbound messages       */
+  /* ────────────────────────────────────────────────────────────────────── */
+  describe('Wave-2: symbolic reply/reaction targets resolve through the agent', () => {
+    it("a reaction targeting { alias: 'last' } resolves to the user's last inbound message id", async () => {
+      // The chat endpoint reacts to the LAST inbound via the symbolic alias. The
+      // agent must pass the turn's buffered inbound messages to buildOutboundItems
+      // so the alias resolves to the real channel message id.
+      const adapter = makeAdapter('messenger', messengerSupports);
+      const h = makeHarness({
+        responses: [{ actions: [{ type: 'reaction', emoji: '🔥', targetMessageId: { alias: 'last' } }] }],
+        adapters: { messenger: adapter }
+      });
+      await h.agent.handleInbound(
+        inbound({ channel: 'messenger', channelMessageId: 'm_first', channelScopedUserId: 'fb-user', text: 'a' })
+      );
+      await h.agent.handleInbound(
+        inbound({ channel: 'messenger', channelMessageId: 'm_last', channelScopedUserId: 'fb-user', text: 'b' })
+      );
+      await flushBuffer();
+
+      // The reaction resolved to the LAST buffered inbound id, not the first.
+      expect(adapter.sendReaction).toHaveBeenCalledTimes(1);
+      expect(adapter.sendReaction).toHaveBeenCalledWith('fb-user', 'm_last', '🔥');
+      await h.agent.close();
+    });
+  });
 });
 
 /* ──────────────────────────────────────────────────────────────────────── */
@@ -3017,4 +3474,54 @@ function status(channelMessageId: string, value: StatusUpdate['status']): Status
     timestamp: FIXED_NOW,
     raw: {}
   };
+}
+
+/** A WhatsApp `failed` status carrying an `errorCode` (+ optional title). */
+function failedStatus(channelMessageId: string, errorCode: number, errorTitle?: string): StatusUpdate {
+  return {
+    channel: 'whatsapp',
+    channelMessageId,
+    channelScopedUserId: 'user-1',
+    channelScopedBusinessId: 'biz-1',
+    status: 'failed',
+    timestamp: FIXED_NOW,
+    errorCode,
+    ...(errorTitle !== undefined ? { errorTitle } : {}),
+    raw: {}
+  };
+}
+
+/**
+ * Drive a WhatsApp turn up to the point where its first outbound MESSAGE has been
+ * sent and is awaiting a delivery status (on_status). Returns the harness, the
+ * conversation key, and the channelMessageId of the in-flight (sent) item — the
+ * handle a `failed` status would reference. Used by the async-failed-status tests.
+ */
+async function sendWhatsAppAndAwaitStatus(opts: {
+  responses: NormalizedChatResponse[];
+  limitTracker: LimitTracker;
+  withMetrics?: boolean;
+  chatImpl?: (request: ChatRequest) => Promise<NormalizedChatResponse>;
+  /** Optional trace id threaded through handleInbound (persisted on the record + mapping). */
+  traceId?: string;
+}): Promise<{ h: Harness; key: string; sentId: string }> {
+  const adapter = makeAdapter('whatsapp', whatsappSupports, { template: true });
+  const h = makeHarness({
+    responses: opts.responses,
+    adapters: { whatsapp: adapter },
+    limitTracker: opts.limitTracker,
+    ...(opts.withMetrics ? { withMetrics: true } : {})
+  });
+  if (opts.chatImpl) h.chat.complete.mockImplementation(opts.chatImpl);
+
+  const key = 'whatsapp:biz-1:user-1';
+  await h.agent.handleInbound(
+    inbound({ channelMessageId: 'wamid.in1' }),
+    opts.traceId !== undefined ? { traceId: opts.traceId } : undefined
+  );
+  await flushBuffer();
+
+  const record = await h.store.getConversation(key);
+  const sentId = record!.currentOutboundMessageId!;
+  return { h, key, sentId };
 }

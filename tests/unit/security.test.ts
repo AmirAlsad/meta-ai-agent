@@ -343,4 +343,102 @@ describe('createMetaSignatureVerifier', () => {
       );
     });
   });
+
+  describe('onReject callback (rejection metrics)', () => {
+    it('calls onReject("mismatch") on a present-but-wrong signature (401)', () => {
+      const onReject = vi.fn();
+      const middleware = createMetaSignatureVerifier(SECRET, undefined, onReject);
+      const req = makeReq({ rawBody: body, signatureHeader: signBody(body, 'wrong-secret') });
+      const res = makeRes();
+      const next = vi.fn();
+
+      middleware(req, res, next);
+
+      expect(res.statusCode).toBe(401);
+      expect(onReject).toHaveBeenCalledTimes(1);
+      expect(onReject).toHaveBeenCalledWith('mismatch');
+    });
+
+    it('calls onReject("missing_signature") when no header is sent (401)', () => {
+      const onReject = vi.fn();
+      const middleware = createMetaSignatureVerifier(SECRET, undefined, onReject);
+      const req = makeReq({ rawBody: body });
+      const res = makeRes();
+      const next = vi.fn();
+
+      middleware(req, res, next);
+
+      expect(res.statusCode).toBe(401);
+      expect(onReject).toHaveBeenCalledTimes(1);
+      expect(onReject).toHaveBeenCalledWith('missing_signature');
+    });
+
+    it('calls onReject("missing_signature") for an empty-string header (401)', () => {
+      const onReject = vi.fn();
+      const middleware = createMetaSignatureVerifier(SECRET, undefined, onReject);
+      const req = makeReq({ rawBody: body, signatureHeader: '' });
+      const res = makeRes();
+      const next = vi.fn();
+
+      middleware(req, res, next);
+
+      expect(res.statusCode).toBe(401);
+      expect(onReject).toHaveBeenCalledWith('missing_signature');
+    });
+
+    it('calls onReject("no_raw_body") when rawBody is missing (400)', () => {
+      const onReject = vi.fn();
+      const middleware = createMetaSignatureVerifier(SECRET, undefined, onReject);
+      const req = makeReq({ signatureHeader: signBody(body) });
+      const res = makeRes();
+      const next = vi.fn();
+
+      middleware(req, res, next);
+
+      expect(res.statusCode).toBe(400);
+      expect(onReject).toHaveBeenCalledTimes(1);
+      expect(onReject).toHaveBeenCalledWith('no_raw_body');
+    });
+
+    it('does NOT call onReject on a valid signature', () => {
+      const onReject = vi.fn();
+      const middleware = createMetaSignatureVerifier(SECRET, undefined, onReject);
+      const req = makeReq({ rawBody: body, signatureHeader: signBody(body) });
+      const res = makeRes();
+      const next = vi.fn();
+
+      middleware(req, res, next);
+
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(onReject).not.toHaveBeenCalled();
+    });
+
+    it('still works (no throw) when onReject is omitted — backward compat', () => {
+      // The two-arg call shape (the existing call sites/tests) must keep working.
+      const middleware = createMetaSignatureVerifier(SECRET, makeLogger());
+      const req = makeReq({ rawBody: body, signatureHeader: signBody(body, 'wrong-secret') });
+      const res = makeRes();
+      const next = vi.fn();
+
+      expect(() => middleware(req, res, next)).not.toThrow();
+      expect(res.statusCode).toBe(401);
+    });
+
+    it('swallows a throwing onReject so it cannot break the security path', () => {
+      const onReject = vi.fn(() => {
+        throw new Error('metrics sink boom');
+      });
+      const middleware = createMetaSignatureVerifier(SECRET, undefined, onReject);
+      const req = makeReq({ rawBody: body, signatureHeader: signBody(body, 'wrong-secret') });
+      const res = makeRes();
+      const next = vi.fn();
+
+      expect(() => middleware(req, res, next)).not.toThrow();
+      expect(res.statusCode).toBe(401);
+      expect((res as unknown as { _getJSONData: () => unknown })._getJSONData()).toEqual({
+        error: 'invalid_signature'
+      });
+      expect(next).not.toHaveBeenCalled();
+    });
+  });
 });

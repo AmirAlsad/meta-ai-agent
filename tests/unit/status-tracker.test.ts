@@ -105,7 +105,7 @@ describe('InMemoryStatusTracker — applyStatusUpdate', () => {
     ]);
   });
 
-  it('records errorCode/errorTitle on failed and sets current to failed', () => {
+  it('records errorCode/errorTitle/errorCategory on failed and sets current to failed', () => {
     const tracker = makeTracker();
     const record = tracker.applyStatusUpdate({
       channelMessageId: 'wamid.A',
@@ -117,9 +117,60 @@ describe('InMemoryStatusTracker — applyStatusUpdate', () => {
     });
 
     expect(record.current).toBe('failed');
+    // 131026 → recipient bucket; the derived category rides on the history entry
+    // AND is mirrored onto the record top-level.
     expect(record.history).toEqual([
-      { status: 'failed', timestamp: 1500, errorCode: 131_026, errorTitle: 'Message undeliverable' }
+      {
+        status: 'failed',
+        timestamp: 1500,
+        errorCode: 131_026,
+        errorTitle: 'Message undeliverable',
+        errorCategory: 'recipient'
+      }
     ]);
+    expect(record.errorCategory).toBe('recipient');
+  });
+
+  it('derives errorCategory for a failed status even with NO errorCode (→ unknown)', () => {
+    const tracker = makeTracker();
+    const record = tracker.applyStatusUpdate({
+      channelMessageId: 'wamid.B',
+      channel: 'whatsapp',
+      status: 'failed',
+      timestamp: 2000
+    });
+    expect(record.history[0]).toEqual({
+      status: 'failed',
+      timestamp: 2000,
+      errorCategory: 'unknown'
+    });
+    expect(record.errorCategory).toBe('unknown');
+  });
+
+  it('maps a window errorCode (131047) to the window_closed category', () => {
+    const tracker = makeTracker();
+    const record = tracker.applyStatusUpdate({
+      channelMessageId: 'wamid.C',
+      channel: 'whatsapp',
+      status: 'failed',
+      timestamp: 2500,
+      errorCode: 131_047
+    });
+    expect(record.errorCategory).toBe('window_closed');
+    expect(record.history[0]?.errorCategory).toBe('window_closed');
+  });
+
+  it('does NOT attach errorCategory to a non-failure status', () => {
+    const tracker = makeTracker();
+    const record = tracker.applyStatusUpdate({
+      channelMessageId: 'wamid.D',
+      channel: 'whatsapp',
+      status: 'sent',
+      timestamp: 3000
+    });
+    expect(record.history[0]).toEqual({ status: 'sent', timestamp: 3000 });
+    expect(record.history[0]).not.toHaveProperty('errorCategory');
+    expect(record.errorCategory).toBeUndefined();
   });
 
   it('failed (top rank) is not masked by a lower-rank status arriving afterward', () => {

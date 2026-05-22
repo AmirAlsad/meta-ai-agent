@@ -506,6 +506,180 @@ describe('Stage 6 observability routes', () => {
     });
   });
 
+  describe('GET /admin/queue (token-gated, no PII)', () => {
+    it('returns 200 with { kind, stats } for a correct token', async () => {
+      const { app } = buildApp();
+      const res = await request(app)
+        .get('/admin/queue')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(200);
+      // The in-memory scheduler reports its kind + a `pending` count (0 here, no
+      // timers armed). No PII — only counts.
+      expect(res.body.kind).toBe('in_memory');
+      expect(res.body.stats).toMatchObject({ pending: 0 });
+    });
+
+    it('reflects pending timers after a flush is scheduled', async () => {
+      const { app, scheduler } = buildApp();
+      await scheduler.schedule('whatsapp:biz:user', 60_000);
+      const res = await request(app)
+        .get('/admin/queue')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(200);
+      expect(res.body.stats.pending).toBe(1);
+      await scheduler.close();
+    });
+
+    it('accepts the x-admin-api-token header form too', async () => {
+      const { app } = buildApp();
+      const res = await request(app).get('/admin/queue').set('x-admin-api-token', ADMIN_TOKEN);
+      expect(res.status).toBe(200);
+    });
+
+    it('returns 401 without a token', async () => {
+      const { app } = buildApp();
+      const res = await request(app).get('/admin/queue');
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: 'unauthorized' });
+    });
+
+    it('returns 401 with the wrong token', async () => {
+      const { app } = buildApp();
+      const res = await request(app)
+        .get('/admin/queue')
+        .set('Authorization', 'Bearer wrong-token-9999999999');
+      expect(res.status).toBe(401);
+    });
+
+    it('returns 500 (does not hang) when getStats rejects', async () => {
+      const { app, scheduler } = buildApp();
+      vi.spyOn(scheduler, 'getStats').mockRejectedValue(new Error('stats boom'));
+      const res = await request(app)
+        .get('/admin/queue')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ error: 'internal_error' });
+    });
+
+    it('is NOT mounted (404) when adminApiToken is unset', async () => {
+      const { app } = buildApp({ adminApiToken: undefined });
+      const res = await request(app)
+        .get('/admin/queue')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: 'not_found' });
+    });
+  });
+
+  describe('GET /admin/dedupe (token-gated, no PII)', () => {
+    it('returns present:false for an id never claimed', async () => {
+      const { app } = buildApp();
+      const res = await request(app)
+        .get('/admin/dedupe')
+        .query({ messageId: 'wamid.NEVER.SEEN' })
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ messageId: 'wamid.NEVER.SEEN', present: false });
+    });
+
+    it('returns present:true with a ttl after the id was claimed', async () => {
+      const { app, store } = buildApp();
+      const claimed = await store.claimInboundHandle('wamid.CLAIMED.1');
+      expect(claimed).toBe(true);
+      const res = await request(app)
+        .get('/admin/dedupe')
+        .query({ messageId: 'wamid.CLAIMED.1' })
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(200);
+      expect(res.body.messageId).toBe('wamid.CLAIMED.1');
+      expect(res.body.present).toBe(true);
+      expect(typeof res.body.ttlSeconds).toBe('number');
+      expect(res.body.ttlSeconds).toBeGreaterThan(0);
+    });
+
+    it('returns 400 when the messageId query param is missing', async () => {
+      const { app } = buildApp();
+      const res = await request(app)
+        .get('/admin/dedupe')
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'messageId query parameter is required' });
+    });
+
+    it('returns 400 when messageId is empty/whitespace', async () => {
+      const { app } = buildApp();
+      const res = await request(app)
+        .get('/admin/dedupe')
+        .query({ messageId: '   ' })
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'messageId query parameter is required' });
+    });
+
+    it('returns 401 without a token (and before the 400 param check)', async () => {
+      const { app } = buildApp();
+      const res = await request(app).get('/admin/dedupe');
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: 'unauthorized' });
+    });
+
+    it('returns 500 (does not hang) when peekInboundHandle rejects', async () => {
+      const { app, store } = buildApp();
+      vi.spyOn(store, 'peekInboundHandle').mockRejectedValue(new Error('peek boom'));
+      const res = await request(app)
+        .get('/admin/dedupe')
+        .query({ messageId: 'wamid.X' })
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ error: 'internal_error' });
+    });
+
+    it('is NOT mounted (404) when adminApiToken is unset', async () => {
+      const { app } = buildApp({ adminApiToken: undefined });
+      const res = await request(app)
+        .get('/admin/dedupe')
+        .query({ messageId: 'wamid.X' })
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      expect(res.status).toBe(404);
+      expect(res.body).toEqual({ error: 'not_found' });
+    });
+  });
+
+  describe('webhook signature-rejection metrics', () => {
+    it('increments webhook_secret_rejections_total{reason:"mismatch"} on a bad signature', async () => {
+      const { app, metricsCollector } = buildApp();
+      const bodyBuf = loadFixtureBuffer('whatsapp/text-inbound.json');
+      const res = await request(app)
+        .post('/webhook')
+        .set('Content-Type', 'application/json')
+        .set('x-hub-signature-256', signBody(bodyBuf, 'wrong-secret'))
+        .send(bodyBuf.toString('utf8'));
+      expect(res.status).toBe(401);
+
+      const snapshot = metricsCollector.snapshot();
+      const rejections = snapshot.metrics.find(m => m.name === 'webhook_secret_rejections_total');
+      expect(rejections).toBeDefined();
+      const mismatch = rejections?.series.find(s => s.labels.reason === 'mismatch');
+      expect((mismatch as { value: number }).value).toBeGreaterThanOrEqual(1);
+    });
+
+    it('increments webhook_secret_rejections_total{reason:"missing_signature"} when no header is sent', async () => {
+      const { app, metricsCollector } = buildApp();
+      const bodyBuf = loadFixtureBuffer('whatsapp/text-inbound.json');
+      const res = await request(app)
+        .post('/webhook')
+        .set('Content-Type', 'application/json')
+        .send(bodyBuf.toString('utf8'));
+      expect(res.status).toBe(401);
+
+      const rejections = metricsCollector
+        .snapshot()
+        .metrics.find(m => m.name === 'webhook_secret_rejections_total');
+      const missing = rejections?.series.find(s => s.labels.reason === 'missing_signature');
+      expect((missing as { value: number }).value).toBeGreaterThanOrEqual(1);
+    });
+  });
+
   describe('trace id propagation', () => {
     it('stamps an x-trace-id header on any response', async () => {
       const { app } = buildApp();

@@ -52,14 +52,58 @@ export interface ChatRequest {
 }
 
 /**
+ * Symbolic selector for an inbound message in the buffered turn.
+ *
+ * An LLM chat endpoint almost never knows the literal channel message id (a
+ * WhatsApp `wamid`, a Messenger `m_*`, an Instagram base64-ish id) verbatim, so
+ * `reply` / `reaction` targets accept this symbolic form instead of (or
+ * alongside) a literal id. {@link resolveTargetRef} in
+ * `src/chat/target-resolver.ts` maps a `TargetRef` against the turn's buffered
+ * inbound {@link IncomingMessage}[] (the natural target — you react/reply to
+ * what the USER said) to a concrete `channelMessageId`.
+ *
+ * Variants:
+ *  - `alias` — positional: `'last'` (most recent inbound), `'first'` (oldest),
+ *    `'previous'` (second-most-recent).
+ *  - `contentIncludes` — substring match against message text; `occurrence`
+ *    (1-based) disambiguates when several messages match. Ambiguous (>1 match,
+ *    no `occurrence`) is a resolve failure.
+ *  - `content` — exact (trim+lowercase) text match.
+ *  - `messageId` — an explicit literal channel message id, escape-hatch form
+ *    (equivalent to passing a bare string, but self-documenting).
+ *
+ * Mirrors the sibling sendblue package's `TargetRef`, adapted to Meta: there is
+ * no `partIndex` (Meta has no message-part splitting) and the literal form uses
+ * `messageId` (a `channelMessageId`) rather than Sendblue's Apple-GUID
+ * `messageHandle`.
+ */
+export type TargetRef =
+  | { alias: 'last' | 'previous' | 'first' }
+  | { contentIncludes: string; occurrence?: number }
+  | { content: string }
+  | { messageId: string };
+
+/**
+ * Reply / reaction target as it arrives on a {@link ChatAction}: EITHER a
+ * literal channel message id (a plain string — the legacy, backward-compatible
+ * form) OR a symbolic {@link TargetRef} the agent resolves against the turn's
+ * inbound messages. A bare string is treated exactly like `{ messageId }`.
+ */
+export type ChatActionTarget = string | TargetRef;
+
+/**
  * One rich action the chat endpoint can ask the agent to perform. Unsupported
  * actions for a channel are skipped by the agent rather than erroring.
+ *
+ * `reaction` / `reply` `targetMessageId` accepts either a literal channel
+ * message id string (backward compatible) or a symbolic {@link TargetRef}; the
+ * delivery queue resolves the latter against the buffered inbound messages.
  */
 export type ChatAction =
   | { type: 'message'; text: string }
   | { type: 'typing'; durationMs?: number }
-  | { type: 'reaction'; emoji: string; targetMessageId: string }
-  | { type: 'reply'; text: string; targetMessageId: string }
+  | { type: 'reaction'; emoji: string; targetMessageId: ChatActionTarget }
+  | { type: 'reply'; text: string; targetMessageId: ChatActionTarget }
   | { type: 'media'; url: string; caption?: string; mimeType?: string; filename?: string }
   | { type: 'template'; name: string; language: string; components?: TemplateComponent[] }
   | { type: 'silence' };

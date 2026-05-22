@@ -12,6 +12,7 @@
  */
 
 import type { Channel, DeliveryStatus } from '../meta/types.js';
+import type { FailureCategory } from '../limits/error-codes.js';
 
 /**
  * One observed status transition for an outbound message.
@@ -19,13 +20,17 @@ import type { Channel, DeliveryStatus } from '../meta/types.js';
  * `history` keeps these in arrival order (append-only), so the admin route can
  * render a full timeline even when Meta delivers events out of order (e.g. a
  * late `sent` after `delivered`) or redelivers them. `errorCode`/`errorTitle`
- * are WhatsApp-only and only populated on a `failed` entry.
+ * are WhatsApp-only and only populated on a `failed` entry. `errorCategory` is
+ * the human-readable bucket the tracker derives from `errorCode` (e.g.
+ * `window_closed`, `recipient`) so the admin surface shows a category, not a
+ * bare int — populated only on a `failed` entry.
  */
 export interface StatusHistoryEntry {
   status: DeliveryStatus;
   timestamp: number;
   errorCode?: number;
   errorTitle?: string;
+  errorCategory?: FailureCategory;
 }
 
 /**
@@ -52,6 +57,13 @@ export interface StatusRecord {
   firstSeenAt: number;
   /** Unix ms of the most recent status applied. */
   lastUpdatedAt: number;
+  /**
+   * The failure bucket of the most recent `failed` status seen, mirrored from
+   * the corresponding history entry so a dashboard can read it off the record
+   * without scanning `history`. Only set once a `failed` status has been
+   * applied (WhatsApp-only); absent otherwise.
+   */
+  errorCategory?: FailureCategory;
 }
 
 /**

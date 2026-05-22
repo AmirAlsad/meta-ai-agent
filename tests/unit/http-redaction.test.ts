@@ -572,6 +572,37 @@ describe('redactStatusRecord', () => {
     expect(out.channelMessageId).toBe('wamid.OUT1');
   });
 
+  it('surfaces errorCategory unmasked (bounded enum, not PII) — top-level and in history', () => {
+    const out = redactStatusRecord(
+      makeStatus({
+        current: 'failed',
+        errorCategory: 'recipient',
+        history: [
+          { status: 'sent', timestamp: 1_700_000_000_000 },
+          {
+            status: 'failed',
+            timestamp: 1_700_000_002_000,
+            errorCode: 131_026,
+            errorTitle: 'Message undeliverable',
+            errorCategory: 'recipient'
+          }
+        ]
+      })
+    ) as Record<string, unknown>;
+    // The bucket is allow-listed verbatim, not dropped by the fail-closed redactor.
+    expect(out.errorCategory).toBe('recipient');
+    expect(out.history).toEqual([
+      { status: 'sent', timestamp: 1_700_000_000_000 },
+      {
+        status: 'failed',
+        timestamp: 1_700_000_002_000,
+        errorCode: 131_026,
+        errorTitle: 'Message undeliverable',
+        errorCategory: 'recipient'
+      }
+    ]);
+  });
+
   it('reveal:true returns the record untouched', () => {
     const rec = makeStatus();
     const revealed = redactStatusRecord(rec, { reveal: true });

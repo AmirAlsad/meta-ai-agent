@@ -193,6 +193,32 @@ export const SCENARIOS_BY_CHANNEL: Record<Channel, readonly CaptureScenario[]> =
   instagram: INSTAGRAM_SCENARIOS
 };
 
+/** Ordered channel list — the iteration order used by `--list` / `--channel=all`. */
+export const ALL_CHANNELS: readonly Channel[] = Object.freeze([
+  'whatsapp',
+  'messenger',
+  'instagram'
+] as const);
+
+/**
+ * Render the scenario inventory for `--list`: one section per channel with its
+ * scenario names. PURE (returns the lines rather than printing) so it is
+ * unit-testable and so the caller decides where the output goes. Exported for
+ * reuse by the showcase harness and tests.
+ */
+export function formatScenarioList(
+  registry: Record<Channel, readonly CaptureScenario[]> = SCENARIOS_BY_CHANNEL
+): string[] {
+  const lines: string[] = ['Available guided-capture scenarios (by channel):'];
+  for (const channel of ALL_CHANNELS) {
+    lines.push(`  ${channel}:`);
+    for (const scenario of registry[channel]) {
+      lines.push(`    - ${scenario.name}`);
+    }
+  }
+  return lines;
+}
+
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Capture wrapper                                                            */
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -234,6 +260,12 @@ export type ChannelOrAll = Channel | 'all';
 
 export interface GuidedCaptureFlags {
   help: boolean;
+  /**
+   * `--list` — print the available scenario ids (grouped by channel) and exit.
+   * Resolved BEFORE `loadConfig()` so it works with no `.env` / credentials,
+   * mirroring the sibling sendblue repo's `--list`.
+   */
+  list: boolean;
   channel: ChannelOrAll | undefined;
   scenarios: string[] | undefined;
   port: number | undefined;
@@ -244,6 +276,7 @@ export interface GuidedCaptureFlags {
 export function parseFlags(argv: readonly string[]): GuidedCaptureFlags {
   const flags: GuidedCaptureFlags = {
     help: false,
+    list: false,
     channel: undefined,
     scenarios: undefined,
     port: undefined,
@@ -253,6 +286,10 @@ export function parseFlags(argv: readonly string[]): GuidedCaptureFlags {
   for (const raw of argv) {
     if (raw === '--help' || raw === '-h') {
       flags.help = true;
+      continue;
+    }
+    if (raw === '--list') {
+      flags.list = true;
       continue;
     }
     if (raw === '--no-webhook-registration') {
@@ -310,6 +347,8 @@ Options:
                                If omitted, you'll be prompted.
   --scenarios=<a,b,c>          Run only these scenarios (by name). Default: all
                                scenarios for the chosen channel.
+  --list                       Print the available scenario ids (grouped by
+                               channel) and exit. Requires no credentials.
   --port=<n>                   Local listener port. Default: config.port (3000).
   --ngrok-domain=<x>           Reserved ngrok subdomain.
   --no-webhook-registration    Skip the Meta webhook subscription POST.
@@ -731,6 +770,13 @@ async function main(): Promise<void> {
 
   if (flags.help) {
     process.stdout.write(`${HELP_TEXT}\n`);
+    return;
+  }
+
+  // `--list` is resolved BEFORE loadConfig so it works with no .env / creds —
+  // it's a pure inventory dump (mirrors the sibling sendblue repo's --list).
+  if (flags.list) {
+    process.stdout.write(`${formatScenarioList().join('\n')}\n`);
     return;
   }
 

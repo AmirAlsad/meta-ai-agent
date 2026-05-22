@@ -470,7 +470,18 @@ export function createApp(deps: AppDeps): express.Express {
     logger.warn({ field: warning.field }, warning.message);
   }
 
-  const verifier = createMetaSignatureVerifier(signatureSecrets, logger);
+  // Stage 10: pass an onReject callback so a signature rejection (which never
+  // reaches the dispatcher's webhook_received_total) is still counted. Only
+  // wired when a metrics handle is present — the metric-less callers (parse+log
+  // tests) leave it undefined and the verifier just skips it. inc() never throws
+  // (and the verifier wraps the callback defensively), so this can't break the
+  // security path.
+  const onSignatureReject = metrics
+    ? (reason: 'missing_signature' | 'mismatch' | 'no_raw_body') => {
+        metrics.webhookSecretRejectionsTotal.inc({ reason });
+      }
+    : undefined;
+  const verifier = createMetaSignatureVerifier(signatureSecrets, logger, onSignatureReject);
   app.post('/webhook', verifier, (req: Request, res: Response) => {
     // ACK before parsing — Meta retries non-2xx for 7 days then drops, so the
     // 200 is load-bearing. The dispatcher parses + logs and (when an agent is
@@ -558,6 +569,81 @@ export function createApp(deps: AppDeps): express.Express {
         return;
       }
       res.json(redactStatusRecord(rec, { reveal: req.query.reveal === 'true' }));
+    });
+  }
+
+  if (config.adminApiToken && scheduler) {
+    const adminToken = config.adminApiToken;
+    const bufferScheduler = scheduler;
+    // GET /admin/queue — buffer scheduler stats ({ kind, stats }). No PII (the
+    // scheduler reports only counts: delayed/pending jobs), so NO redactor and no
+    // ?reveal handling. getStats() is timeout-RACED (like the /ready scheduler
+    // check) so a wedged scheduler — e.g. a hung BullMQ getJobCounts against a
+    // stalled Redis — can't hang the admin route; on timeout/throw we 500 rather
+    // than leave the client hanging. Reuses readyRedisTimeoutMs as the bound
+    // (same "a backing-store probe must not hang the HTTP request" concern).
+    app.get('/admin/queue', (req: Request, res: Response) => {
+      if (!validateAdminToken(req, adminToken)) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
+      const timeoutMs = config.persistence.readyRedisTimeoutMs;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`scheduler getStats timed out after ${timeoutMs}ms`)),
+          timeoutMs
+        );
+      });
+      const statsPromise = bufferScheduler.getStats
+        ? bufferScheduler.getStats()
+        : Promise.resolve(undefined);
+      void Promise.race([statsPromise, timeout])
+        .then(stats => {
+          res.json({ kind: bufferScheduler.kind, ...(stats !== undefined ? { stats } : {}) });
+        })
+        .catch((err: unknown) => {
+          logger.error({ err, method: req.method, path: req.path }, 'admin queue route error');
+          if (!res.headersSent) res.status(500).json({ error: 'internal_error' });
+        })
+        .finally(() => {
+          if (timer) clearTimeout(timer);
+        });
+    });
+  }
+
+  if (config.adminApiToken && store) {
+    const adminToken = config.adminApiToken;
+    const conversationStore = store;
+    // GET /admin/dedupe?messageId=<id> — non-destructive peek of the inbound
+    // dedupe set: answers "did Meta's 7-day redelivery of this id get deduped?".
+    // Returns { messageId, present, ttlSeconds }. NO PII (a boolean + remaining
+    // ttl), so no redactor / no ?reveal. The `messageId` query param is REQUIRED
+    // — a missing/empty one is a 400, not a silent false (so a typo'd probe is an
+    // obvious error rather than a misleading "not present").
+    app.get('/admin/dedupe', (req: Request, res: Response) => {
+      if (!validateAdminToken(req, adminToken)) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
+      const raw = req.query.messageId;
+      const messageId = typeof raw === 'string' ? raw.trim() : '';
+      if (messageId === '') {
+        res.status(400).json({ error: 'messageId query parameter is required' });
+        return;
+      }
+      // Floating promise needs its own .catch(): a rejection (e.g. a Redis store
+      // throw) would otherwise be swallowed by `void` and leave the client
+      // hanging with no response (mirrors /admin/conversations).
+      void conversationStore
+        .peekInboundHandle(messageId)
+        .then(result => {
+          res.json({ messageId, present: result.present, ttlSeconds: result.ttlSeconds });
+        })
+        .catch((err: unknown) => {
+          logger.error({ err, method: req.method, path: req.path }, 'admin dedupe route error');
+          if (!res.headersSent) res.status(500).json({ error: 'internal_error' });
+        });
     });
   }
 

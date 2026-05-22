@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ChatAction } from '../../src/chat/types.js';
 import type { ChannelFeature } from '../../src/meta/shared/adapter.js';
+import type { IncomingMessage } from '../../src/meta/types.js';
 import type { OutboundItem, QueueState } from '../../src/delivery/types.js';
 import {
   advanceCursor,
@@ -183,6 +184,157 @@ describe('buildOutboundItems', () => {
     expect(items).toEqual([]);
     expect(skipped).toEqual([
       { kind: 'typing', reason: 'typing_indicator unsupported on this channel' }
+    ]);
+  });
+});
+
+/** A three-message inbound turn (oldest → newest) for the TargetRef cases. */
+function inboundMsg(id: string, text?: string): IncomingMessage {
+  return {
+    channel: 'whatsapp',
+    channelMessageId: id,
+    channelScopedUserId: 'u1',
+    channelScopedBusinessId: 'b1',
+    timestamp: 0,
+    type: 'text',
+    ...(text !== undefined ? { text } : {}),
+    raw: {}
+  };
+}
+
+const INBOUND: IncomingMessage[] = [
+  inboundMsg('wamid.1', 'order coffee'),
+  inboundMsg('wamid.2', 'and a muffin'),
+  inboundMsg('wamid.3', 'thanks')
+];
+
+describe('buildOutboundItems — symbolic TargetRef resolution', () => {
+  it('a literal-string target passes through unchanged (no inboundMessages needed)', () => {
+    // Backward compatibility: the existing two-arg shape still works and a bare
+    // string id is emitted verbatim.
+    const { items, skipped } = buildOutboundItems(
+      [{ type: 'reaction', emoji: '👍', targetMessageId: 'wamid.literal' }],
+      supportsAll
+    );
+    expect(skipped).toEqual([]);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: 'reaction',
+      emoji: '👍',
+      targetMessageId: 'wamid.literal'
+    });
+  });
+
+  it('resolves a reaction alias:last to the most recent inbound id', () => {
+    const { items, skipped } = buildOutboundItems(
+      [{ type: 'reaction', emoji: '🔥', targetMessageId: { alias: 'last' } }],
+      supportsAll,
+      { inboundMessages: INBOUND }
+    );
+    expect(skipped).toEqual([]);
+    expect(items[0]).toMatchObject({ kind: 'reaction', targetMessageId: 'wamid.3' });
+  });
+
+  it('resolves a reply alias:first to the oldest inbound id', () => {
+    const { items, skipped } = buildOutboundItems(
+      [{ type: 'reply', text: 'about that', targetMessageId: { alias: 'first' } }],
+      supportsAll,
+      { inboundMessages: INBOUND }
+    );
+    expect(skipped).toEqual([]);
+    expect(items[0]).toMatchObject({
+      kind: 'reply',
+      text: 'about that',
+      targetMessageId: 'wamid.1'
+    });
+  });
+
+  it('resolves a contentIncludes target', () => {
+    const { items } = buildOutboundItems(
+      [{ type: 'reply', text: 'sure', targetMessageId: { contentIncludes: 'muffin' } }],
+      supportsAll,
+      { inboundMessages: INBOUND }
+    );
+    expect(items[0]).toMatchObject({ kind: 'reply', targetMessageId: 'wamid.2' });
+  });
+
+  it('reaction with an UNRESOLVED target → no item, skip note with the reason', () => {
+    const { items, skipped } = buildOutboundItems(
+      [{ type: 'reaction', emoji: '👍', targetMessageId: { contentIncludes: 'nope' } }],
+      supportsAll,
+      { inboundMessages: INBOUND }
+    );
+    expect(items).toEqual([]);
+    expect(skipped).toEqual([{ kind: 'reaction', reason: 'target unresolved: not_found' }]);
+  });
+
+  it('reaction with an AMBIGUOUS target → skip note carries the ambiguous reason', () => {
+    const ambiguous = [inboundMsg('wamid.a', 'order coffee'), inboundMsg('wamid.b', 'order tea')];
+    const { items, skipped } = buildOutboundItems(
+      [{ type: 'reaction', emoji: '👍', targetMessageId: { contentIncludes: 'order' } }],
+      supportsAll,
+      { inboundMessages: ambiguous }
+    );
+    expect(items).toEqual([]);
+    expect(skipped).toEqual([{ kind: 'reaction', reason: 'target unresolved: ambiguous' }]);
+  });
+
+  it('reply with an UNRESOLVED target → DOWNGRADE to a plain message + skip note', () => {
+    const { items, skipped } = buildOutboundItems(
+      [{ type: 'reply', text: 'still deliver me', targetMessageId: { contentIncludes: 'nope' } }],
+      supportsAll,
+      { inboundMessages: INBOUND }
+    );
+    // The text still reaches the user as a plain message.
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: 'message', text: 'still deliver me' });
+    expect(items[0].targetMessageId).toBeUndefined();
+    expect(skipped).toEqual([
+      { kind: 'reply', reason: 'target unresolved: not_found; downgraded to message' }
+    ]);
+  });
+
+  it('a symbolic target with NO inboundMessages provided fails to resolve (downgrade/skip)', () => {
+    // Two-arg-style call but with a symbolic target: history defaults to [], so
+    // an alias that needs history is not_found.
+    const reply = buildOutboundItems(
+      [{ type: 'reply', text: 'hi', targetMessageId: { alias: 'last' } }],
+      supportsAll
+    );
+    expect(reply.items[0]).toMatchObject({ kind: 'message', text: 'hi' });
+    expect(reply.skipped[0].reason).toContain('target unresolved: not_found');
+
+    const reaction = buildOutboundItems(
+      [{ type: 'reaction', emoji: '👍', targetMessageId: { alias: 'last' } }],
+      supportsAll
+    );
+    expect(reaction.items).toEqual([]);
+    expect(reaction.skipped).toEqual([{ kind: 'reaction', reason: 'target unresolved: not_found' }]);
+  });
+
+  it('reaction-unsupported wins over target resolution (unsupported note, not unresolved)', () => {
+    // The channel-capability check short-circuits before resolution, so an
+    // unsupported reaction is reported as such regardless of the target.
+    const { items, skipped } = buildOutboundItems(
+      [{ type: 'reaction', emoji: '👍', targetMessageId: { alias: 'last' } }],
+      supportsNoRich,
+      { inboundMessages: INBOUND }
+    );
+    expect(items).toEqual([]);
+    expect(skipped).toEqual([{ kind: 'reaction', reason: 'reaction unsupported on this channel' }]);
+  });
+
+  it('reply on a channel WITHOUT reply_to but WITH a resolvable target → downgrade-to-message', () => {
+    // The target resolves fine, but the channel can't thread — same downgrade
+    // as the original reply_to-unsupported path.
+    const { items, skipped } = buildOutboundItems(
+      [{ type: 'reply', text: 'hello', targetMessageId: { alias: 'last' } }],
+      supportsNoRich,
+      { inboundMessages: INBOUND }
+    );
+    expect(items[0]).toMatchObject({ kind: 'message', text: 'hello' });
+    expect(skipped).toEqual([
+      { kind: 'reply', reason: 'reply_to unsupported; downgraded to message' }
     ]);
   });
 });

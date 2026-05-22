@@ -430,6 +430,12 @@ describe('loadConfig: limits section (Stage 10)', () => {
       whatsappPerSecond: 80,
       messengerPerSecond: 40,
       instagramPerSecond: 10,
+      whatsappPerHour: 1000,
+      whatsappPerDay: 10000,
+      messengerPerHour: 0,
+      messengerPerDay: 0,
+      instagramPerHour: 0,
+      instagramPerDay: 0,
       transientRetryMaxAttempts: 3,
       transientRetryBaseMs: 1000,
       transientRetryMaxMs: 60000
@@ -443,6 +449,12 @@ describe('loadConfig: limits section (Stage 10)', () => {
       whatsappPerSecond: 80,
       messengerPerSecond: 40,
       instagramPerSecond: 10,
+      whatsappPerHour: 1000,
+      whatsappPerDay: 10000,
+      messengerPerHour: 0,
+      messengerPerDay: 0,
+      instagramPerHour: 0,
+      instagramPerDay: 0,
       transientRetryMaxAttempts: 3,
       transientRetryBaseMs: 1000,
       transientRetryMaxMs: 60000
@@ -516,6 +528,72 @@ describe('loadConfig: limits section (Stage 10)', () => {
       expect(() =>
         loadConfig(baseEnv({ TRANSIENT_RETRY_BASE_MS: '9000', TRANSIENT_RETRY_MAX_MS: '3000' }))
       ).toThrow(/TRANSIENT_RETRY_BASE_MS.*greater than TRANSIENT_RETRY_MAX_MS/);
+    });
+  });
+
+  // Track-only per-hour / per-day counters (NON-negative integers; 0 disables).
+  for (const { env, field } of [
+    { env: 'WHATSAPP_RATE_LIMIT_PER_HOUR', field: 'whatsappPerHour' },
+    { env: 'MESSENGER_RATE_LIMIT_PER_HOUR', field: 'messengerPerHour' },
+    { env: 'INSTAGRAM_RATE_LIMIT_PER_HOUR', field: 'instagramPerHour' },
+    { env: 'WHATSAPP_RATE_LIMIT_PER_DAY', field: 'whatsappPerDay' },
+    { env: 'MESSENGER_RATE_LIMIT_PER_DAY', field: 'messengerPerDay' },
+    { env: 'INSTAGRAM_RATE_LIMIT_PER_DAY', field: 'instagramPerDay' }
+  ] as const) {
+    describe(env, () => {
+      it('honors a valid integer override', () => {
+        // Pin the companion var high so the per-hour<=per-day check never trips.
+        const extra =
+          field.endsWith('PerHour')
+            ? { [`${env.replace('PER_HOUR', 'PER_DAY')}`]: '9999999' }
+            : {};
+        expect(loadConfig(baseEnv({ ...extra, [env]: '500000' })).limits[field]).toBe(500000);
+      });
+
+      it('accepts 0 (disables that window)', () => {
+        expect(loadConfig(baseEnv({ [env]: '0' })).limits[field]).toBe(0);
+      });
+
+      it('throws (naming the var) on a negative value', () => {
+        expect(() => loadConfig(baseEnv({ [env]: '-1' }))).toThrow(new RegExp(`Invalid ${env}`));
+      });
+
+      it('throws (naming the var) on a non-integer value', () => {
+        expect(() => loadConfig(baseEnv({ [env]: '12.5' }))).toThrow(new RegExp(`Invalid ${env}`));
+      });
+    });
+  }
+
+  describe('per-hour <= per-day cross-check', () => {
+    it('accepts per-hour equal to per-day', () => {
+      const config = loadConfig(
+        baseEnv({ WHATSAPP_RATE_LIMIT_PER_HOUR: '500', WHATSAPP_RATE_LIMIT_PER_DAY: '500' })
+      );
+      expect(config.limits.whatsappPerHour).toBe(500);
+      expect(config.limits.whatsappPerDay).toBe(500);
+    });
+
+    it('throws (naming both vars) when per-hour > per-day', () => {
+      expect(() =>
+        loadConfig(baseEnv({ WHATSAPP_RATE_LIMIT_PER_HOUR: '5000', WHATSAPP_RATE_LIMIT_PER_DAY: '1000' }))
+      ).toThrow(/WHATSAPP_RATE_LIMIT_PER_HOUR.*greater than WHATSAPP_RATE_LIMIT_PER_DAY/);
+    });
+
+    it('does NOT enforce the check when per-day is 0 (disabled)', () => {
+      // hour > 0, day = 0 means "day window disabled" — not a misconfiguration.
+      const config = loadConfig(
+        baseEnv({ MESSENGER_RATE_LIMIT_PER_HOUR: '5000', MESSENGER_RATE_LIMIT_PER_DAY: '0' })
+      );
+      expect(config.limits.messengerPerHour).toBe(5000);
+      expect(config.limits.messengerPerDay).toBe(0);
+    });
+
+    it('does NOT enforce the check when per-hour is 0 (disabled)', () => {
+      const config = loadConfig(
+        baseEnv({ INSTAGRAM_RATE_LIMIT_PER_HOUR: '0', INSTAGRAM_RATE_LIMIT_PER_DAY: '1000' })
+      );
+      expect(config.limits.instagramPerHour).toBe(0);
+      expect(config.limits.instagramPerDay).toBe(1000);
     });
   });
 });

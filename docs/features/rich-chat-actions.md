@@ -7,8 +7,12 @@ inbound turn to `CHAT_ENDPOINT_URL`; the endpoint replies with either the legacy
 collapses every shape into one ordered `ChatAction[]`, which the delivery layer
 turns into outbound items.
 
-Source: [`src/chat/types.ts`](../../src/chat/types.ts) (shapes),
-[`src/chat/contract.ts`](../../src/chat/contract.ts) (`normalizeChatResponse`),
+Source: [`src/chat/types.ts`](../../src/chat/types.ts) (shapes, incl. `TargetRef` /
+`ChatActionTarget`),
+[`src/chat/contract.ts`](../../src/chat/contract.ts) (`normalizeChatResponse` + the
+field-aliasing in `validateAction`),
+[`src/chat/target-resolver.ts`](../../src/chat/target-resolver.ts)
+(`resolveTargetRef`),
 [`src/chat/client.ts`](../../src/chat/client.ts) (the HTTP client),
 [`src/chat/errors.ts`](../../src/chat/errors.ts) (`ChatEndpointError`), and
 `buildOutboundItems` in [`src/delivery/queue.ts`](../../src/delivery/queue.ts).
@@ -83,12 +87,16 @@ optional and supports four overlapping forms:
 | Type | Shape | Semantics |
 | --- | --- | --- |
 | `message` | `{ type: 'message', text }` | Send a plain text message. |
-| `reply` | `{ type: 'reply', text, targetMessageId }` | Send `text` threaded as a reply to `targetMessageId`. |
-| `reaction` | `{ type: 'reaction', emoji, targetMessageId }` | React to `targetMessageId` with `emoji`. |
+| `reply` | `{ type: 'reply', text, targetMessageId }` | Send `text` threaded as a reply to `targetMessageId` (a literal id OR a symbolic `TargetRef` — see [Symbolic reply/reaction targets](#symbolic-replyreaction-targets)). |
+| `reaction` | `{ type: 'reaction', emoji, targetMessageId }` | React to `targetMessageId` with `emoji` (literal id OR `TargetRef`). |
 | `typing` | `{ type: 'typing', durationMs? }` | Show a typing indicator. |
-| `media` | `{ type: 'media', url, caption?, mimeType? }` | Send media at `url` (all three channels — see [Media send](./media.md)). |
+| `media` | `{ type: 'media', url, caption?, mimeType?, filename? }` | Send media at `url` (all three channels — see [Media send](./media.md)). |
 | `template` | `{ type: 'template', name, language, components? }` | Send a WhatsApp template. WhatsApp-only. |
 | `silence` | `{ type: 'silence' }` | A no-op signal — produces no outbound. |
+
+`targetMessageId` on `reply` / `reaction` is typed `ChatActionTarget` =
+`string | TargetRef`: either a literal channel message id (the backward-compatible
+form) or a symbolic selector resolved against the turn's buffered inbound messages.
 
 ### Example `actions[]` response
 
@@ -143,6 +151,56 @@ When validating an `actions[]` array, each entry is checked against the union:
 Warnings are non-fatal `ChatContractWarning`s. The HTTP client logs them at
 `warn` but still returns the normalized actions.
 
+### Defensive field aliasing
+
+An LLM endpoint emits inconsistent JSON, so `validateAction` reads fields through a
+permissive aliasing layer (`readAliasedString` / `readTarget`) that tolerates the
+common drift before validating. It is permissive about INPUT spelling but always
+emits the canonical `ChatAction` shape — downstream code never sees an alias:
+
+| Canonical field | Accepted aliases |
+| --- | --- |
+| `text` (message / reply) | `content` |
+| `url` (media) | `media_url` |
+| `mimeType` (media) | `mime_type` |
+| `targetMessageId` (reply / reaction) | `target_message_id` |
+
+A `reaction` `emoji` of `""` is preserved verbatim (the documented "unreact"
+signal). An unknown action **type** still produces an `invalid-action` warning
+(never a throw). The sibling sendblue package's reaction emoji-synonym coercion
+(heart→love etc.) was **deliberately NOT ported** — it is iMessage-Tapback-specific
+and has no Meta meaning.
+
+## Symbolic reply/reaction targets
+
+An LLM chat endpoint almost never knows the literal channel message id (a WhatsApp
+`wamid`, a Messenger `m_*`, an Instagram base64-ish id) verbatim, so `reply` /
+`reaction` accept a symbolic `TargetRef` instead of (or alongside) a literal id.
+`resolveTargetRef` ([`src/chat/target-resolver.ts`](../../src/chat/target-resolver.ts))
+maps it against the turn's buffered inbound `IncomingMessage[]` (the natural target —
+you react/reply to what the **user** said, oldest→newest) inside
+`buildOutboundItems`:
+
+| `TargetRef` variant | Resolves to |
+| --- | --- |
+| `{ alias: 'last' }` | the most recent inbound (also the **default** when no target is given) |
+| `{ alias: 'first' }` | the oldest inbound |
+| `{ alias: 'previous' }` | the second-most-recent inbound (needs ≥2 messages, else `not_found`) |
+| `{ contentIncludes, occurrence? }` | substring match; `occurrence` (1-based) disambiguates >1 match; ambiguous (>1 match, no `occurrence`) is `not_found`/`ambiguous` |
+| `{ content }` | exact (trim+lowercase) text match (first match wins) |
+| `{ messageId }` | an explicit literal id — the escape-hatch form, equivalent to a bare string |
+
+A bare string and `{ messageId }` pass through **without** consulting history (the
+endpoint may legitimately know an id from a prior turn the buffer no longer holds;
+the adapter is the authority on whether an id is sendable). Symbolic forms require
+non-empty history.
+
+On a resolution failure the behaviour matches the unsupported-feature handling: an
+**unresolvable reaction is skipped** (with a note), while an **unresolvable reply is
+downgraded to a plain message** (the text still matters to the user even when the
+threading target can't be found). When `targetMessageId` is absent entirely it
+defaults to `{ alias: 'last' }`.
+
 ## The HTTP client
 
 `HttpChatClient.complete(request, signal?)`
@@ -172,8 +230,8 @@ a `skipped` list (for logging), not thrown:
 | Action | If supported | If unsupported |
 | --- | --- | --- |
 | `message` | → `message` item | always supported |
-| `reply` | → `reply` item (`reply_to`) | **downgraded** to a plain `message` item (text still delivered; threading lost), recorded in `skipped` |
-| `reaction` | → `reaction` item | skipped with a reason |
+| `reply` | → `reply` item (`reply_to`) — `targetMessageId` resolved via `resolveTargetRef` | **downgraded** to a plain `message` item (text still delivered; threading lost) when the channel lacks `reply_to` OR the target is unresolvable, recorded in `skipped` |
+| `reaction` | → `reaction` item — `targetMessageId` resolved via `resolveTargetRef` | skipped with a reason (unsupported channel OR unresolvable target) |
 | `typing` | → `typing` item | skipped (best-effort; no content lost) |
 | `media` | → `media` item (`media_send`; the agent infers the kind from `mimeType` and routes via `sendMedia` — see [Media send](./media.md)) | skipped — only on a channel without `media_send` (all three support it since **Stage 7**) |
 | `template` | → `template` item (`template`) | skipped — only WhatsApp `supports('template')` |
@@ -201,6 +259,11 @@ warning logging. `buildOutboundItems` capability gating lives in
 
 ## Known limitations
 
-- `context.windowOpen` is reported but not enforced (Stage 10).
+- `context.windowOpen` is now enforced for WhatsApp via the closed-window template
+  re-prompt (`context.requiresTemplate`); Messenger/Instagram have no out-of-window
+  mechanism to enforce. See [Rate limiting](./rate-limiting.md).
+- Symbolic targets resolve against the **buffered inbound turn only** — a `TargetRef`
+  pointing at a message from a prior turn (no longer in the buffer) won't resolve;
+  the endpoint must use a literal id for those.
 
 See [Known gaps](../KNOWN-GAPS.md) and [Architecture](../ARCHITECTURE.md).

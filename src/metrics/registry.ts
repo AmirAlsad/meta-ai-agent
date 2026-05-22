@@ -7,9 +7,9 @@ import { DEFAULT_LATENCY_BUCKETS_SECONDS } from './collector.js';
  * the specific handle they need from this registry; the registry shape is the
  * source of truth for label cardinality and bucket boundaries.
  *
- * Scope: Stage 6 (transport + observability). SMS-style send-limit metrics
- * (acquire-slot pacing, limit-threshold crossings, limit stalls) belong to
- * Stage 10 and are intentionally NOT registered here.
+ * Scope: Stage 6 (transport + observability). Stage 10 added the send-limit /
+ * hardening metrics below (`transient_retry_total`,
+ * `acquire_send_slot_delay_seconds`, `webhook_secret_rejections_total`).
  */
 export type AgentMetrics = {
   webhookReceived: Counter;
@@ -25,6 +25,26 @@ export type AgentMetrics = {
   bufferFlushTotal: Counter;
   agentUp: Gauge;
   agentBuildInfo: Gauge;
+  /**
+   * Stage 10: transient-retry outcomes for a failed outbound send. `outcome` is
+   * `scheduled` (a retry was armed with backoff) or `exhausted` (the retry
+   * budget ran out and the item was skipped). EMITTED by the conversation agent's
+   * transient-retry path; registered here so the handle exists for it to pull.
+   */
+  transientRetryTotal: Counter;
+  /**
+   * Stage 10: wall-clock seconds a send waited at the per-channel pacing slot
+   * (`LimitTracker.acquireSendSlot`). 0 == the slot was free. EMITTED by the
+   * agent's `sendNext` pacing path; registered here.
+   */
+  acquireSendSlotDelaySeconds: Histogram;
+  /**
+   * Stage 10: inbound webhooks REJECTED at the signature-verification boundary,
+   * by `reason`. EMITTED here from the signature verifier callback (the only
+   * `AgentMetrics` handle whose emit lives outside the agent) — it counts the
+   * requests that never reach the dispatcher's `webhook_received_total`.
+   */
+  webhookSecretRejectionsTotal: Counter;
 };
 
 /**
@@ -131,6 +151,19 @@ export function createAgentMetrics(collector: MetricsCollector): AgentMetrics {
     agentBuildInfo: collector.gauge('agent_build_info', {
       help: 'Build/version metadata. Always 1; the version is encoded in the label.',
       labels: ['version']
+    }),
+    transientRetryTotal: collector.counter('transient_retry_total', {
+      help: 'Transient-retry outcomes for failed outbound sends (scheduled vs exhausted).',
+      labels: ['channel', 'outcome']
+    }),
+    acquireSendSlotDelaySeconds: collector.histogram('acquire_send_slot_delay_seconds', {
+      help: 'Wall-clock seconds a send waited at the per-channel pacing slot.',
+      labels: ['channel'],
+      buckets: DEFAULT_LATENCY_BUCKETS_SECONDS
+    }),
+    webhookSecretRejectionsTotal: collector.counter('webhook_secret_rejections_total', {
+      help: 'Inbound webhooks rejected at signature verification, by reason.',
+      labels: ['reason']
     })
   };
 }
