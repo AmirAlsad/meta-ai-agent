@@ -43,6 +43,13 @@ import type {
 /** Host serving the Instagram-Login messaging endpoints. */
 const INSTAGRAM_GRAPH_HOST = 'graph.instagram.com' as const;
 
+/** Narrow a Graph list response (`{ data: [...] }`) to its data array. */
+function readDataArray(raw: unknown): unknown[] {
+  if (typeof raw !== 'object' || raw === null) return [];
+  const data = (raw as Record<string, unknown>).data;
+  return Array.isArray(data) ? data : [];
+}
+
 /**
  * Default minimum spacing between two outbound Graph calls for one IG account.
  *
@@ -177,6 +184,112 @@ export class InstagramClient implements ChannelAdapter {
     // The reply is keyed to the comment, not a user id — surface the comment id
     // as the SendResult.recipientId so callers have a stable correlation key.
     return this.toSendResult(commentId, raw);
+  }
+
+  /* ── Comment surface (CommentCapableClient) ─────────────────────────── */
+
+  /**
+   * Public reply under a comment on the account's own media:
+   * `POST /{comment-id}/replies` with `{ message }` on `graph.instagram.com`
+   * (live-verified August 2026 against a stranger's comment). The created
+   * reply id comes back as `id`. Requires
+   * `instagram_business_manage_comments` on the token.
+   *
+   * Paced through the same per-account pacer as every other IG Graph call —
+   * comment endpoints sit under the general Conversations rate ceiling
+   * (~2/sec), not the messaging Send-API ceiling.
+   */
+  async replyToComment(commentId: string, text: string): Promise<{ id?: string }> {
+    await this.pace();
+    const raw = await this.graph.request({
+      method: 'POST',
+      host: INSTAGRAM_GRAPH_HOST,
+      path: `${commentId}/replies`,
+      body: { message: text },
+      accessToken: this.config.accessToken,
+      operation: 'instagram.replyToComment'
+    });
+    const record = raw as Record<string, unknown> | null;
+    const id = record && typeof record.id === 'string' ? record.id : undefined;
+    return id !== undefined ? { id } : {};
+  }
+
+  /**
+   * {@link CommentCapableClient.sendCommentPrivateReply} — delegates to
+   * {@link InstagramClient.sendPrivateReply} (which predates the comment
+   * pipeline; same call, uniform name across channels).
+   */
+  async sendCommentPrivateReply(commentId: string, text: string): Promise<unknown> {
+    return this.sendPrivateReply(commentId, text);
+  }
+
+  // NOTE: there is deliberately NO likeComment here — Instagram has no
+  // comment-like endpoint at all (verified against the live API August
+  // 2026). The absence is how `supportsCommentCapability('like')` resolves
+  // to false for IG; on this platform the levers are a public reply, a
+  // private reply, or nothing.
+
+  /** Delete a comment on the account's own media: `DELETE /{comment-id}`. */
+  async deleteComment(commentId: string): Promise<void> {
+    await this.pace();
+    await this.graph.request({
+      method: 'DELETE',
+      host: INSTAGRAM_GRAPH_HOST,
+      path: commentId,
+      accessToken: this.config.accessToken,
+      operation: 'instagram.deleteComment'
+    });
+  }
+
+  /**
+   * Recently published media for the account, newest first:
+   * `GET /{ig-user-id}/media`. Used by the comment POLLER — Instagram comment
+   * WEBHOOKS are Advanced-Access-gated, so at Standard Access new comments
+   * are discovered by polling recent media. Paced like every other call.
+   */
+  async listRecentMedia(limit = 10): Promise<Array<{ id: string; timestamp?: string }>> {
+    await this.pace();
+    const raw = await this.graph.request({
+      method: 'GET',
+      host: INSTAGRAM_GRAPH_HOST,
+      path: `${this.config.userId}/media`,
+      query: { fields: 'id,timestamp', limit },
+      accessToken: this.config.accessToken,
+      operation: 'instagram.listRecentMedia'
+    });
+    return readDataArray(raw).flatMap(item => {
+      if (typeof item !== 'object' || item === null) return [];
+      const record = item as Record<string, unknown>;
+      if (typeof record.id !== 'string') return [];
+      return [
+        {
+          id: record.id,
+          ...(typeof record.timestamp === 'string' ? { timestamp: record.timestamp } : {})
+        }
+      ];
+    });
+  }
+
+  /**
+   * Comments on one media object: `GET /{media-id}/comments`. Returns the raw
+   * comment records (id/text/from/username/timestamp/parent_id when present) —
+   * the poller normalizes them into IncomingComments. Identity note: unlike
+   * Facebook's read path, IG polling returns commenter identity freely at
+   * Standard Access (measured August 2026).
+   */
+  async listMediaComments(mediaId: string, limit = 50): Promise<Array<Record<string, unknown>>> {
+    await this.pace();
+    const raw = await this.graph.request({
+      method: 'GET',
+      host: INSTAGRAM_GRAPH_HOST,
+      path: `${mediaId}/comments`,
+      query: { fields: 'id,text,username,from,timestamp,parent_id', limit },
+      accessToken: this.config.accessToken,
+      operation: 'instagram.listMediaComments'
+    });
+    return readDataArray(raw).filter(
+      (item): item is Record<string, unknown> => typeof item === 'object' && item !== null
+    );
   }
 
   /**

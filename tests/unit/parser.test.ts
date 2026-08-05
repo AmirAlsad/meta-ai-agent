@@ -744,23 +744,26 @@ describe('parseMessengerWebhook', () => {
   });
 
   it('returns empty for non-object payloads without throwing', () => {
-    expect(parseMessengerWebhook(null)).toEqual({ messages: [], statuses: [] });
-    expect(parseMessengerWebhook(42)).toEqual({ messages: [], statuses: [] });
-    expect(parseMessengerWebhook('nope')).toEqual({ messages: [], statuses: [] });
+    const empty = { messages: [], statuses: [], comments: [] };
+    expect(parseMessengerWebhook(null)).toEqual(empty);
+    expect(parseMessengerWebhook(42)).toEqual(empty);
+    expect(parseMessengerWebhook('nope')).toEqual(empty);
   });
 
   it('returns empty when entry is missing or wrong-shaped', () => {
     expect(parseMessengerWebhook({ object: 'page' })).toEqual({
       messages: [],
-      statuses: []
+      statuses: [],
+      comments: []
     });
     expect(parseMessengerWebhook({ object: 'page', entry: 'no' })).toEqual({
       messages: [],
-      statuses: []
+      statuses: [],
+      comments: []
     });
     expect(
       parseMessengerWebhook({ object: 'page', entry: [{ id: 'x' }] })
-    ).toEqual({ messages: [], statuses: [] });
+    ).toEqual({ messages: [], statuses: [], comments: [] });
   });
 
   it('surfaces unknown messaging-event types as MessageType=unknown with a synthetic id', () => {

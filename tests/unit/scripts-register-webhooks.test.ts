@@ -125,7 +125,11 @@ describe('SUBSCRIBED_FIELDS', () => {
       'messaging_optins',
       'messaging_referrals',
       'message_reactions',
-      'message_echoes'
+      'message_echoes',
+      // Comment pipeline (feed carries Page comments among other events) +
+      // machine-readable policy-enforcement notices.
+      'feed',
+      'messaging_policy_enforcement'
     ]);
   });
 
@@ -142,7 +146,11 @@ describe('SUBSCRIBED_FIELDS', () => {
       'messaging_postbacks',
       'messaging_seen',
       'message_reactions',
-      'messaging_referral'
+      'messaging_referral',
+      // Accepted at Standard Access; DELIVERY is Advanced-gated (the poller
+      // covers the gap) — subscribed so Advanced Access lights up without a
+      // re-run.
+      'comments'
     ]);
     expect(SUBSCRIBED_FIELDS.instagram).not.toContain('message_echoes');
   });

@@ -30,6 +30,7 @@
     "setup:oauth:messenger": "node --import tsx scripts/setup/oauth-messenger.ts",
     "setup:profile": "node --import tsx scripts/setup/configure-profile.ts",
     "meta:webhooks": "node --import tsx scripts/setup/register-webhooks.ts",
+    "tokens:refresh:instagram": "node --import tsx scripts/setup/refresh-instagram-tokens.ts",
     "probe:outbound": "node --import tsx scripts/setup/probe-outbound.ts",
     "capture:fixtures": "node --import tsx scripts/capture/fixture-capture.ts",
     "capture:guided": "node --import tsx scripts/capture/guided-capture.ts"

@@ -80,7 +80,20 @@ export const SUBSCRIBED_FIELDS = {
     'messaging_optins',
     'messaging_referrals',
     'message_reactions',
-    'message_echoes'
+    'message_echoes',
+    // Comment pipeline: FB Page comments arrive on the `feed` field (there is
+    // no narrower comments-only field on the page object — `feed` also fires
+    // for likes, shares, publishes, and edits; the parser filters to
+    // `item: 'comment'`). MUST live in this list, not in a one-off Graph
+    // call: the per-page `subscribed_apps` POST REPLACES the field set, so a
+    // manually-added field is clobbered on every re-run (measured twice,
+    // August 2026).
+    'feed',
+    // Policy-enforcement notices (warnings, feature blocks, unblocks) for the
+    // Page's messaging. Enforcement otherwise arrives ONLY as an email with a
+    // 7-day response clock — this field is the machine-readable copy, and the
+    // dispatcher surfaces it at error level so alerting can key on it.
+    'messaging_policy_enforcement'
   ]),
   // Instagram Business messaging fields. `messaging_seen` is IG's name for
   // the read-receipt event (Messenger calls the equivalent `message_reads`).
@@ -100,7 +113,14 @@ export const SUBSCRIBED_FIELDS = {
     'messaging_postbacks',
     'messaging_seen',
     'message_reactions',
-    'messaging_referral'
+    'messaging_referral',
+    // Comment pipeline: the subscription is accepted at Standard Access but
+    // DELIVERY is Advanced-Access-gated (measured August 2026 — the one IG
+    // surface that stayed gated). Subscribed anyway: it costs nothing, the
+    // parser handles the envelope, and an app that later gains Advanced
+    // Access starts receiving without a re-run. Until then the IG comment
+    // POLLER (src/comments/ig-poller.ts) is the delivery path.
+    'comments'
   ])
 } as const satisfies Record<'whatsapp' | 'messenger' | 'instagram', readonly string[]>;
 

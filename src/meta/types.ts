@@ -576,10 +576,17 @@ export interface StatusUpdate {
 }
 
 /**
- * Return value from every per-channel parser. Holds both the inbound
- * messages and the status updates extracted from a single webhook delivery.
+ * Return value from every per-channel parser. Holds the inbound messages,
+ * status updates, and comments extracted from a single webhook delivery.
  */
 export interface ParseResult {
   messages: IncomingMessage[];
   statuses: StatusUpdate[];
+  /**
+   * Comment events from `entry[].changes` (FB `feed` / IG `comments`).
+   * OPTIONAL on the type so pre-comment-pipeline ParseResult literals keep
+   * compiling; the Messenger/Instagram parsers always populate it (possibly
+   * empty), WhatsApp never does (no comment surface).
+   */
+  comments?: import('./comments/types.js').IncomingComment[];
 }

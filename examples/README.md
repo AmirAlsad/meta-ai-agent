@@ -11,17 +11,18 @@ for the request/response shapes, capability gating, and normalization rules.
 
 ## The examples
 
-There are **six**, in three groups:
+There are **seven**, in three groups:
 
 - **Chat endpoints (drivable via the REPL / `example:dev`)** —
   [`minimal-chat-endpoint`](#minimal-chat-endpoint--the-echo-bot) (echo),
   [`multi-channel-router`](#multi-channel-router--channel-aware--capability-driven)
   (channel + capability aware),
   [`action-catalog`](#action-catalog--every-chataction-shape) (every `ChatAction`
-  shape), and [`scripted-flow`](#scripted-flow--deterministic-state-machine) (a
-  deterministic state machine). All four are pure, LLM-free, and boot in-process
-  in the runners below. Each has its own per-example README with a keyword map /
-  state table.
+  shape), [`scripted-flow`](#scripted-flow--deterministic-state-machine) (a
+  deterministic state machine), and
+  [`comment-endpoint`](#comment-endpoint--kind-comment-on-a-shared-endpoint)
+  (one server handling both DM turns and `kind: 'comment'` dispatches). All are
+  pure, LLM-free, and boot in-process in the runners below.
 - **[`showcase-bot`](#showcase-bot--llm-backed-separate-package)** — an
   LLM-backed endpoint; a **separate package**, run standalone.
 - **[`identity-lookup`](#identity-lookup--a-user_lookup_url-stub)** — a
@@ -46,6 +47,25 @@ node --import tsx examples/minimal-chat-endpoint/index.ts
 
 …or, faster, drive it through the **local REPL** (below) — no standalone server
 to wire up.
+
+### `comment-endpoint` — `kind: 'comment'` on a shared endpoint
+
+With `COMMENTS_ENABLED=true` the transport POSTs inbound comments to
+`COMMENT_ENDPOINT_URL` (default: your `CHAT_ENDPOINT_URL`) with a
+`kind: 'comment'` discriminator. This example shows one server branching on
+that field to serve both surfaces, and demonstrates the posture that matters
+on public comments: **selective engagement** — silence as the default answer,
+a like (where the channel has one; Facebook only) for low-signal comments,
+words only for comments worth them. See
+[`docs/features/comments.md`](../docs/features/comments.md) for the contract.
+
+- Source: [`comment-endpoint/index.ts`](./comment-endpoint/index.ts)
+- Exports: `commentResponse(req)` (pure handler) and `createCommentEndpoint()`
+  (the Express app, `POST /chat`).
+
+```bash
+node --import tsx examples/comment-endpoint/index.ts
+```
 
 ### `multi-channel-router` — channel-aware + capability-driven
 

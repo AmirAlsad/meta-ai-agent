@@ -3,7 +3,10 @@ import path from 'node:path';
 import express from 'express';
 import pino from 'pino';
 import { Redis } from 'ioredis';
-import { loadConfig, configuredAccounts, type Config } from './config/loader.js';
+import { loadConfig, configuredAccounts, commentsConfig, type Config } from './config/loader.js';
+import { CommentAgent } from './comments/agent.js';
+import { CommentChatClient } from './comments/chat.js';
+import { InstagramCommentPoller } from './comments/ig-poller.js';
 import { createApp, PACKAGE_VERSION } from './http/app.js';
 import { GraphClient } from './meta/shared/graph-client.js';
 import { HttpMediaHydrator } from './meta/shared/media-hydrator.js';
@@ -29,6 +32,7 @@ import { InMemoryContactStore } from './identity/contact-store.js';
 import { HttpIdentityResolver } from './identity/resolver.js';
 import type { IdentityResolver } from './identity/resolver.js';
 import { AdapterRegistry } from './meta/shared/registry.js';
+import { WebhookGapMonitor } from './monitoring/webhook-gap.js';
 
 /**
  * Build the full dependency graph and return the wired Express app, the
@@ -95,12 +99,17 @@ export function buildRuntime(
       adapter: new MessengerClient({ config: account, graph, logger })
     });
   }
+  // Kept alongside registration so the comment poller can reach each IG
+  // account's client without a downcast through the registry.
+  const igClients: Array<{ account: (typeof accounts.instagram)[number]; client: InstagramClient }> = [];
   for (const account of accounts.instagram) {
+    const client = new InstagramClient({ config: account, graph, logger });
+    igClients.push({ account, client });
     adapters.register({
       channel: 'instagram',
       accountName: account.accountName,
       businessId: account.userId,
-      adapter: new InstagramClient({ config: account, graph, logger })
+      adapter: client
     });
   }
 
@@ -236,10 +245,60 @@ export function buildRuntime(
     })
     .catch(err => logger.warn({ err }, 'recoverPendingRetries failed'));
 
+  // Comment pipeline — OPT-IN via COMMENTS_ENABLED (default off: a transport
+  // must never start answering public comments as a side effect of wiring
+  // credentials). When enabled: webhook-delivered comments (FB `feed`, and IG
+  // `comments` for Advanced-Access apps) route through the CommentAgent, and
+  // the Instagram poller covers the Standard-Access gap where IG comment
+  // webhooks don't deliver. Reuses the conversation store's dedupe and the
+  // limit tracker's per-account pacing.
+  const comments = commentsConfig(config);
+  let commentAgent: CommentAgent | undefined;
+  let commentPoller: InstagramCommentPoller | undefined;
+  if (comments.enabled) {
+    commentAgent = new CommentAgent({
+      store,
+      adapters,
+      chatClient: new CommentChatClient({
+        endpointUrl: comments.endpointUrl ?? config.chatEndpointUrl,
+        timeoutMs: config.conversation.chatEndpointTimeoutMs,
+        logger
+      }),
+      logger,
+      limitTracker
+    });
+    if (comments.igPollSeconds > 0 && igClients.length > 0) {
+      commentPoller = new InstagramCommentPoller({
+        accounts: igClients,
+        commentAgent,
+        logger,
+        intervalMs: comments.igPollSeconds * 1000,
+        lookbackMs: comments.igLookbackHours * 3_600_000,
+        mediaLimit: comments.igMediaLimit
+      });
+      commentPoller.start();
+    }
+  }
+
+  // Webhook delivery-gap alerting (opt-in via WEBHOOK_GAP_ALERT_MINUTES) —
+  // catches Messenger's silent 1h auto-unsubscribe and IG-token subscription
+  // death as an error log instead of a late discovery.
+  const gapAlertMinutes = config.webhookGapAlertMinutes ?? 0;
+  let webhookGapMonitor: WebhookGapMonitor | undefined;
+  if (gapAlertMinutes > 0) {
+    webhookGapMonitor = new WebhookGapMonitor({
+      logger,
+      thresholdMs: gapAlertMinutes * 60_000
+    });
+    webhookGapMonitor.start();
+  }
+
   const app = createApp({
     config,
     logger,
     agent,
+    ...(commentAgent ? { commentAgent } : {}),
+    ...(webhookGapMonitor ? { webhookGapMonitor } : {}),
     metrics,
     metricsCollector,
     statusTracker,
@@ -258,6 +317,9 @@ export function buildRuntime(
   // ordering is not strictly required — disconnecting the shared client after the
   // agent is closed is simply the safe default.
   const close = async (): Promise<void> => {
+    // Stop the poller + monitor FIRST so no new work starts while draining.
+    commentPoller?.stop();
+    webhookGapMonitor?.stop();
     await agent.close();
     if (redis) redis.disconnect();
   };

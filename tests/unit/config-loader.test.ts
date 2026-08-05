@@ -662,7 +662,7 @@ describe('tokenFormatWarnings (advisory, never throws)', () => {
     expect(warnings.map(w => w.field)).toContain('MESSENGER_PAGE_ACCESS_TOKEN');
   });
 
-  it('warns on an Instagram token missing the IGQ prefix', () => {
+  it('warns on an Instagram token missing both the IGAA and IGQ prefixes', () => {
     const config = loadConfig(
       baseEnv({
         INSTAGRAM_USER_ID: '17841400000000000',
@@ -671,6 +671,16 @@ describe('tokenFormatWarnings (advisory, never throws)', () => {
     );
     const warnings = tokenFormatWarnings(config);
     expect(warnings.map(w => w.field)).toContain('INSTAGRAM_ACCESS_TOKEN');
+  });
+
+  it('accepts the current IGAA prefix without warning (prefix rotated during 2026)', () => {
+    const config = loadConfig(
+      baseEnv({
+        INSTAGRAM_USER_ID: '17841400000000000',
+        INSTAGRAM_ACCESS_TOKEN: 'IGAAcurrentgenerationtokenvalue'
+      })
+    );
+    expect(tokenFormatWarnings(config).map(w => w.field)).not.toContain('INSTAGRAM_ACCESS_TOKEN');
   });
 
   it('fires a check ONLY when its channel is configured', () => {

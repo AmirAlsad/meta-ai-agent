@@ -228,6 +228,35 @@ export interface AccountsConfig {
   instagram: NamedInstagramConfig[];
 }
 
+/**
+ * Comment pipeline tuning. The pipeline is OPT-IN (`COMMENTS_ENABLED`,
+ * default false): a transport that starts answering public comments the
+ * moment someone wires credentials would be a foot-gun, so comment dispatch —
+ * webhook-driven Facebook events and the Instagram poller alike — stays inert
+ * until explicitly enabled.
+ */
+export interface CommentsConfig {
+  /** Master switch for comment dispatch (webhooks AND the IG poller). Default false. */
+  enabled: boolean;
+  /**
+   * Endpoint POSTed the `kind: 'comment'` requests. Default: unset, which
+   * falls back to `CHAT_ENDPOINT_URL` — one endpoint can serve both surfaces
+   * by branching on `kind`.
+   */
+  endpointUrl?: string;
+  /**
+   * Instagram comment poll interval (seconds). IG comment WEBHOOKS are
+   * Advanced-Access-gated, so at Standard Access new comments are discovered
+   * by polling recent media. Default 60; 0 disables the poller (webhook-only
+   * deploys that hold Advanced Access can turn it off).
+   */
+  igPollSeconds: number;
+  /** How far back (hours) a media object stays in the poll set. Default 72. */
+  igLookbackHours: number;
+  /** How many recent media objects to consider per poll sweep. Default 10. */
+  igMediaLimit: number;
+}
+
 export interface Config {
   meta: MetaConfig;
   /**
@@ -247,6 +276,12 @@ export interface Config {
    * the single-account form from the legacy fields when absent.
    */
   accounts?: AccountsConfig;
+  /**
+   * Comment pipeline config. OPTIONAL on the type (same rationale as
+   * `accounts`: hand-assembled configs predate it); `loadConfig` always
+   * populates it, and consumers read it through {@link commentsConfig}.
+   */
+  comments?: CommentsConfig;
   channels: Channels;
   conversation: ConversationConfig;
   persistence: PersistenceConfig;
@@ -264,19 +299,34 @@ export interface Config {
   userLookupUrl?: string;
   redisUrl?: string;
   adminApiToken?: string;
+  /**
+   * Webhook delivery-gap alerting (`WEBHOOK_GAP_ALERT_MINUTES`): when > 0, a
+   * channel that has delivered at least one webhook this process lifetime and
+   * then goes silent for this many minutes logs an ERROR (re-alerted once per
+   * window). Exists because Meta silently auto-unsubscribes a Messenger
+   * webhook after ~1h of failed delivery with manual-only recovery. Default 0
+   * (disabled); OPTIONAL on the type for hand-assembled configs.
+   */
+  webhookGapAlertMinutes?: number;
   publicBaseUrl?: string;
   /**
    * Reserved static ngrok domain (bare hostname, e.g. `foo.ngrok-free.app`).
    *
-   * REQUIRED rather than optional because the Meta App Dashboard anchors
-   * three separate webhook callback URL registrations (WhatsApp, Messenger,
+   * REQUIRED in development because the Meta App Dashboard anchors three
+   * separate webhook callback URL registrations (WhatsApp, Messenger,
    * Instagram) plus the Instagram Business Login OAuth redirect URI to a
    * single public domain. Re-registering all four across the Dashboard every
    * time an ephemeral ngrok URL rotates is the dominant pain point of the
    * setup loop; pinning a free static domain (one is included on every ngrok
    * account at https://dashboard.ngrok.com/cloud-edge/domains) eliminates it.
+   *
+   * OPTIONAL when `NODE_ENV=production`: a deployed transport (Railway,
+   * Fly, …) has a real public URL and no tunnel — requiring a dummy ngrok
+   * domain there was pure friction. The runtime never reads it; only the
+   * dev/setup scripts do, and `startTunnel` throws its own remediation-rich
+   * error if a script is ever run without one.
    */
-  ngrokDomain: string;
+  ngrokDomain?: string;
   agentAutostart: boolean;
   port: number;
   nodeEnv: string;
@@ -447,9 +497,13 @@ const NGROK_DOMAIN_MISSING_REMEDIATION =
   'https://dashboard.ngrok.com/cloud-edge/domains and set NGROK_DOMAIN to the ' +
   'bare hostname (e.g. NGROK_DOMAIN=foo.ngrok-free.app) — no https:// scheme.';
 
-function loadNgrokDomain(env: ConfigEnv): string {
+function loadNgrokDomain(env: ConfigEnv): string | undefined {
   const raw = trimmed(env, 'NGROK_DOMAIN');
   if (raw === undefined) {
+    // Production bypass: a deployed transport has a real public URL and no
+    // tunnel — only the dev/setup scripts consume this value, and they throw
+    // their own remediation if run without one (see Config.ngrokDomain).
+    if ((trimmed(env, 'NODE_ENV') ?? 'development') === 'production') return undefined;
     throw new Error(NGROK_DOMAIN_MISSING_REMEDIATION);
   }
   // The @ngrok/ngrok SDK accepts `domain` as a bare hostname only and
@@ -753,6 +807,49 @@ function loadLimitsConfig(env: ConfigEnv): LimitsConfig {
   };
 }
 
+/**
+ * Documented defaults for {@link CommentsConfig}. Single source of truth so
+ * the loader fallbacks and {@link defaultCommentsConfig} can never drift.
+ */
+const COMMENTS_DEFAULTS: Omit<CommentsConfig, 'endpointUrl'> = {
+  enabled: false,
+  igPollSeconds: 60,
+  igLookbackHours: 72,
+  igMediaLimit: 10
+};
+
+/** The {@link CommentsConfig} defaults as a fresh object (tests / embedders). */
+export function defaultCommentsConfig(): CommentsConfig {
+  return { ...COMMENTS_DEFAULTS };
+}
+
+function loadCommentsConfig(env: ConfigEnv): CommentsConfig {
+  const d = COMMENTS_DEFAULTS;
+  const endpointUrl = trimmed(env, 'COMMENT_ENDPOINT_URL');
+  if (endpointUrl !== undefined) {
+    try {
+      new URL(endpointUrl);
+    } catch {
+      throw new Error(`Invalid COMMENT_ENDPOINT_URL: ${endpointUrl}. Expected a parseable URL.`);
+    }
+  }
+  return {
+    enabled: loadBoolean(env, 'COMMENTS_ENABLED', d.enabled),
+    ...(endpointUrl !== undefined ? { endpointUrl } : {}),
+    igPollSeconds: loadNonNegativeInt(env, 'INSTAGRAM_COMMENT_POLL_SECONDS', d.igPollSeconds),
+    igLookbackHours: loadPositiveInt(env, 'INSTAGRAM_COMMENT_LOOKBACK_HOURS', d.igLookbackHours),
+    igMediaLimit: loadPositiveInt(env, 'INSTAGRAM_COMMENT_MEDIA_LIMIT', d.igMediaLimit)
+  };
+}
+
+/**
+ * The comments config for a config object, defaulting when `comments` is
+ * absent (hand-assembled configs). Mirrors {@link configuredAccounts}.
+ */
+export function commentsConfig(config: Config): CommentsConfig {
+  return config.comments ?? defaultCommentsConfig();
+}
+
 function loadChatEndpointUrl(env: ConfigEnv): string {
   const raw = requireEnv(env, 'CHAT_ENDPOINT_URL');
   try {
@@ -991,6 +1088,7 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     messenger,
     instagram,
     accounts,
+    comments: loadCommentsConfig(env),
     channels,
     conversation: loadConversationConfig(env),
     persistence: loadPersistenceConfig(env),
@@ -999,8 +1097,12 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     userLookupUrl: loadUserLookupUrl(env),
     redisUrl: loadRedisUrl(env),
     adminApiToken: loadAdminApiToken(env),
+    webhookGapAlertMinutes: loadNonNegativeInt(env, 'WEBHOOK_GAP_ALERT_MINUTES', 0),
     publicBaseUrl: trimmed(env, 'PUBLIC_BASE_URL'),
-    ngrokDomain: loadNgrokDomain(env),
+    ...(() => {
+      const ngrokDomain = loadNgrokDomain(env);
+      return ngrokDomain !== undefined ? { ngrokDomain } : {};
+    })(),
     agentAutostart: loadAgentAutostart(env),
     port: loadPort(env),
     nodeEnv: trimmed(env, 'NODE_ENV') ?? 'development'
@@ -1077,13 +1179,18 @@ export function tokenFormatWarnings(config: Config): TokenFormatWarning[] {
   }
 
   for (const account of accounts.instagram) {
-    if (!account.accessToken.startsWith('IGQ')) {
+    // Meta rotated the Instagram Login token prefix from "IGQ" to "IGAA"
+    // during 2026 — Dashboard-generated and OAuth-minted long-lived tokens now
+    // begin "IGAA" (measured August 2026); older still-valid tokens begin
+    // "IGQ". Warning on the old prefix alone produced a false alarm on every
+    // healthy new deploy, so both are accepted.
+    if (!account.accessToken.startsWith('IGQ') && !account.accessToken.startsWith('IGAA')) {
       warnings.push({
         field: fieldFor('INSTAGRAM_ACCESS_TOKEN', account.accountName),
         message:
-          'Instagram access token does not start with "IGQ". Instagram Business Login ' +
-          'user tokens normally begin with "IGQ"; verify you used the long-lived IG ' +
-          'token from the OAuth flow.'
+          'Instagram access token does not start with "IGAA" (current) or "IGQ" (older). ' +
+          'Instagram Login user tokens normally begin with one of these; verify you used ' +
+          'the long-lived IG token from the OAuth flow or the Dashboard Generate-token button.'
       });
     }
   }

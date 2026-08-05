@@ -27,8 +27,12 @@ export interface TunnelOptions {
    * re-registering the webhook callback URL in three Meta Dashboard
    * configurations every time an ephemeral tunnel rotates. Reserve a free
    * one at https://dashboard.ngrok.com/cloud-edge/domains.
+   *
+   * Typed optional because `Config.ngrokDomain` is optional in production
+   * deploys (no tunnel there); {@link startTunnel} throws a remediation-rich
+   * error when a script actually tries to open a tunnel without one.
    */
-  domain: string;
+  domain: string | undefined;
   /** ngrok region. Defaults to the closest geo region if omitted. */
   region?: string;
 }
@@ -62,6 +66,14 @@ export async function startTunnel(
   const authtoken = opts.authtoken ?? process.env.NGROK_AUTHTOKEN;
   if (!authtoken || authtoken.trim() === '') {
     throw new Error(MISSING_AUTHTOKEN_REMEDIATION);
+  }
+  if (!opts.domain || opts.domain.trim() === '') {
+    throw new Error(
+      'Missing ngrok domain. Reserve a free static domain at ' +
+        'https://dashboard.ngrok.com/cloud-edge/domains and set NGROK_DOMAIN to the ' +
+        'bare hostname (e.g. NGROK_DOMAIN=foo.ngrok-free.app) — required for the ' +
+        'dev/setup scripts even though a production deploy runs without one.'
+    );
   }
 
   const config: NgrokConfig = {

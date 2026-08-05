@@ -57,6 +57,7 @@ import type { AgentMetrics } from '../metrics/registry.js';
 import { normalizeErrorCodeLabel } from '../metrics/registry.js';
 import type { IdentityResolver } from '../identity/resolver.js';
 import type { LimitTracker } from '../limits/tracker.js';
+import { MESSENGER_SEND_SUBCODE_HINTS } from '../limits/error-codes.js';
 import type { StatusTracker } from '../status/tracker.js';
 import { calculateBufferTimeout } from './buffering.js';
 import type { BufferScheduler } from './scheduler.js';
@@ -1220,7 +1221,16 @@ export class ConversationAgent {
         error_code: errorCode
       });
       if (error instanceof MetaApiError) {
-        logger.error({ err: error, conversationKey: key, kind: item.kind }, 'outbound send failed');
+        // Name the remediation for the two chronically-confused Messenger/IG
+        // subcodes (role gate vs 24h window) instead of logging a bare int.
+        const subcodeHint =
+          error.errorSubCode !== undefined
+            ? MESSENGER_SEND_SUBCODE_HINTS.get(error.errorSubCode)
+            : undefined;
+        logger.error(
+          { err: error, conversationKey: key, kind: item.kind, ...(subcodeHint ? { subcodeHint } : {}) },
+          'outbound send failed'
+        );
       } else {
         logger.error({ err: error, conversationKey: key, kind: item.kind }, 'unexpected outbound send error');
       }

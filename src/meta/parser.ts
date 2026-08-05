@@ -1,3 +1,4 @@
+import type { IncomingComment } from './comments/types.js';
 import type {
   Channel,
   FlowResponseInfo,
@@ -413,7 +414,8 @@ export function parseInstagramWebhook(payload: unknown): ParseResult {
 function parseFbStylePayload(payload: unknown, channel: Channel): ParseResult {
   const messages: IncomingMessage[] = [];
   const statuses: StatusUpdate[] = [];
-  if (!isObject(payload)) return { messages, statuses };
+  const comments: IncomingComment[] = [];
+  if (!isObject(payload)) return { messages, statuses, comments };
 
   // Per-payload counter for synthesized ids on unknown messaging events. Two
   // opt-in / handover events landing at the same ms used to collapse to one
@@ -432,11 +434,204 @@ function parseFbStylePayload(payload: unknown, channel: Channel): ParseResult {
       if (result.message) messages.push(result.message);
       for (const status of result.statuses) statuses.push(status);
     }
-    // `entry[].changes` exists for non-messaging feed events on Messenger
-    // (post comments, etc.). Stage 2 scope is messaging only — drop them.
+    // `entry[].changes` carries the non-messaging surfaces: Facebook Page
+    // `feed` events (comments among a lot of noise) and Instagram `comments`
+    // events. Collected into the sibling `comments` list — messaging stays
+    // untouched.
+    const changes = readArray(entry, 'changes') ?? [];
+    for (const change of changes) {
+      const parsed = parseCommentChange(change, channel, entryId);
+      if (parsed) comments.push(parsed);
+    }
+    // Instagram-Login-flavor envelopes have been observed carrying `field` /
+    // `value` DIRECTLY on the entry (no `changes[]` wrapper). Tolerate both.
+    if (channel === 'instagram' && readString(entry, 'field') !== undefined) {
+      const parsed = parseCommentChange(entry, channel, entryId);
+      if (parsed) comments.push(parsed);
+    }
   }
 
-  return { messages: dedupeById(messages), statuses: dedupeById(statuses) };
+  return {
+    messages: dedupeById(messages),
+    statuses: dedupeById(statuses),
+    comments: dedupeComments(comments)
+  };
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Comments (entry[].changes)                                                 */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Per-payload comment dedupe by (commentId, verb) — Meta batches identical
+ * change blocks across `entry[]` items just like it does message blocks. The
+ * verb joins the key so an `add` and a later `edited` for the same comment in
+ * one delivery both survive.
+ */
+function dedupeComments(items: IncomingComment[]): IncomingComment[] {
+  const seen = new Set<string>();
+  const out: IncomingComment[] = [];
+  for (const item of items) {
+    const key = `${item.commentId}:${item.verb}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * Normalize a comment timestamp to milliseconds. Facebook `feed` values ship
+ * `created_time` in Unix SECONDS (measured August 2026 — unlike the messaging
+ * events on the same object, which ship milliseconds), and FB/IG `entry.time`
+ * is seconds too, so the <1e12 upscale applies regardless of channel here.
+ */
+function normalizeCommentTimestamp(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value < 1e12 ? value * 1000 : value;
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed < 1e12 ? parsed * 1000 : parsed;
+  }
+  return undefined;
+}
+
+/** Final `_`-separated segment of a Facebook composite id (`{asset}_{part}` → part). */
+function lastIdSegment(id: string): string {
+  const i = id.lastIndexOf('_');
+  return i === -1 ? id : id.slice(i + 1);
+}
+
+/**
+ * Parse one `changes[]` block (or an IG entry-level `field`/`value` pair)
+ * into an {@link IncomingComment}. Returns undefined for anything that isn't
+ * a comment — which on the FB `feed` field is MOST traffic: reactions, likes,
+ * shares, status/photo/video publishes, and edits of the post itself all fire
+ * `feed` webhooks. Non-throwing like everything else in this parser.
+ */
+function parseCommentChange(
+  raw: unknown,
+  channel: Channel,
+  entryId: string | undefined
+): IncomingComment | undefined {
+  if (channel !== 'messenger' && channel !== 'instagram') return undefined;
+  if (!isObject(raw)) return undefined;
+  const field = readString(raw, 'field');
+  const value = readObject(raw, 'value');
+  if (!value) return undefined;
+
+  if (channel === 'messenger' && field === 'feed') {
+    return parseFacebookFeedComment(value, entryId);
+  }
+  if (channel === 'instagram' && (field === 'comments' || field === 'live_comments')) {
+    return parseInstagramCommentValue(value, entryId);
+  }
+  return undefined;
+}
+
+/** Facebook Page `feed` change → comment (item `comment` only; everything else is noise). */
+function parseFacebookFeedComment(
+  value: Record<string, unknown>,
+  entryId: string | undefined
+): IncomingComment | undefined {
+  // `item` discriminates the feed event kind. Only comments become
+  // IncomingComments; reactions/shares/publishes are dropped here (the
+  // dispatcher's summary log still counts the webhook itself).
+  if (readString(value, 'item') !== 'comment') return undefined;
+  const commentId = readString(value, 'comment_id');
+  if (!commentId) return undefined;
+  const businessId = entryId;
+  if (!businessId) return undefined;
+
+  const postId = readString(value, 'post_id');
+  const parentId = readString(value, 'parent_id');
+  const verb = readString(value, 'verb') ?? 'add';
+  const from = readObject(value, 'from');
+  const fromId = from ? readString(from, 'id') : undefined;
+  const post = readObject(value, 'post');
+
+  // Reply detection, best-effort (see the IncomingComment.isReply doc): a
+  // parent that IS the post — verbatim or by final id segment — marks a
+  // top-level comment, not a reply. Measured against both August 2026
+  // captures (reel: parent_id == post_id on a top-level comment; photo
+  // post: reply parent uses the post's OWN id prefix, not the page's).
+  let isReply: boolean | undefined;
+  if (parentId !== undefined && postId !== undefined) {
+    isReply = parentId !== postId && lastIdSegment(parentId) !== lastIdSegment(postId);
+  }
+
+  const comment: IncomingComment = {
+    channel: 'messenger',
+    channelScopedBusinessId: businessId,
+    commentId,
+    timestamp:
+      normalizeCommentTimestamp(value['created_time']) ??
+      // timestamp-fallback mirrors the messaging parser: better a parseable
+      // comment with a best-effort timestamp than a dropped one.
+      Date.now(),
+    verb,
+    raw: value
+  };
+  if (postId !== undefined) comment.postId = postId;
+  if (parentId !== undefined) comment.parentId = parentId;
+  if (isReply !== undefined) comment.isReply = isReply;
+  const message = readString(value, 'message');
+  if (message !== undefined) comment.text = message;
+  if (fromId !== undefined) {
+    const name = from ? readString(from, 'name') : undefined;
+    comment.from = { id: fromId, ...(name !== undefined ? { name } : {}) };
+  }
+  if (post) {
+    const permalink = readString(post, 'permalink_url');
+    if (permalink !== undefined) comment.permalinkUrl = permalink;
+  }
+  return comment;
+}
+
+/** Instagram `comments` change value → comment. */
+function parseInstagramCommentValue(
+  value: Record<string, unknown>,
+  entryId: string | undefined
+): IncomingComment | undefined {
+  const commentId = readString(value, 'id');
+  if (!commentId) return undefined;
+  const businessId = entryId;
+  if (!businessId) return undefined;
+
+  const media = readObject(value, 'media');
+  const mediaId = media ? readString(media, 'id') : undefined;
+  const parentId = readString(value, 'parent_id');
+  const from = readObject(value, 'from');
+  const fromId = from ? readString(from, 'id') : undefined;
+
+  const comment: IncomingComment = {
+    channel: 'instagram',
+    channelScopedBusinessId: businessId,
+    commentId,
+    // IG comment change values carry no timestamp; the value-level
+    // `timestamp` is tolerated if Meta ever adds one, else best-effort now.
+    timestamp: normalizeCommentTimestamp(value['timestamp']) ?? Date.now(),
+    // IG comment webhooks have no verb — a delivered change IS an add.
+    verb: 'add',
+    raw: value
+  };
+  if (mediaId !== undefined) comment.postId = mediaId;
+  if (parentId !== undefined) {
+    comment.parentId = parentId;
+    // Documented IG semantics: parent_id present ⇔ this is a reply.
+    comment.isReply = true;
+  }
+  const text = readString(value, 'text');
+  if (text !== undefined) comment.text = text;
+  if (fromId !== undefined) {
+    // IG uses `username` where FB uses `name`.
+    const name = from ? (readString(from, 'username') ?? readString(from, 'name')) : undefined;
+    comment.from = { id: fromId, ...(name !== undefined ? { name } : {}) };
+  }
+  const productType = media ? readString(media, 'media_product_type') : undefined;
+  if (productType !== undefined) comment.mediaProductType = productType;
+  return comment;
 }
 
 interface FbEventResult {
@@ -571,6 +766,34 @@ function parseFbStyleEvent(
       out.push(status);
     }
     return { statuses: out };
+  }
+
+  // Policy-enforcement notices (subscribed via `messaging_policy_enforcement`):
+  // Meta warning about / blocking / unblocking the asset's messaging. These
+  // carry NO sender (there is no counterparty), so they must be surfaced
+  // BEFORE the both-ids guard below or they'd be silently dropped — and a
+  // dropped enforcement notice is the difference between reacting inside the
+  // 7-day response window and finding out when messaging stops working. The
+  // dispatcher logs these at error level.
+  const policyEnforcement = readObject(raw, 'policy_enforcement');
+  if (policyEnforcement) {
+    const businessId = recipientId ?? entryId;
+    if (!businessId) return { statuses: [] };
+    unknownEventState.counter += 1;
+    return {
+      message: {
+        channel,
+        channelMessageId: `${businessId}-${eventTimestamp}-policy-${unknownEventState.counter}`,
+        // No counterparty on an enforcement notice; the business fills both
+        // sides so conversation keying stays well-formed if one ever routes.
+        channelScopedUserId: senderId ?? businessId,
+        channelScopedBusinessId: businessId,
+        timestamp: eventTimestamp,
+        type: 'unknown',
+        raw
+      },
+      statuses: []
+    };
   }
 
   // Anything else (opt-in, account_linking, future events). Surface as

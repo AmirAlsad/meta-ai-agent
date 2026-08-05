@@ -54,6 +54,15 @@ interface MessengerSendResponse {
   recipient_id?: string;
 }
 
+/** Narrow a Graph response to `{ id: string }` without trusting its shape. */
+function isRecordWithId(value: unknown): value is { id: string } {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as Record<string, unknown>).id === 'string'
+  );
+}
+
 export class MessengerClient implements ChannelAdapter {
   readonly channel = 'messenger' as const;
 
@@ -367,6 +376,74 @@ export class MessengerClient implements ChannelAdapter {
       default:
         return false;
     }
+  }
+
+  /* ── Comment surface (CommentCapableClient) ─────────────────────────── */
+
+  /**
+   * Public reply under a Page post comment: `POST /{comment-id}/comments`
+   * with `{ message }` (live-verified August 2026 on both photo posts and
+   * reels). The created reply's id comes back as `id`.
+   *
+   * Requires `pages_manage_engagement` (the reply is a Page action) plus
+   * `pages_read_user_content` on the token — scopes the standard messaging
+   * login config does NOT carry; see the setup docs.
+   */
+  async replyToComment(commentId: string, text: string): Promise<{ id?: string }> {
+    const raw = await this.graph.request({
+      method: 'POST',
+      path: `${commentId}/comments`,
+      body: { message: text },
+      accessToken: this.config.pageAccessToken,
+      operation: 'messenger.replyToComment'
+    });
+    const id = isRecordWithId(raw) ? raw.id : undefined;
+    return id !== undefined ? { id } : {};
+  }
+
+  /**
+   * Like a comment as the Page: `POST /{comment-id}/likes` (live-verified
+   * August 2026 — Meta's docs contradict themselves on this endpoint, the
+   * live API accepts it). Facebook-only: Instagram has NO comment-like
+   * endpoint at all, which is why this method is optional on
+   * {@link CommentCapableClient}.
+   */
+  async likeComment(commentId: string): Promise<void> {
+    await this.graph.request({
+      method: 'POST',
+      path: `${commentId}/likes`,
+      body: {},
+      accessToken: this.config.pageAccessToken,
+      operation: 'messenger.likeComment'
+    });
+  }
+
+  /**
+   * Comment-to-DM private reply: `POST /{pageId}/messages` with
+   * `recipient: { comment_id }` (live-verified August 2026). One message per
+   * comment within 7 days; it does NOT open a messaging window until the
+   * person replies.
+   */
+  async sendCommentPrivateReply(commentId: string, text: string): Promise<unknown> {
+    return this.post(
+      {
+        recipient: { comment_id: commentId },
+        message: { text },
+        // A private reply is definitionally a response to the user's comment.
+        messaging_type: 'RESPONSE'
+      },
+      'messenger.sendCommentPrivateReply'
+    );
+  }
+
+  /** Delete a comment on the Page's own content: `DELETE /{comment-id}`. */
+  async deleteComment(commentId: string): Promise<void> {
+    await this.graph.request({
+      method: 'DELETE',
+      path: commentId,
+      accessToken: this.config.pageAccessToken,
+      operation: 'messenger.deleteComment'
+    });
   }
 
   /**

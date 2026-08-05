@@ -90,6 +90,8 @@ Stage 6 adds the operational surface. The agent records per-outbound-message del
 - [Trusted sources](./docs/TRUSTED-SOURCES.md) — curated Meta documentation references.
 - [Configuration](./docs/features/configuration.md)
 - [Multi-account](./docs/features/multi-account.md) — several Pages / IG accounts / WhatsApp numbers under one app, declared with `__<name>`-suffixed env vars; the `AdapterRegistry` routes outbound by `channel:businessId` and the chat request carries `accountName`.
+- [Comments](./docs/features/comments.md) — opt-in comment pipeline (`COMMENTS_ENABLED`): FB `feed` / IG `comments` webhook parsing, the Standard-Access Instagram comment poller, the `kind: 'comment'` chat contract, and the reply / private-reply / like levers with allowlist-of-self echo filtering.
+- Production hardening (post-Stage-10 pass): `npm run tokens:refresh:instagram` (scheduled 60-day IG token refresh with `--write` and an alerting exit code), webhook delivery-gap alerting (`WEBHOOK_GAP_ALERT_MINUTES` — catches Messenger's silent 1h auto-unsubscribe), `messaging_policy_enforcement` subscription surfaced at error level, the NGROK_DOMAIN production bypass, Messenger/IG throttle codes (17/32/80002/80006) in the transient-retry set, and named remediation hints for the 2018028 role-gate vs 2018065 window subcodes.
 - [Webhook security](./docs/features/webhook-security.md)
 - [Inbound webhooks](./docs/features/inbound-webhooks.md)
 - [Message parsing](./docs/features/message-parsing.md)

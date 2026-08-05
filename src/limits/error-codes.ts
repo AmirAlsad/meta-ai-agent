@@ -42,14 +42,48 @@ export const WHATSAPP_WINDOW_ERROR_CODES = new Set<number>([131047, 470]);
  * must be matched by code, not status. Verified against Meta's rate-limiting +
  * WhatsApp error references:
  *   - 4      "Application request limit reached" (app-level Graph throttle)
+ *   - 17     "User request limit reached" (per-user Graph throttle)
+ *   - 32     "Page request limit reached" (per-Page Graph throttle)
+ *   - 613    "Calls to this API have exceeded the rate limit"
+ *   - 80002  "There have been too many calls to this Instagram account" (IG BUC)
+ *   - 80006  "There have been too many messenger api calls to this Page" (Messenger BUC)
  *   - 80007  "Rate limit issues" (WABA reached its rate limit)
  *   - 130429 "Rate limit hit" (Cloud API throughput)
  *   - 131056 "(Business, Consumer) pair rate limit hit"
- *   - 613    "Calls to this API have exceeded the rate limit"
- * Policy/quality throttles (131048 "Spam rate limit", 131049, 368) are NOT here —
- * they are permanent; retrying won't recover and can worsen account standing.
+ * "Safe to retry" here means retry WITH BACKOFF through the bounded transient-
+ * retry path — never a hot re-send. Meta's own guidance for these codes is to
+ * pause and reduce call rate; the transient retry's exponential backoff is that
+ * pause. Policy/quality throttles (131048 "Spam rate limit", 131049, 368) are
+ * NOT here — they are permanent; retrying won't recover and can worsen account
+ * standing.
  */
-export const META_RATE_LIMIT_ERROR_CODES = new Set<number>([4, 80007, 130429, 131056, 613]);
+export const META_RATE_LIMIT_ERROR_CODES = new Set<number>([
+  4, 17, 32, 613, 80002, 80006, 80007, 130429, 131056
+]);
+
+/**
+ * Messenger / Instagram send-failure SUBcodes worth naming for operators.
+ * These two look alike in logs (both arrive as code 10 / "message not sent")
+ * and are routinely confused — measured live August 2026:
+ *   - 2018028 is the DEVELOPMENT-MODE ROLE GATE ("Cannot message users who are
+ *     not admins, developers or testers of the app") — fixed by app roles or
+ *     by going Live, NOT by messaging inside a window.
+ *   - 2018065 is the 24-HOUR WINDOW ("This message is sent outside of allowed
+ *     window") — a policy condition on when you may message, unrelated to roles.
+ * Neither is retryable (both are deterministic), so they stay `permanent` in
+ * the classifier; this map exists so the send-failure log names the actual
+ * remediation instead of leaving an operator to look up a bare subcode.
+ */
+export const MESSENGER_SEND_SUBCODE_HINTS: ReadonlyMap<number, string> = new Map([
+  [
+    2018028,
+    'Development-mode role gate: the recipient has no role on the app. Add them as a Tester (or switch the app to Live) — this is NOT the 24h window.'
+  ],
+  [
+    2018065,
+    '24-hour messaging window is closed for this conversation. Messenger/Instagram have no automated out-of-window path (message tags retired April 2026) — the user must message first.'
+  ]
+]);
 
 /**
  * Human-readable failure bucket for a WhatsApp Cloud API error code, surfaced

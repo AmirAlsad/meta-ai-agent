@@ -12,6 +12,8 @@ import { redactConversationRecord, redactStatusRecord } from './redaction.js';
 import { parseMetaWebhook } from '../meta/parser.js';
 import type { IncomingMessage, ParseResult, StatusUpdate } from '../meta/types.js';
 import type { ConversationAgent } from '../conversation/agent.js';
+import type { CommentAgent } from '../comments/agent.js';
+import type { WebhookGapMonitor } from '../monitoring/webhook-gap.js';
 import type { AgentMetrics } from '../metrics/registry.js';
 import type { MetricsCollector } from '../metrics/collector.js';
 import { renderPrometheus, PROMETHEUS_CONTENT_TYPE } from '../metrics/prometheus.js';
@@ -57,6 +59,20 @@ export interface AppDeps {
   store?: ConversationStore;
   scheduler?: BufferScheduler;
   redisClient?: RedisPinger;
+  /**
+   * Comment pipeline (optional, additive): when present, every parsed
+   * comment is routed into it after the message/status routing. Absent ⇒
+   * comments are parsed and logged but not dispatched — exactly the
+   * pre-pipeline behavior plus visibility.
+   */
+  commentAgent?: CommentAgent;
+  /**
+   * Webhook delivery-gap monitor (optional): when present, every
+   * signature-valid webhook records a receipt for its channel so silent
+   * subscription death (Messenger's 1h auto-unsubscribe, an expired IG
+   * token) becomes an alertable error instead of a late discovery.
+   */
+  webhookGapMonitor?: WebhookGapMonitor;
 }
 
 /**
@@ -130,7 +146,12 @@ export async function dispatchWebhook(
   logger: pino.Logger,
   _config: Config,
   agent?: ConversationAgent,
-  opts?: { metrics?: AgentMetrics; traceId?: string; requestLogger?: pino.Logger }
+  opts?: {
+    metrics?: AgentMetrics;
+    traceId?: string;
+    requestLogger?: pino.Logger;
+    commentAgent?: CommentAgent;
+  }
 ): Promise<ParseResult> {
   // Prefer the request-scoped child logger (carries traceId + route) when the
   // HTTP layer supplied one, so this dispatch's logs correlate to the webhook.
@@ -171,6 +192,26 @@ export async function dispatchWebhook(
   // Per-message logs. Use `warn` for `type: 'unknown'` so unmodeled inbounds
   // surface in observability; `info` for everything else.
   for (const msg of result.messages) {
+    // Policy-enforcement notices get a dedicated ERROR-level line (not the
+    // generic unknown-type warn): enforcement otherwise arrives only as an
+    // email with a 7-day response clock, and field reports say appeals are
+    // effectively nonexistent — so alerting must be able to key on this
+    // marker. The event still flows through the normal unknown-type path.
+    const enforcement =
+      msg.raw !== null && typeof msg.raw === 'object'
+        ? (msg.raw as { policy_enforcement?: unknown }).policy_enforcement
+        : undefined;
+    if (enforcement !== undefined) {
+      log.error(
+        {
+          channel: msg.channel,
+          channelScopedBusinessId: msg.channelScopedBusinessId,
+          policyEnforcement: enforcement,
+          traceMarker: 'inbound.policy_enforcement' as const
+        },
+        'MESSAGING POLICY ENFORCEMENT notice received — respond within the 7-day window'
+      );
+    }
     logIncomingMessage(log, msg);
   }
 
@@ -187,6 +228,7 @@ export async function dispatchWebhook(
     entryCount,
     messageCount: result.messages.length,
     statusCount: result.statuses.length,
+    commentCount: result.comments?.length ?? 0,
     traceMarker: `inbound.${channel}` as const
   };
 
@@ -228,6 +270,18 @@ export async function dispatchWebhook(
     }
     for (const status of result.statuses) {
       await agent.handleStatus(status, handleOpts);
+    }
+  }
+
+  // Route parsed comments into the comment agent when one is wired. Sequential
+  // for the same reason as the message loop; every handleComment is fail-soft
+  // (logs and swallows internally; never throws out).
+  if (opts?.commentAgent && result.comments !== undefined) {
+    for (const comment of result.comments) {
+      await opts.commentAgent.handleComment(
+        comment,
+        opts.requestLogger !== undefined ? { logger: opts.requestLogger } : undefined
+      );
     }
   }
 
@@ -348,8 +402,19 @@ async function buildReadinessReport(deps: {
 }
 
 export function createApp(deps: AppDeps): express.Express {
-  const { config, logger, agent, metrics, metricsCollector, statusTracker, store, scheduler, redisClient } =
-    deps;
+  const {
+    config,
+    logger,
+    agent,
+    metrics,
+    metricsCollector,
+    statusTracker,
+    store,
+    scheduler,
+    redisClient,
+    commentAgent,
+    webhookGapMonitor
+  } = deps;
   const app = express();
   const startedAtMs = Date.now();
 
@@ -505,10 +570,21 @@ export function createApp(deps: AppDeps): express.Express {
     // the security.ts note re: signature-rejection metrics being deferred.
     const ctx = requestContextFromLocals(res);
     res.status(200).send('EVENT_RECEIVED');
+    // Record the receipt for gap alerting BEFORE the async dispatch — the
+    // signal is "Meta delivered to us at all", not "we processed it".
+    if (webhookGapMonitor) {
+      const receiptChannel = objectToChannel(
+        req.body !== null && typeof req.body === 'object'
+          ? (req.body as { object?: unknown }).object
+          : undefined
+      );
+      if (receiptChannel !== 'unknown') webhookGapMonitor.recordReceipt(receiptChannel);
+    }
     void dispatchWebhook(req.body, logger, config, agent, {
       ...(metrics !== undefined ? { metrics } : {}),
       ...(ctx?.traceId !== undefined ? { traceId: ctx.traceId } : {}),
-      ...(ctx?.logger !== undefined ? { requestLogger: ctx.logger } : {})
+      ...(ctx?.logger !== undefined ? { requestLogger: ctx.logger } : {}),
+      ...(commentAgent !== undefined ? { commentAgent } : {})
     }).catch(err => {
       logger.error({ err }, 'dispatchWebhook rejected unexpectedly');
     });
