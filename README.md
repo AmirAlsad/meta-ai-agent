@@ -38,7 +38,7 @@ Stage 3 setup + capture tooling (real Meta App + ngrok required):
 npm run setup:oauth:instagram    # OAuth → long-lived (~60d) Instagram token
 npm run setup:oauth:messenger    # FB Login for Business → scope-controlled Page Access Token
 npm run setup:all                # End-to-end verify across every configured channel
-npm run meta:webhooks            # Programmatic webhook subscription (or --inspect)
+npm run meta:webhooks            # Programmatic webhook subscription (--inspect to audit, --yes for non-interactive)
 npm run setup:profile -- --config=<path>   # Apply Messenger Profile + IG ice breakers from a JSON config
 npm run capture:guided           # Interactive scenario-driven payload capture
 npm run capture:fixtures         # Passive capture server

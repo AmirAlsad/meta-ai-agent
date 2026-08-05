@@ -101,6 +101,18 @@ want the id itself.
   populated default no longer blocks capturing `reed`). The Messenger flow's
   Page auto-selection reads `MESSENGER_PAGE_ID__<name>` when an account is
   named.
+- **One Messenger OAuth grant covers every Page ticked in the login dialog.**
+  The browser step authorizes the app for all selected Pages at once;
+  `GET /me/accounts` on the resulting User Token then returns each granted
+  Page with its id AND its Page Access Token in one response. The script
+  captures one account per run (run it once per name — subsequent runs reuse
+  the standing grant, so only the first shows the full consent dialog), but
+  when driving the flow without a TTY (the Page selector and the `.env`
+  append prompt both need one), a single manual `/me/accounts` call against
+  the User Token is the practical multi-Page path: it yields every suffixed
+  `MESSENGER_PAGE_ID__*` / `MESSENGER_PAGE_ACCESS_TOKEN__*` pair from one
+  browser sign-in. Proven live August 2026 (two named accounts captured from
+  one grant).
 
 ## Notes and edges
 

@@ -41,7 +41,7 @@ npm run setup:instagram          # Same, Instagram (Business Login)
 npm run setup:all                # All configured channels under one tunnel
 npm run setup:oauth:instagram    # OAuth → long-lived (~60d) Instagram User Access Token
 npm run setup:oauth:messenger    # FB Login for Business → scope-controlled Messenger Page Access Token
-npm run meta:webhooks            # Programmatic webhook subscription (also: --inspect)
+npm run meta:webhooks            # Programmatic webhook subscription (also: --inspect, --yes)
 npm run setup:profile -- --config=<path>  # Stage 8: apply Messenger Profile (Get Started/menu/ice breakers/greeting) + IG ice breakers from a JSON config
 npm run capture:fixtures         # Passive capture server: log + save every webhook
 npm run capture:guided           # Interactive scenario walker (--list prints the scenario inventory, no creds needed)

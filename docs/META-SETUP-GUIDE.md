@@ -147,7 +147,7 @@ MESSENGER_LOGIN_CONFIG_ID=...      # REQUIRED only if using `setup:oauth:messeng
    - Verifies the token via `GET https://graph.instagram.com/me`.
    - Offers to append `INSTAGRAM_USER_ID` and `INSTAGRAM_ACCESS_TOKEN` to `.env`. The append step refuses to clobber an existing non-empty `INSTAGRAM_USER_ID` / `INSTAGRAM_ACCESS_TOKEN` but does NOT block empty placeholder lines copied from `.env.example` — those are skipped so a first-time capture can still succeed.
 
-> **"Allow access to messages" on the IG mobile app is the silent killer.** Open the official Instagram app on the linked business account → Settings → Messages and story replies → Message controls → enable **Allow access to messages**. When this is OFF, OAuth completes successfully, webhook subscriptions POST 200, and **no real webhook ever fires**. There is no error log, no Graph API to detect the state, no UI signal in the Meta Dashboard. If you've done everything else right and webhooks aren't arriving, this is the first thing to check. `verify-instagram` surfaces it as a manual confirmation prompt.
+> **"Allow access to messages" on the IG mobile app is the silent killer.** Open the official Instagram app on the linked business account → Settings and activity → Messages and story replies → Message controls → **Connected tools** → enable **Allow access to messages**. The toggle exists only in the mobile app — instagram.com's settings do not surface it, so don't burn time hunting for it on the web. When this is OFF, OAuth completes successfully, webhook subscriptions POST 200, and **no real webhook ever fires**. There is no error log, no Graph API to detect the state, no UI signal in the Meta Dashboard. If you've done everything else right and webhooks aren't arriving, this is the first thing to check. `verify-instagram` surfaces it as a manual confirmation prompt.
 
 > **Instagram Tester registration is a second silent killer (Development mode).** Verified during a live walkthrough on 2026-05-20: while the app is in Development mode, Instagram only fires messaging webhooks for DMs sent from accounts registered as **Instagram Testers**. Instagram keeps a *separate* tester list from the Facebook app roles — find it under **App Dashboard → App Roles → Roles → Instagram Testers**. Empirically, BOTH the business account AND every personal account you'll DM from must appear there as **accepted** testers, or the inbound webhook silently never arrives (no error, no log). Two gotchas:
 > - A first DM from a non-connected account lands in the business's "message requests" folder. You do **NOT** need to manually accept the request — the Send API can reply within the 24-hour window without it (the user-initiated message opens the window). The message-request routing is a symptom of the account not being a connection, not the cause of webhook silence; the tester registration is the actual gate.
@@ -353,9 +353,20 @@ Each runs the full bootstrap + per-channel verify for a single channel. They eac
 npm run meta:webhooks                                   # Register, given PUBLIC_BASE_URL
 npm run meta:webhooks -- --callback-url=https://...     # Register, explicit URL
 npm run meta:webhooks -- --inspect                      # Read-only diagnostic
+npm run meta:webhooks -- --yes                          # Skip the confirm prompt (non-interactive runs)
 ```
 
 Useful when you've already brought your own public URL (e.g. a deployed staging environment) and just want to push subscriptions or check their state.
+
+**The callback URL must be serving when you register.** The Messenger app-level
+subscription (`POST /{appId}/subscriptions`) triggers Meta's live verification
+handshake — a `GET` with `hub.challenge` against the callback URL — at
+registration time, and fails with HTTP 400 / code 2200 ("Callback verification
+failed... HTTP Status Code = 404") if nothing answers there. Start the agent
+(or the dev loop, which registers for you on boot) before running this script;
+registering against a down endpoint is the most common cause of a
+Messenger-only failure while WhatsApp and Instagram succeed (their per-asset
+`subscribed_apps` calls don't re-verify the callback).
 
 ### Subscribed fields per channel
 
@@ -364,18 +375,24 @@ Source of truth: `SUBSCRIBED_FIELDS` in [`scripts/setup/register-webhooks.ts`](.
 | Channel | Fields |
 | --- | --- |
 | WhatsApp | `messages`, `message_template_status_update`, `account_review_update`, `phone_number_quality_update`, `phone_number_name_update` |
-| Messenger | `messages`, `messaging_postbacks`, `message_deliveries`, `message_reads`, `messaging_optins`, `messaging_referrals`, `message_reactions`, `message_echoes` |
-| Instagram | `messages`, `messaging_postbacks`, `messaging_seen`, `message_reactions`, `messaging_referral`, `message_echoes` |
+| Messenger | `messages`, `messaging_postbacks`, `message_deliveries`, `message_reads`, `messaging_optins`, `messaging_referrals`, `message_reactions`, `message_echoes`, `feed`, `messaging_policy_enforcement` |
+| Instagram | `messages`, `messaging_postbacks`, `messaging_seen`, `message_reactions`, `messaging_referral`, `comments` |
+
+`feed` and `comments` power the [comment pipeline](./features/comments.md)
+(dispatch is opt-in via `COMMENTS_ENABLED`; the subscriptions are always on so
+enabling it later needs no re-registration). `messaging_policy_enforcement`
+carries Meta's machine-readable policy notices — the dispatcher logs them at
+error level (see [Operational visibility](./features/operational-visibility.md)).
 
 #### Field-naming traps
 
 - **`messaging_referral` (singular, Instagram) vs `messaging_referrals` (plural, Messenger).** Meta uses different spellings for the same concept on the two products. Mixing them up silently breaks the referral webhook on whichever channel was misspelled — the Dashboard accepts the subscription, but no events fire.
 - **`message_reads` (Messenger) vs `messaging_seen` (Instagram).** Same concept (read receipt), different field name.
-- **`message_echoes` is not exposed in the Instagram Dashboard UI.** Messenger's Dashboard UI exposes it; Instagram's does not. The field IS a valid Instagram subscription — `subscribeInstagramApp` (called by `setup:all` / `setup:instagram`) registers it via the Graph API. If you're subscribing Instagram manually in the Dashboard and don't see `message_echoes` in the list, that's expected — fall back to `npm run meta:webhooks`. Meta's UI behavior may evolve; if `message_echoes` later appears in the IG Dashboard, prefer the UI route.
+- **`message_echoes` is a Messenger-only field.** It is NOT a valid Instagram subscription — including it in the IG subscribe call rejects the whole call with HTTP 400 / code 100 (verified against the live API, 2026-05-20; see [Known gaps](./KNOWN-GAPS.md)). Instagram delivers echoes of your own outbound anyway, riding the `messages` field with `is_echo: true` (measured August 2026) — there is simply no separate field to subscribe.
 
 #### Dashboard fields to NOT subscribe to
 
-- **Instagram Dashboard also exposes** `comments`, `mentions`, `live_comments`, and `story_insights`. These are out of scope for the messaging-agent use case. They land in the parser's `unknown` bucket and pollute logs; do not subscribe.
+- **Instagram Dashboard also exposes** `mentions`, `live_comments`, and `story_insights`. These are out of scope for this package. They land in the parser's `unknown` bucket and pollute logs; do not subscribe. (`comments` used to be on this list — it became a first-class subscription with the [comment pipeline](./features/comments.md). Note its webhook DELIVERY is Advanced-Access-gated even though the subscription is accepted at Standard Access; the IG comment poller is the delivery path until then.)
 - **`message_edits` and `message_context`** are 2025-era subscription fields that appear in the Dashboard (WhatsApp + Messenger for `message_edits`; varying per product for `message_context`). The parser in this package does **not** support either yet — see the entries in [Known gaps](./KNOWN-GAPS.md). Do not subscribe until parser support lands; the events would arrive but normalize to `MessageType: 'unknown'`.
 
 Messenger's webhook field options in the Dashboard differ from Instagram's. They share `messages` / `messaging_postbacks` / `message_reactions` but diverge on the read-receipt and referral field names (as above). Always cross-check against `SUBSCRIBED_FIELDS`.

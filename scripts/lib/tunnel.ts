@@ -37,6 +37,15 @@ export interface TunnelOptions {
   region?: string;
 }
 
+/**
+ * LIFETIME: hold this object for as long as the tunnel must stay up. Its
+ * closure is the only reference to the native ngrok Listener, and once it is
+ * garbage-collected the SDK closes the tunnel — the endpoint goes "offline"
+ * with no error anywhere in this process. Observed live (August 2026) in a
+ * throwaway script that did `await startTunnel(...)` without keeping the
+ * result: ready at first, dead minutes later. Every caller in this repo
+ * stores the handle (and closes it on shutdown).
+ */
 export interface ActiveTunnel {
   /** Public HTTPS URL (no trailing slash). Safe to use as a webhook callback. */
   url: string;
