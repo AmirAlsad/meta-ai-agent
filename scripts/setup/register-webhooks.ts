@@ -667,16 +667,23 @@ export async function inspectExistingSubscriptions(
 /* CLI entry point                                                            */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-function parseArgs(argv: string[]): { callbackUrl?: string; inspect: boolean; help: boolean } {
+function parseArgs(argv: string[]): {
+  callbackUrl?: string;
+  inspect: boolean;
+  help: boolean;
+  yes: boolean;
+} {
   let callbackUrl: string | undefined;
   let inspect = false;
   let help = false;
+  let yes = false;
   for (const arg of argv) {
     if (arg === '--help' || arg === '-h') help = true;
     else if (arg === '--inspect' || arg === '-i') inspect = true;
+    else if (arg === '--yes' || arg === '-y') yes = true;
     else if (arg.startsWith('--callback-url=')) callbackUrl = arg.slice('--callback-url='.length);
   }
-  return { callbackUrl, inspect, help };
+  return { callbackUrl, inspect, help, yes };
 }
 
 function printHelp(): void {
@@ -690,6 +697,7 @@ function printHelp(): void {
       '  --callback-url=<url>  Public HTTPS webhook URL (e.g. https://abc.ngrok.app/webhook).',
       '                        If omitted, PUBLIC_BASE_URL env var is used (with /webhook appended).',
       '  --inspect, -i         Print current subscriptions and exit without modifying anything.',
+      '  --yes, -y             Skip the confirmation prompt (for non-interactive runs).',
       '  --help, -h            Show this help.',
       ''
     ].join('\n')
@@ -833,7 +841,7 @@ async function runCli(): Promise<number> {
 
   let proceed: boolean;
   try {
-    proceed = await confirm('Proceed with webhook registration?', false);
+    proceed = args.yes || (await confirm('Proceed with webhook registration?', false));
   } finally {
     // Don't leak the readline if the user just hit Enter — but keep it open
     // briefly so a Ctrl-C in the prompt still routes through the SIGINT
