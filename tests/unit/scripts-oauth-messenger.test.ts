@@ -9,6 +9,7 @@ import {
   selectPage,
   type PageEntry
 } from '../../scripts/setup/oauth-messenger.js';
+import { messengerEnvVarNames } from '../../scripts/setup/oauth-messenger.js';
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* URL builders                                                               */
@@ -126,10 +127,11 @@ describe('buildMeAccountsUrl', () => {
 /* ────────────────────────────────────────────────────────────────────────── */
 
 describe('parseFlags', () => {
-  it('defaults to all-false flags', () => {
+  it('defaults to all-false flags with the default account', () => {
     expect(parseFlags([])).toEqual({
       help: false,
-      reveal: false
+      reveal: false,
+      account: 'default'
     });
   });
   it('parses --help / -h', () => {
@@ -231,5 +233,31 @@ describe('selectPage', () => {
   it('treats a whitespace-only MESSENGER_PAGE_ID the same as undefined', () => {
     const result = selectPage([pageA, pageB], '   ');
     expect(result.mode).toBe('prompt');
+  });
+});
+
+describe('multi-account (--account) support', () => {
+  it('parses --account=<name> and rejects malformed names', () => {
+    expect(parseFlags(['--account=iris'])).toMatchObject({ account: 'iris' });
+    expect(() => parseFlags(['--account='])).toThrow(/--account requires/);
+    expect(() => parseFlags(['--account=bad_name'])).toThrow(/--account requires/);
+  });
+
+  it('messengerEnvVarNames maps default to bare vars and names to the suffixed form', () => {
+    expect(messengerEnvVarNames('default')).toEqual({
+      pageId: 'MESSENGER_PAGE_ID',
+      pageAccessToken: 'MESSENGER_PAGE_ACCESS_TOKEN'
+    });
+    expect(messengerEnvVarNames('iris')).toEqual({
+      pageId: 'MESSENGER_PAGE_ID__iris',
+      pageAccessToken: 'MESSENGER_PAGE_ACCESS_TOKEN__iris'
+    });
+  });
+
+  it('hasExistingMessengerPageToken is account-scoped', () => {
+    const env = 'MESSENGER_PAGE_ACCESS_TOKEN=EAAtok\n';
+    expect(hasExistingMessengerPageToken(env, 'default')).toBe(true);
+    expect(hasExistingMessengerPageToken(env, 'iris')).toBe(false);
+    expect(hasExistingMessengerPageToken(env + 'MESSENGER_PAGE_ACCESS_TOKEN__iris=EAAtok2\n', 'iris')).toBe(true);
   });
 });

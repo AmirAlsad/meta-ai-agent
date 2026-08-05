@@ -132,6 +132,13 @@ const LONG_LIVED_THRESHOLD_SECONDS = 5_000_000;
 interface CliFlags {
   help: boolean;
   reveal: boolean;
+  /**
+   * Which account's env vars to target (`--account=<name>`). `'default'` uses
+   * the classic bare MESSENGER_PAGE_ID / MESSENGER_PAGE_ACCESS_TOKEN; any
+   * other name reads/writes the multi-account suffixed form
+   * (MESSENGER_PAGE_ID__<name> / MESSENGER_PAGE_ACCESS_TOKEN__<name>).
+   */
+  account: string;
 }
 
 interface UserAccessTokenResponse {
@@ -302,7 +309,8 @@ export function buildMeAccountsUrl(args: {
 export function parseFlags(argv: readonly string[]): CliFlags {
   const flags: CliFlags = {
     help: false,
-    reveal: false
+    reveal: false,
+    account: 'default'
   };
   for (const raw of argv) {
     if (raw === '--help' || raw === '-h') {
@@ -313,9 +321,31 @@ export function parseFlags(argv: readonly string[]): CliFlags {
       flags.reveal = true;
       continue;
     }
+    if (raw.startsWith('--account=')) {
+      const value = raw.slice('--account='.length).trim();
+      if (value === '' || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(value)) {
+        throw new Error(
+          '--account requires a name matching [A-Za-z0-9][A-Za-z0-9-]* (use "default" for the bare vars).'
+        );
+      }
+      flags.account = value;
+      continue;
+    }
     throw new Error(`Unknown flag: ${raw}. Run with --help for usage.`);
   }
   return flags;
+}
+
+/**
+ * The env var names this run reads/writes: the bare pair for `default`, the
+ * `__<name>`-suffixed pair (the loader's multi-account form) otherwise.
+ */
+export function messengerEnvVarNames(account: string): { pageId: string; pageAccessToken: string } {
+  const suffix = account === 'default' ? '' : `__${account}`;
+  return {
+    pageId: `MESSENGER_PAGE_ID${suffix}`,
+    pageAccessToken: `MESSENGER_PAGE_ACCESS_TOKEN${suffix}`
+  };
 }
 
 /**
@@ -329,8 +359,9 @@ export function parseFlags(argv: readonly string[]): CliFlags {
  * in which case the script will auto-select that Page. We only refuse to
  * clobber the TOKEN.
  */
-export function hasExistingMessengerPageToken(envContents: string): boolean {
-  return /^\s*MESSENGER_PAGE_ACCESS_TOKEN=\S/m.test(envContents);
+export function hasExistingMessengerPageToken(envContents: string, account = 'default'): boolean {
+  const suffix = account === 'default' ? '' : `__${account}`;
+  return new RegExp(`^\\s*MESSENGER_PAGE_ACCESS_TOKEN${suffix}=\\S`, 'm').test(envContents);
 }
 
 /**
@@ -386,6 +417,9 @@ Usage:
 
 Options:
   --reveal                Print the Page Access Token unmasked. Default masks.
+  --account=<name>        Read/write the multi-account suffixed env vars
+                          (MESSENGER_PAGE_ID__<name> / MESSENGER_PAGE_ACCESS_TOKEN__<name>).
+                          Default "default" uses the bare vars.
   --help, -h              Show this message.
 
 Environment:
@@ -462,7 +496,11 @@ async function main(): Promise<void> {
   const graphApiVersion = (process.env['META_GRAPH_API_VERSION'] ?? 'v25.0').trim();
   const port = parsePort(process.env['PORT']);
   const ngrokDomain = (process.env['NGROK_DOMAIN'] ?? '').trim();
-  const targetPageId = (process.env['MESSENGER_PAGE_ID'] ?? '').trim();
+  const envNames = messengerEnvVarNames(flags.account);
+  // For a named account, auto-selection keys on the SUFFIXED page-id var — the
+  // bare MESSENGER_PAGE_ID belongs to the default account and would silently
+  // pick the wrong Page.
+  const targetPageId = (process.env[envNames.pageId] ?? '').trim();
 
   if (!appId) {
     fail('META_APP_ID must be set in .env.');
@@ -654,7 +692,7 @@ async function main(): Promise<void> {
       chosen = selection.selected;
       info(
         targetPageId
-          ? `Auto-selected Page matching MESSENGER_PAGE_ID=${targetPageId}: ${chosen.name} (${chosen.id}).`
+          ? `Auto-selected Page matching ${envNames.pageId}=${targetPageId}: ${chosen.name} (${chosen.id}).`
           : `Auto-selected the only available Page: ${chosen.name} (${chosen.id}).`
       );
     } else {
@@ -663,9 +701,9 @@ async function main(): Promise<void> {
 
     // ── 8. Print captured credentials ─────────────────────────────────────
     divider('Captured Credentials');
-    info(`MESSENGER_PAGE_ID=${chosen.id}`);
+    info(`${envNames.pageId}=${chosen.id}`);
     info(
-      `MESSENGER_PAGE_ACCESS_TOKEN=${flags.reveal ? chosen.access_token : maskToken(chosen.access_token)}`
+      `${envNames.pageAccessToken}=${flags.reveal ? chosen.access_token : maskToken(chosen.access_token)}`
     );
     info(`Page: ${chosen.name}${chosen.category ? ` (${chosen.category})` : ''}`);
     if (chosen.tasks && chosen.tasks.length > 0) {
@@ -681,7 +719,8 @@ async function main(): Promise<void> {
       pageAccessToken: chosen.access_token,
       // Only write the page id line if .env doesn't already carry a non-empty one;
       // otherwise we'd risk clobbering or duplicating it.
-      includePageIdLine: true
+      includePageIdLine: true,
+      account: flags.account
     });
 
     success(
@@ -954,11 +993,13 @@ async function maybeAppendToEnv(args: {
   pageId: string;
   pageAccessToken: string;
   includePageIdLine: boolean;
+  account: string;
 }): Promise<void> {
+  const envNames = messengerEnvVarNames(args.account);
   const envPath = path.resolve(process.cwd(), '.env');
   const exists = await fileExists(envPath);
   const yes = await confirm(
-    exists ? 'Append MESSENGER_PAGE_ACCESS_TOKEN to .env now?' : '.env not found in cwd — create it now?',
+    exists ? `Append ${envNames.pageAccessToken} to .env now?` : '.env not found in cwd — create it now?',
     false
   );
   if (!yes) {
@@ -975,9 +1016,9 @@ async function maybeAppendToEnv(args: {
   let hasExistingPageId = false;
   if (exists) {
     const existing = await readFile(envPath, 'utf8');
-    if (hasExistingMessengerPageToken(existing)) {
+    if (hasExistingMessengerPageToken(existing, args.account)) {
       fail(
-        'Existing non-empty MESSENGER_PAGE_ACCESS_TOKEN line found in .env. ' +
+        `Existing non-empty ${envNames.pageAccessToken} line found in .env. ` +
           'Remove or clear that line manually to avoid clobbering an existing value.'
       );
       return;
@@ -985,21 +1026,22 @@ async function maybeAppendToEnv(args: {
     // Don't duplicate MESSENGER_PAGE_ID if it already carries a non-empty value
     // (the user-supplied one and the OAuth-picked one match by construction —
     // selectPage() auto-picked precisely because they matched).
-    hasExistingPageId = /^\s*MESSENGER_PAGE_ID=\S/m.test(existing);
+    hasExistingPageId = new RegExp(`^\\s*${envNames.pageId}=\\S`, 'm').test(existing);
   }
 
+  const accountLabel = args.account === 'default' ? '' : ` — account "${args.account}"`;
   const pageIdLine =
-    args.includePageIdLine && !hasExistingPageId ? `MESSENGER_PAGE_ID=${args.pageId}\n` : '';
+    args.includePageIdLine && !hasExistingPageId ? `${envNames.pageId}=${args.pageId}\n` : '';
   const block =
     (exists ? '\n' : '') +
-    `# Messenger Page Access Token (captured ${new Date().toISOString()} via FB Login for Business)\n` +
+    `# Messenger Page Access Token (captured ${new Date().toISOString()} via FB Login for Business${accountLabel})\n` +
     pageIdLine +
-    `MESSENGER_PAGE_ACCESS_TOKEN=${args.pageAccessToken}\n`;
+    `${envNames.pageAccessToken}=${args.pageAccessToken}\n`;
   await appendFile(envPath, block, 'utf8');
   success(
     pageIdLine
-      ? `Wrote MESSENGER_PAGE_ID and MESSENGER_PAGE_ACCESS_TOKEN to ${envPath}.`
-      : `Wrote MESSENGER_PAGE_ACCESS_TOKEN to ${envPath} (MESSENGER_PAGE_ID already present, skipped).`
+      ? `Wrote ${envNames.pageId} and ${envNames.pageAccessToken} to ${envPath}.`
+      : `Wrote ${envNames.pageAccessToken} to ${envPath} (${envNames.pageId} already present, skipped).`
   );
 }
 

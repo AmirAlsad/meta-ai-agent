@@ -4,7 +4,7 @@ import path from 'node:path';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import type pino from 'pino';
 import type { Config } from '../config/loader.js';
-import { tokenFormatWarnings } from '../config/loader.js';
+import { configuredAccounts, tokenFormatWarnings } from '../config/loader.js';
 import { createMetaSignatureVerifier } from './security.js';
 import { traceMiddleware, requestContextFromLocals } from './trace.js';
 import { validateAdminToken } from './auth.js';
@@ -445,8 +445,14 @@ export function createApp(deps: AppDeps): express.Express {
   // 2026-05-20). The verifier accepts a signature that matches ANY configured
   // secret — see src/http/security.ts for the try-all rationale.
   const signatureSecrets = [config.meta.appSecret];
-  if (config.instagram?.appSecret && !signatureSecrets.includes(config.instagram.appSecret)) {
-    signatureSecrets.push(config.instagram.appSecret);
+  // Multi-account: collect every configured IG account's secret (normally they
+  // all share the one app-level INSTAGRAM_APP_SECRET; the loader inherits the
+  // bare var per account, so this usually adds a single entry).
+  const igAccounts = configuredAccounts(config).instagram;
+  for (const account of igAccounts) {
+    if (account.appSecret && !signatureSecrets.includes(account.appSecret)) {
+      signatureSecrets.push(account.appSecret);
+    }
   }
 
   // Foot-gun guard: an enabled Instagram channel WITHOUT its app secret means
@@ -454,7 +460,7 @@ export function createApp(deps: AppDeps): express.Express {
   // from the developer's perspective. We don't throw at config load (so
   // WhatsApp+Messenger-only and partial setups keep running), but we surface it
   // loudly at startup so the cause is discoverable.
-  if (config.channels.instagram && !config.instagram?.appSecret) {
+  if (config.channels.instagram && !igAccounts.some(account => account.appSecret)) {
     logger.warn(
       { channel: 'instagram' },
       'Instagram channel enabled but INSTAGRAM_APP_SECRET not set — inbound Instagram webhooks will fail signature verification.'

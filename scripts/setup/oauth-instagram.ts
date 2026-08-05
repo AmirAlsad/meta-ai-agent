@@ -77,6 +77,13 @@ const CALLBACK_PATH = '/auth/instagram/callback';
 interface CliFlags {
   help: boolean;
   reveal: boolean;
+  /**
+   * Which account's env vars to write (`--account=<name>`). `'default'` uses
+   * the classic bare INSTAGRAM_USER_ID / INSTAGRAM_ACCESS_TOKEN; any other
+   * name writes the multi-account suffixed form
+   * (INSTAGRAM_USER_ID__<name> / INSTAGRAM_ACCESS_TOKEN__<name>).
+   */
+  account: string;
 }
 
 interface ShortLivedTokenResponse {
@@ -189,15 +196,33 @@ export function formatExpiresIn(seconds: number | undefined): string {
  * it lets us distinguish a real value from an empty placeholder copied from
  * `.env.example` (which would otherwise block a first-time OAuth capture).
  */
-export function hasExistingInstagramValue(envContents: string): boolean {
-  return /^\s*INSTAGRAM_(USER_ID|ACCESS_TOKEN)=\S/m.test(envContents);
+export function hasExistingInstagramValue(envContents: string, account = 'default'): boolean {
+  const suffix = account === 'default' ? '' : `__${account}`;
+  const pattern = new RegExp(
+    `^\\s*INSTAGRAM_(USER_ID|ACCESS_TOKEN)${suffix.replace(/[-]/g, '\\-')}=\\S`,
+    'm'
+  );
+  return pattern.test(envContents);
+}
+
+/**
+ * The env var names this run writes: the bare pair for `default`, the
+ * `__<name>`-suffixed pair (the loader's multi-account form) otherwise.
+ */
+export function instagramEnvVarNames(account: string): { userId: string; accessToken: string } {
+  const suffix = account === 'default' ? '' : `__${account}`;
+  return {
+    userId: `INSTAGRAM_USER_ID${suffix}`,
+    accessToken: `INSTAGRAM_ACCESS_TOKEN${suffix}`
+  };
 }
 
 /** Parse `process.argv` slice into a typed flag bag. Throws on unknown flags. */
 export function parseFlags(argv: readonly string[]): CliFlags {
   const flags: CliFlags = {
     help: false,
-    reveal: false
+    reveal: false,
+    account: 'default'
   };
   for (const raw of argv) {
     if (raw === '--help' || raw === '-h') {
@@ -206,6 +231,16 @@ export function parseFlags(argv: readonly string[]): CliFlags {
     }
     if (raw === '--reveal') {
       flags.reveal = true;
+      continue;
+    }
+    if (raw.startsWith('--account=')) {
+      const value = raw.slice('--account='.length).trim();
+      if (value === '' || !/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(value)) {
+        throw new Error(
+          '--account requires a name matching [A-Za-z0-9][A-Za-z0-9-]* (use "default" for the bare vars).'
+        );
+      }
+      flags.account = value;
       continue;
     }
     throw new Error(`Unknown flag: ${raw}. Run with --help for usage.`);
@@ -283,6 +318,9 @@ Usage:
 
 Options:
   --reveal                Print the long-lived token unmasked. Default masks.
+  --account=<name>        Write the multi-account suffixed env vars
+                          (INSTAGRAM_USER_ID__<name> / INSTAGRAM_ACCESS_TOKEN__<name>).
+                          Default "default" writes the bare vars.
   --help, -h              Show this message.
 
 Environment:
@@ -507,9 +545,10 @@ async function main(): Promise<void> {
 
     // ── 7. Print summary ───────────────────────────────────────────────────
     divider('Captured Credentials');
-    info(`INSTAGRAM_USER_ID=${userId}`);
+    const envNames = instagramEnvVarNames(flags.account);
+    info(`${envNames.userId}=${userId}`);
     info(
-      `INSTAGRAM_ACCESS_TOKEN=${flags.reveal ? longLived.access_token : maskToken(longLived.access_token)}`
+      `${envNames.accessToken}=${flags.reveal ? longLived.access_token : maskToken(longLived.access_token)}`
     );
     if (username) info(`username: @${username}`);
     info(`expires_in: ${formatExpiresIn(longLived.expires_in)}`);
@@ -518,7 +557,7 @@ async function main(): Promise<void> {
     }
 
     // ── 8. Optional .env append ────────────────────────────────────────────
-    await maybeAppendToEnv({ userId, accessToken: longLived.access_token });
+    await maybeAppendToEnv({ userId, accessToken: longLived.access_token, account: flags.account });
 
     success('Done. The long-lived token is valid for ~60 days; refresh before expiry.');
   } catch (err) {
@@ -760,7 +799,12 @@ function tryParseJson(raw: string): unknown {
 /* .env writing                                                               */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-async function maybeAppendToEnv(args: { userId: string; accessToken: string }): Promise<void> {
+async function maybeAppendToEnv(args: {
+  userId: string;
+  accessToken: string;
+  account: string;
+}): Promise<void> {
+  const envNames = instagramEnvVarNames(args.account);
   const envPath = path.resolve(process.cwd(), '.env');
   const exists = await fileExists(envPath);
   const yes = await confirm(
@@ -777,9 +821,9 @@ async function maybeAppendToEnv(args: { userId: string; accessToken: string }): 
   // copied verbatim from .env.example) — those should not block a fresh capture.
   if (exists) {
     const existing = await readFile(envPath, 'utf8');
-    if (hasExistingInstagramValue(existing)) {
+    if (hasExistingInstagramValue(existing, args.account)) {
       fail(
-        'Existing non-empty INSTAGRAM_USER_ID or INSTAGRAM_ACCESS_TOKEN line found in .env. ' +
+        `Existing non-empty ${envNames.userId} or ${envNames.accessToken} line found in .env. ` +
           'Remove or clear those lines manually to avoid clobbering existing values.'
       );
       return;
@@ -787,13 +831,14 @@ async function maybeAppendToEnv(args: { userId: string; accessToken: string }): 
   }
 
   // Ensure a trailing newline before our block so we don't merge lines.
+  const accountLabel = args.account === 'default' ? '' : ` — account "${args.account}"`;
   const block =
     (exists ? '\n' : '') +
-    `# Instagram Business Login (captured ${new Date().toISOString()})\n` +
-    `INSTAGRAM_USER_ID=${args.userId}\n` +
-    `INSTAGRAM_ACCESS_TOKEN=${args.accessToken}\n`;
+    `# Instagram Business Login (captured ${new Date().toISOString()}${accountLabel})\n` +
+    `${envNames.userId}=${args.userId}\n` +
+    `${envNames.accessToken}=${args.accessToken}\n`;
   await appendFile(envPath, block, 'utf8');
-  success(`Wrote INSTAGRAM_USER_ID and INSTAGRAM_ACCESS_TOKEN to ${envPath}.`);
+  success(`Wrote ${envNames.userId} and ${envNames.accessToken} to ${envPath}.`);
 }
 
 async function fileExists(p: string): Promise<boolean> {

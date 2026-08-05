@@ -49,6 +49,12 @@ export type VerifyChannel = 'whatsapp' | 'messenger' | 'instagram';
 export type VerifyTarget = VerifyChannel | 'all';
 
 export interface ParsedArgs {
+  /**
+   * Which configured account to verify (`--account=<name>`). Defaults to
+   * `'default'` — the bare-var account. Multi-account deploys pass the
+   * `__<name>` suffix name (e.g. `--account=reed`).
+   */
+  account: string;
   /** Channels to verify. Defaults to all configured channels. */
   channels: VerifyChannel[];
   /** Skip the `registerAllWebhooks` call in `bootstrapVerifyContext`. */
@@ -120,6 +126,7 @@ const VALID_CHANNELS: ReadonlySet<VerifyChannel> = new Set([
  */
 export function parseVerifyArgs(argv: readonly string[]): ParsedArgs {
   const flags: ParsedArgs = {
+    account: 'default',
     channels: [],
     skipWebhookRegistration: false,
     skipOutbound: false,
@@ -139,6 +146,14 @@ export function parseVerifyArgs(argv: readonly string[]): ParsedArgs {
     }
     if (raw === '--skip-outbound') {
       flags.skipOutbound = true;
+      continue;
+    }
+    if (raw.startsWith('--account=')) {
+      const value = raw.slice('--account='.length).trim();
+      if (value === '') {
+        throw new Error('--account requires a value: --account=<name> (use "default" for the bare env vars).');
+      }
+      flags.account = value;
       continue;
     }
     if (raw === '--accept-invalid-signatures') {
@@ -201,6 +216,27 @@ function parsePortEnv(raw: string | undefined): number {
  * `verify-whatsapp`) is interpolated so the example commands print the
  * caller's actual name without each script re-defining the help body.
  */
+/**
+ * Pick the account named by `--account` from a channel's configured accounts.
+ * Returns `undefined` (after printing a remediation) when the name is unknown —
+ * callers treat that exactly like missing credentials. A single-account deploy
+ * never sees this: the default of `'default'` matches the bare-var account.
+ */
+export function selectVerifyAccount<T extends { accountName: string }>(
+  accounts: T[],
+  requested: string,
+  channelLabel: string
+): T | undefined {
+  const match = accounts.find((account) => account.accountName === requested);
+  if (match) return match;
+  if (accounts.length === 0) return undefined;
+  fail(
+    `No ${channelLabel} account named "${requested}". Configured: ` +
+      accounts.map((a) => a.accountName).join(', ')
+  );
+  return undefined;
+}
+
 export function printVerifyHelp(scriptName: string): void {
   process.stdout.write(
     [
@@ -216,6 +252,7 @@ export function printVerifyHelp(scriptName: string): void {
       '  --skip-webhook-registration   Skip programmatic webhook subscription;',
       '                                assume it has already been done.',
       '  --skip-outbound               Skip the outbound send-test (template/reply).',
+      '  --account=<name>              Verify the named account (default: the bare-var "default" account).',
       '  --ngrok-domain=<domain>       Reserved ngrok subdomain (stable URL).',
       '  --port=<n>                    Local capture-server port. Default: $PORT or 3000.',
       '  --accept-invalid-signatures   Capture webhooks even when X-Hub-Signature-256',

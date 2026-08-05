@@ -89,6 +89,7 @@ Stage 6 adds the operational surface. The agent records per-outbound-message del
 - [Meta payload structures](./docs/META-PAYLOAD-STRUCTURES.md) — observed payload shapes (populated as captures land).
 - [Trusted sources](./docs/TRUSTED-SOURCES.md) — curated Meta documentation references.
 - [Configuration](./docs/features/configuration.md)
+- [Multi-account](./docs/features/multi-account.md) — several Pages / IG accounts / WhatsApp numbers under one app, declared with `__<name>`-suffixed env vars; the `AdapterRegistry` routes outbound by `channel:businessId` and the chat request carries `accountName`.
 - [Webhook security](./docs/features/webhook-security.md)
 - [Inbound webhooks](./docs/features/inbound-webhooks.md)
 - [Message parsing](./docs/features/message-parsing.md)

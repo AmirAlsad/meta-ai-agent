@@ -185,11 +185,68 @@ export interface LimitsConfig {
   transientRetryMaxMs: number;
 }
 
+/** A channel credential set plus the account name it was declared under. */
+export interface NamedWhatsAppConfig extends WhatsAppConfig {
+  accountName: string;
+}
+export interface NamedMessengerConfig extends MessengerConfig {
+  accountName: string;
+}
+export interface NamedInstagramConfig extends InstagramConfig {
+  accountName: string;
+}
+
+/**
+ * Multi-account collections, one list per channel.
+ *
+ * Declared in the environment with a `__<name>` suffix on every credential
+ * var of the account: `MESSENGER_PAGE_ID__reed` + `MESSENGER_PAGE_ACCESS_TOKEN__reed`
+ * declares Messenger account `reed`; `INSTAGRAM_USER_ID__iris` +
+ * `INSTAGRAM_ACCESS_TOKEN__iris` declares Instagram account `iris`. Names are
+ * discovered by scanning the environment for the suffixed PRIMARY var of each
+ * channel (`WHATSAPP_PHONE_NUMBER_ID__*` / `MESSENGER_PAGE_ID__*` /
+ * `INSTAGRAM_USER_ID__*`), so there is no separate account-list var to drift
+ * out of sync. The classic bare vars keep working and declare the account
+ * named `default` — a single-account deploy needs no changes at all.
+ *
+ * Validation (fail-fast, same posture as the rest of the loader):
+ *  - names must match `[A-Za-z0-9][A-Za-z0-9-]*` (no underscores — `__` is the
+ *    delimiter) and must not be the reserved `default`;
+ *  - a half-configured named account throws, exactly like the bare form;
+ *  - two accounts on one channel sharing a business id throw (inbound routing
+ *    would be ambiguous).
+ *
+ * Per-account optional vars follow the same suffix: `WHATSAPP_BUSINESS_ACCOUNT_ID__<name>`.
+ * `INSTAGRAM_APP_SECRET` is APP-level (it verifies webhook signatures for the
+ * whole app, not one account) — a named IG account inherits the bare var, with
+ * `INSTAGRAM_APP_SECRET__<name>` accepted as an override for the unusual
+ * multi-app setup.
+ */
+export interface AccountsConfig {
+  whatsapp: NamedWhatsAppConfig[];
+  messenger: NamedMessengerConfig[];
+  instagram: NamedInstagramConfig[];
+}
+
 export interface Config {
   meta: MetaConfig;
+  /**
+   * The `default` account's credentials (the bare, unsuffixed env vars) — kept
+   * for backward compatibility with existing callers and setup scripts. The
+   * same credentials ALSO appear in `accounts.<channel>` as the entry named
+   * `default`; new code should iterate `accounts`.
+   */
   whatsapp?: WhatsAppConfig;
   messenger?: MessengerConfig;
   instagram?: InstagramConfig;
+  /**
+   * Every configured account per channel, `default` (when present) first.
+   * OPTIONAL on the type so hand-assembled configs (tests, embedders) that
+   * predate multi-account keep compiling — `loadConfig` always populates it,
+   * and consumers read it through {@link configuredAccounts}, which derives
+   * the single-account form from the legacy fields when absent.
+   */
+  accounts?: AccountsConfig;
   channels: Channels;
   conversation: ConversationConfig;
   persistence: PersistenceConfig;
@@ -273,6 +330,102 @@ function loadChannelCredentials<Required, Out = Required>(
     );
   }
   return map(resolved as Record<keyof Required, string>);
+}
+
+/**
+ * Account names allowed in the `__<name>` suffix form. No underscores: `__` is
+ * the delimiter, and a name containing it would parse ambiguously. `default`
+ * is reserved for the bare-var account.
+ */
+const ACCOUNT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
+
+/**
+ * Scan the environment for `${primaryEnvVar}__<name>` keys and return the
+ * discovered account names, sorted for deterministic load order. Throws on a
+ * malformed or reserved name — a typo'd suffix silently creating a half-broken
+ * account is exactly the failure mode the loader's fail-fast posture exists to
+ * prevent.
+ */
+function discoverAccountNames(env: ConfigEnv, primaryEnvVar: string): string[] {
+  const prefix = `${primaryEnvVar}__`;
+  const names: string[] = [];
+  for (const key of Object.keys(env)) {
+    if (!key.startsWith(prefix)) continue;
+    // Skip unset/blank values — an empty suffixed var is "not declared", same
+    // as the bare-var convention in `trimmed`.
+    if (trimmed(env, key) === undefined) continue;
+    const name = key.slice(prefix.length);
+    if (!ACCOUNT_NAME_PATTERN.test(name)) {
+      throw new Error(
+        `Invalid account name "${name}" in ${key}. Account names must match ` +
+          `[A-Za-z0-9][A-Za-z0-9-]* (letters, digits, hyphens; no underscores).`
+      );
+    }
+    if (name === 'default') {
+      throw new Error(
+        `Invalid account name "default" in ${key}. "default" is reserved for the ` +
+          `bare (unsuffixed) variables — use those instead.`
+      );
+    }
+    names.push(name);
+  }
+  return names.sort();
+}
+
+/**
+ * Load every `__<name>`-suffixed account for one channel. Reuses
+ * {@link loadChannelCredentials} per name (so a half-configured named account
+ * throws with the exact suffixed var names), then layers channel-specific
+ * optional fields via `map`.
+ */
+function loadNamedAccounts<Required, Out>(
+  env: ConfigEnv,
+  channel: string,
+  primaryEnvVar: string,
+  fields: Record<keyof Required, string>,
+  map: (values: Record<keyof Required, string>, accountName: string) => Out
+): Out[] {
+  const out: Out[] = [];
+  for (const name of discoverAccountNames(env, primaryEnvVar)) {
+    const suffixedFields = Object.fromEntries(
+      Object.entries(fields).map(([key, envName]) => [key, `${envName as string}__${name}`])
+    ) as Record<keyof Required, string>;
+    const loaded = loadChannelCredentials<Required, Out>(
+      env,
+      `${channel} account "${name}"`,
+      suffixedFields,
+      values => map(values, name)
+    );
+    // loadChannelCredentials returns undefined only when NO field was set, and
+    // discovery guarantees the primary var is set — so this is always defined;
+    // the guard keeps the type system honest.
+    if (loaded !== undefined) out.push(loaded);
+  }
+  return out;
+}
+
+/**
+ * Throw when two accounts on one channel share a business id — the inbound
+ * webhook's `channelScopedBusinessId` is the routing key, so a duplicate makes
+ * routing ambiguous and is always a copy/paste mistake.
+ */
+function assertUniqueBusinessIds(
+  channel: string,
+  accounts: Array<{ accountName: string }>,
+  idOf: (account: { accountName: string }) => string
+): void {
+  const seen = new Map<string, string>();
+  for (const account of accounts) {
+    const id = idOf(account);
+    const existing = seen.get(id);
+    if (existing !== undefined) {
+      throw new Error(
+        `Duplicate ${channel} business id ${id}: accounts "${existing}" and "${account.accountName}" ` +
+          `both declare it. Each account must have a distinct id.`
+      );
+    }
+    seen.set(id, account.accountName);
+  }
 }
 
 function loadGraphApiVersion(env: ConfigEnv): string {
@@ -740,10 +893,86 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     }
   );
 
+  // Named (multi-account) collections, discovered from `__<name>`-suffixed env
+  // vars. The bare-var account (when present) joins each list as `default`,
+  // first, so `accounts.<channel>[0]` is the classic single-account config on
+  // an unchanged deploy.
+  const namedWhatsApp = loadNamedAccounts<
+    { phoneNumberId: string; accessToken: string },
+    NamedWhatsAppConfig
+  >(
+    env,
+    'WhatsApp',
+    'WHATSAPP_PHONE_NUMBER_ID',
+    { phoneNumberId: 'WHATSAPP_PHONE_NUMBER_ID', accessToken: 'WHATSAPP_ACCESS_TOKEN' },
+    (values, accountName) => {
+      const businessAccountId = trimmed(env, `WHATSAPP_BUSINESS_ACCOUNT_ID__${accountName}`);
+      return {
+        accountName,
+        phoneNumberId: values.phoneNumberId,
+        accessToken: values.accessToken,
+        ...(businessAccountId !== undefined ? { businessAccountId } : {})
+      };
+    }
+  );
+  const namedMessenger = loadNamedAccounts<
+    { pageId: string; pageAccessToken: string },
+    NamedMessengerConfig
+  >(
+    env,
+    'Messenger',
+    'MESSENGER_PAGE_ID',
+    { pageId: 'MESSENGER_PAGE_ID', pageAccessToken: 'MESSENGER_PAGE_ACCESS_TOKEN' },
+    (values, accountName) => ({
+      accountName,
+      pageId: values.pageId,
+      pageAccessToken: values.pageAccessToken
+    })
+  );
+  const namedInstagram = loadNamedAccounts<
+    { userId: string; accessToken: string },
+    NamedInstagramConfig
+  >(
+    env,
+    'Instagram',
+    'INSTAGRAM_USER_ID',
+    { userId: 'INSTAGRAM_USER_ID', accessToken: 'INSTAGRAM_ACCESS_TOKEN' },
+    (values, accountName) => {
+      // The app secret is app-level (it signs webhooks for every account under
+      // the app) — inherit the bare var, allow a suffixed override.
+      const appSecret =
+        trimmed(env, `INSTAGRAM_APP_SECRET__${accountName}`) ?? trimmed(env, 'INSTAGRAM_APP_SECRET');
+      return {
+        accountName,
+        userId: values.userId,
+        accessToken: values.accessToken,
+        ...(appSecret !== undefined ? { appSecret } : {})
+      };
+    }
+  );
+
+  const accounts: AccountsConfig = {
+    whatsapp: [
+      ...(whatsapp !== undefined ? [{ accountName: 'default', ...whatsapp }] : []),
+      ...namedWhatsApp
+    ],
+    messenger: [
+      ...(messenger !== undefined ? [{ accountName: 'default', ...messenger }] : []),
+      ...namedMessenger
+    ],
+    instagram: [
+      ...(instagram !== undefined ? [{ accountName: 'default', ...instagram }] : []),
+      ...namedInstagram
+    ]
+  };
+  assertUniqueBusinessIds('WhatsApp', accounts.whatsapp, a => (a as NamedWhatsAppConfig).phoneNumberId);
+  assertUniqueBusinessIds('Messenger', accounts.messenger, a => (a as NamedMessengerConfig).pageId);
+  assertUniqueBusinessIds('Instagram', accounts.instagram, a => (a as NamedInstagramConfig).userId);
+
   const channels: Channels = {
-    whatsapp: whatsapp !== undefined,
-    messenger: messenger !== undefined,
-    instagram: instagram !== undefined
+    whatsapp: accounts.whatsapp.length > 0,
+    messenger: accounts.messenger.length > 0,
+    instagram: accounts.instagram.length > 0
   };
 
   if (!channels.whatsapp && !channels.messenger && !channels.instagram) {
@@ -751,7 +980,8 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
       'No messaging channel configured. Set credentials for at least one of WhatsApp ' +
         '(WHATSAPP_PHONE_NUMBER_ID + WHATSAPP_ACCESS_TOKEN), Messenger ' +
         '(MESSENGER_PAGE_ID + MESSENGER_PAGE_ACCESS_TOKEN), or Instagram ' +
-        '(INSTAGRAM_USER_ID + INSTAGRAM_ACCESS_TOKEN).'
+        '(INSTAGRAM_USER_ID + INSTAGRAM_ACCESS_TOKEN) — bare for a single account, ' +
+        'or suffixed (e.g. MESSENGER_PAGE_ID__reed) for named accounts.'
     );
   }
 
@@ -760,6 +990,7 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     whatsapp,
     messenger,
     instagram,
+    accounts,
     channels,
     conversation: loadConversationConfig(env),
     persistence: loadPersistenceConfig(env),
@@ -773,6 +1004,24 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     agentAutostart: loadAgentAutostart(env),
     port: loadPort(env),
     nodeEnv: trimmed(env, 'NODE_ENV') ?? 'development'
+  };
+}
+
+/**
+ * The account collections for a config, deriving them from the legacy
+ * per-channel fields when `accounts` is absent. `loadConfig` always populates
+ * `accounts`, so the fallback exists for hand-assembled configs (tests and
+ * embedders that cast a partial object to `Config`) — those carry at most the
+ * single bare-var account per channel, which is exactly what the derivation
+ * reconstructs. Every consumer that iterates accounts goes through this
+ * helper so a legacy-shaped config keeps working unchanged.
+ */
+export function configuredAccounts(config: Config): AccountsConfig {
+  if (config.accounts !== undefined) return config.accounts;
+  return {
+    whatsapp: config.whatsapp !== undefined ? [{ accountName: 'default', ...config.whatsapp }] : [],
+    messenger: config.messenger !== undefined ? [{ accountName: 'default', ...config.messenger }] : [],
+    instagram: config.instagram !== undefined ? [{ accountName: 'default', ...config.instagram }] : []
   };
 }
 
@@ -796,33 +1045,47 @@ export interface TokenFormatWarning {
 export function tokenFormatWarnings(config: Config): TokenFormatWarning[] {
   const warnings: TokenFormatWarning[] = [];
 
-  if (config.whatsapp && config.whatsapp.accessToken.length < 20) {
-    warnings.push({
-      field: 'WHATSAPP_ACCESS_TOKEN',
-      message:
-        'WhatsApp access token looks unusually short (<20 chars). Expected a long ' +
-        'System User / Cloud API token; double-check it was copied in full.'
-    });
+  // The `default` account's field is the bare var; named accounts report the
+  // suffixed var they were declared under, so the warning names the exact env
+  // line to fix.
+  const fieldFor = (bare: string, accountName: string): string =>
+    accountName === 'default' ? bare : `${bare}__${accountName}`;
+
+  const accounts = configuredAccounts(config);
+
+  for (const account of accounts.whatsapp) {
+    if (account.accessToken.length < 20) {
+      warnings.push({
+        field: fieldFor('WHATSAPP_ACCESS_TOKEN', account.accountName),
+        message:
+          'WhatsApp access token looks unusually short (<20 chars). Expected a long ' +
+          'System User / Cloud API token; double-check it was copied in full.'
+      });
+    }
   }
 
-  if (config.messenger && !config.messenger.pageAccessToken.startsWith('EAA')) {
-    warnings.push({
-      field: 'MESSENGER_PAGE_ACCESS_TOKEN',
-      message:
-        'Messenger Page Access Token does not start with "EAA". Page tokens minted ' +
-        'via the Dashboard / Facebook Login for Business normally begin with "EAA"; ' +
-        'verify you used a Page token (not an App or User token).'
-    });
+  for (const account of accounts.messenger) {
+    if (!account.pageAccessToken.startsWith('EAA')) {
+      warnings.push({
+        field: fieldFor('MESSENGER_PAGE_ACCESS_TOKEN', account.accountName),
+        message:
+          'Messenger Page Access Token does not start with "EAA". Page tokens minted ' +
+          'via the Dashboard / Facebook Login for Business normally begin with "EAA"; ' +
+          'verify you used a Page token (not an App or User token).'
+      });
+    }
   }
 
-  if (config.instagram && !config.instagram.accessToken.startsWith('IGQ')) {
-    warnings.push({
-      field: 'INSTAGRAM_ACCESS_TOKEN',
-      message:
-        'Instagram access token does not start with "IGQ". Instagram Business Login ' +
-        'user tokens normally begin with "IGQ"; verify you used the long-lived IG ' +
-        'token from the OAuth flow.'
-    });
+  for (const account of accounts.instagram) {
+    if (!account.accessToken.startsWith('IGQ')) {
+      warnings.push({
+        field: fieldFor('INSTAGRAM_ACCESS_TOKEN', account.accountName),
+        message:
+          'Instagram access token does not start with "IGQ". Instagram Business Login ' +
+          'user tokens normally begin with "IGQ"; verify you used the long-lived IG ' +
+          'token from the OAuth flow.'
+      });
+    }
   }
 
   return warnings;

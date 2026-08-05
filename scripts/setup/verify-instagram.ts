@@ -48,6 +48,7 @@ import {
   parseVerifyArgs,
   printVerifyHelp,
   printVerifySummary,
+  selectVerifyAccount,
   VerifyBootstrapError,
   VerifyResultBuilder,
   type ChannelVerifyResult,
@@ -55,6 +56,7 @@ import {
   type VerifyContext
 } from './verify-shared.js';
 import { SUBSCRIBED_FIELDS } from './register-webhooks.js';
+import { configuredAccounts } from '../../src/config/loader.js';
 import {
   buildInstagramGraphUrl,
   getInstagramSubscribedApps,
@@ -79,14 +81,23 @@ export async function runInstagramVerify(ctx: VerifyContext): Promise<ChannelVer
 
   // ── Step 1: Config check ─────────────────────────────────────────────────
   step(1, 9, 'Config check');
-  if (!ctx.config.instagram || !ctx.config.channels.instagram) {
-    fail('INSTAGRAM_USER_ID / INSTAGRAM_ACCESS_TOKEN missing.');
+  const igAccount = selectVerifyAccount(
+    configuredAccounts(ctx.config).instagram,
+    ctx.cli.account,
+    'Instagram'
+  );
+  if (!igAccount || !ctx.config.channels.instagram) {
+    fail('INSTAGRAM_USER_ID / INSTAGRAM_ACCESS_TOKEN missing (for the requested account).');
     info('Run `npm run setup:oauth:instagram` first to capture a long-lived (~60d) Instagram User Access Token.');
     info('That script handles the OAuth code → short-lived → long-lived exchange and writes the credentials to .env.');
+    info('For a named account, set INSTAGRAM_USER_ID__<name> / INSTAGRAM_ACCESS_TOKEN__<name> and pass --account=<name>.');
     builder.fail('config', 'Instagram credentials missing — run setup:oauth:instagram first.');
     return builder.build();
   }
-  success(`Configured. User id: ${ctx.config.instagram.userId}.`);
+  success(
+    `Configured. User id: ${igAccount.userId}` +
+      (igAccount.accountName === 'default' ? '.' : ` (account "${igAccount.accountName}").`)
+  );
   builder.pass('config');
 
   const graphConfig: GraphConfig = { apiVersion: ctx.config.meta.graphApiVersion };
@@ -95,7 +106,7 @@ export async function runInstagramVerify(ctx: VerifyContext): Promise<ChannelVer
   step(2, 9, 'Token validity (GET https://graph.instagram.com/me)');
   let username: string | undefined;
   try {
-    const me = await getInstagramUser(ctx.config.instagram.accessToken, graphConfig);
+    const me = await getInstagramUser(igAccount.accessToken, graphConfig);
     username = typeof me.username === 'string' ? me.username : undefined;
     success(`User: @${username ?? '?'}  (user_id: ${me.user_id ?? '?'})`);
     builder.pass('token', `username=@${username ?? '?'}`);
@@ -119,12 +130,9 @@ export async function runInstagramVerify(ctx: VerifyContext): Promise<ChannelVer
   // implicitly when step 6's inbound test actually receives a webhook.
   step(3, 9, 'Webhook subscription audit');
   try {
-    const ig = ctx.config.instagram;
-    if (!ig) {
-      builder.fail('webhook', 'Instagram channel not configured.');
-    } else {
+    {
       const graphConfig: GraphConfig = { apiVersion: ctx.config.meta.graphApiVersion };
-      const apps = await getInstagramSubscribedApps(ig.userId, ig.accessToken, graphConfig);
+      const apps = await getInstagramSubscribedApps(igAccount.userId, igAccount.accessToken, graphConfig);
       if (apps.length === 0) {
         warn('No app subscribed to this IG user. Run without --skip-webhook-registration to retry.');
         builder.fail('webhook', 'No per-user Instagram subscription found.');
@@ -245,8 +253,8 @@ export async function runInstagramVerify(ctx: VerifyContext): Promise<ChannelVer
     try {
       info(`Sending reply to IGSID ${senderId}…`);
       const res = await sendInstagramTextReply({
-        userId: ctx.config.instagram.userId,
-        accessToken: ctx.config.instagram.accessToken,
+        userId: igAccount.userId,
+        accessToken: igAccount.accessToken,
         recipientId: senderId,
         text: REPLY_TEXT,
         config: graphConfig

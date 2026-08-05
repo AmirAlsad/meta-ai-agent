@@ -3,7 +3,7 @@ import path from 'node:path';
 import express from 'express';
 import pino from 'pino';
 import { Redis } from 'ioredis';
-import { loadConfig, type Config } from './config/loader.js';
+import { loadConfig, configuredAccounts, type Config } from './config/loader.js';
 import { createApp, PACKAGE_VERSION } from './http/app.js';
 import { GraphClient } from './meta/shared/graph-client.js';
 import { HttpMediaHydrator } from './meta/shared/media-hydrator.js';
@@ -28,8 +28,7 @@ import { InMemoryStatusTracker } from './status/tracker.js';
 import { InMemoryContactStore } from './identity/contact-store.js';
 import { HttpIdentityResolver } from './identity/resolver.js';
 import type { IdentityResolver } from './identity/resolver.js';
-import type { ChannelAdapter } from './meta/shared/adapter.js';
-import type { Channel } from './meta/types.js';
+import { AdapterRegistry } from './meta/shared/registry.js';
 
 /**
  * Build the full dependency graph and return the wired Express app, the
@@ -68,22 +67,41 @@ export function buildRuntime(
   // gets its own adapter.
   const graph = new GraphClient({ apiVersion: config.meta.graphApiVersion, logger });
 
-  // Wire ONLY the channels that have credentials — an unconfigured channel has
-  // no adapter, and the agent drops a turn for a channel it can't send on.
-  const adapters: Partial<Record<Channel, ChannelAdapter>> = {};
-  if (config.whatsapp) {
-    adapters.whatsapp = new WhatsAppClient({
-      config: config.whatsapp,
-      graph,
-      apiVersion: config.meta.graphApiVersion,
-      logger
+  // Wire ONLY the accounts that have credentials — an unconfigured channel has
+  // no adapters, and the agent drops a turn for a channel it can't send on.
+  // Multi-account: every entry in `config.accounts.<channel>` gets its own
+  // client, registered under its channel-scoped business id so the inbound
+  // `channelScopedBusinessId` selects the adapter that answers as that account.
+  const accounts = configuredAccounts(config);
+  const adapters = new AdapterRegistry();
+  for (const account of accounts.whatsapp) {
+    adapters.register({
+      channel: 'whatsapp',
+      accountName: account.accountName,
+      businessId: account.phoneNumberId,
+      adapter: new WhatsAppClient({
+        config: account,
+        graph,
+        apiVersion: config.meta.graphApiVersion,
+        logger
+      })
     });
   }
-  if (config.messenger) {
-    adapters.messenger = new MessengerClient({ config: config.messenger, graph, logger });
+  for (const account of accounts.messenger) {
+    adapters.register({
+      channel: 'messenger',
+      accountName: account.accountName,
+      businessId: account.pageId,
+      adapter: new MessengerClient({ config: account, graph, logger })
+    });
   }
-  if (config.instagram) {
-    adapters.instagram = new InstagramClient({ config: config.instagram, graph, logger });
+  for (const account of accounts.instagram) {
+    adapters.register({
+      channel: 'instagram',
+      accountName: account.accountName,
+      businessId: account.userId,
+      adapter: new InstagramClient({ config: account, graph, logger })
+    });
   }
 
   // Persistence trio (store + buffer scheduler + limit-counter store), selected
@@ -174,7 +192,14 @@ export function buildRuntime(
   const mediaHydrator: InboundMediaHydrator | undefined = config.conversation.inboundMediaDownload
     ? new HttpMediaHydrator({
         graph,
-        ...(config.whatsapp ? { whatsAppAccessToken: config.whatsapp.accessToken } : {}),
+        // Media hydration authenticates with ONE WhatsApp token. With several
+        // WhatsApp accounts this uses the first (the `default` when present) —
+        // acceptable because WhatsApp media ids are app-scoped, and multi-WA
+        // deploys wanting per-account hydration tokens can inject their own
+        // hydrator via buildRuntime's seams.
+        ...(accounts.whatsapp.length > 0
+          ? { whatsAppAccessToken: accounts.whatsapp[0].accessToken }
+          : {}),
         maxBytes: config.conversation.inboundMediaMaxBytes,
         logger
       })

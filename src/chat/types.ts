@@ -27,6 +27,14 @@ import type { Contact } from '../identity/types.js';
  */
 export interface ChatRequest {
   channel: Channel;
+  /**
+   * Name of the configured account this conversation belongs to (`'default'`
+   * on a single-account deploy, else the `__<name>` env suffix). Lets one chat
+   * endpoint serve several personas: route on this rather than on the raw
+   * business id. Optional for backward compatibility with hand-built requests;
+   * the agent always sets it.
+   */
+  accountName?: string;
   conversationKey: string;
   /** Backward-compat aggregated text (concatenated message bodies). */
   message: string;

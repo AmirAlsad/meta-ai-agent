@@ -42,6 +42,7 @@ import {
   parseVerifyArgs,
   printVerifyHelp,
   printVerifySummary,
+  selectVerifyAccount,
   VerifyBootstrapError,
   VerifyResultBuilder,
   type ChannelVerifyResult,
@@ -52,6 +53,7 @@ import {
   inspectExistingSubscriptions,
   SUBSCRIBED_FIELDS
 } from './register-webhooks.js';
+import { configuredAccounts } from '../../src/config/loader.js';
 import {
   buildGraphUrl,
   getWhatsAppPhoneNumber,
@@ -78,8 +80,14 @@ export async function runWhatsAppVerify(ctx: VerifyContext): Promise<ChannelVeri
 
   // ── Step 1: Config check ─────────────────────────────────────────────────
   step(1, 6, 'Config check');
-  if (!ctx.config.whatsapp || !ctx.config.channels.whatsapp) {
-    fail('WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN missing.');
+  const waAccount = selectVerifyAccount(
+    configuredAccounts(ctx.config).whatsapp,
+    ctx.cli.account,
+    'WhatsApp'
+  );
+  if (!waAccount || !ctx.config.channels.whatsapp) {
+    fail('WHATSAPP_PHONE_NUMBER_ID / WHATSAPP_ACCESS_TOKEN missing (for the requested account).');
+    info('For a named account, set WHATSAPP_PHONE_NUMBER_ID__<name> / WHATSAPP_ACCESS_TOKEN__<name> and pass --account=<name>.');
     builder.fail('config', 'WhatsApp credentials not configured in environment.');
     return builder.build();
   }
@@ -88,7 +96,10 @@ export async function runWhatsAppVerify(ctx: VerifyContext): Promise<ChannelVeri
     builder.fail('config', 'Meta app credentials missing.');
     return builder.build();
   }
-  success(`Configured. Phone number id: ${ctx.config.whatsapp.phoneNumberId}.`);
+  success(
+    `Configured. Phone number id: ${waAccount.phoneNumberId}` +
+      (waAccount.accountName === 'default' ? '.' : ` (account "${waAccount.accountName}").`)
+  );
   builder.pass('config');
 
   const graphConfig: GraphConfig = { apiVersion: ctx.config.meta.graphApiVersion };
@@ -98,8 +109,8 @@ export async function runWhatsAppVerify(ctx: VerifyContext): Promise<ChannelVeri
   let displayPhone: string | undefined;
   try {
     const phone = await getWhatsAppPhoneNumber(
-      ctx.config.whatsapp.phoneNumberId,
-      ctx.config.whatsapp.accessToken,
+      waAccount.phoneNumberId,
+      waAccount.accessToken,
       graphConfig
     );
     displayPhone = typeof phone.display_phone_number === 'string' ? phone.display_phone_number : undefined;
@@ -170,8 +181,8 @@ export async function runWhatsAppVerify(ctx: VerifyContext): Promise<ChannelVeri
       // for this account; we surface the Meta error rather than swallowing it.
       info(`Sending hello_world template to ${testNumber} (E.164 without "+")…`);
       const sendResult = await sendHelloWorldTemplate({
-        phoneNumberId: ctx.config.whatsapp.phoneNumberId,
-        accessToken: ctx.config.whatsapp.accessToken,
+        phoneNumberId: waAccount.phoneNumberId,
+        accessToken: waAccount.accessToken,
         to: testNumber,
         config: graphConfig
       });

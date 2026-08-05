@@ -29,7 +29,7 @@
 
 import 'dotenv/config';
 import pino from 'pino';
-import { loadConfig, type Config } from '../../src/config/loader.js';
+import { loadConfig, configuredAccounts, type Config } from '../../src/config/loader.js';
 import {
   MetaApiError,
   appAccessToken as _appAccessToken,
@@ -122,6 +122,12 @@ export interface RegistrationContext {
 export interface ChannelRegistrationResult {
   channel: 'whatsapp' | 'messenger' | 'instagram';
   /**
+   * The configured account this result belongs to. Absent on channel-level
+   * results (skipped channels, app-level manual_required) — those aren't about
+   * any one account.
+   */
+  accountName?: string;
+  /**
    * - `success`: the subscription is in place.
    * - `skipped`: credentials for this channel were not configured (config has
    *   no per-channel block) — script didn't try.
@@ -195,10 +201,12 @@ function buildManualHint(
 interface ChannelRunner {
   channel: 'whatsapp' | 'messenger' | 'instagram';
   /**
-   * Execute the per-channel registration. Returns a result instead of
+   * Execute the per-channel registration. Returns results instead of
    * throwing so the outer loop can keep going for the other channels.
+   * Multi-account channels yield ONE result PER ACCOUNT (single-account
+   * deploys still see exactly one result per channel).
    */
-  run(): Promise<ChannelRegistrationResult>;
+  run(): Promise<ChannelRegistrationResult[]>;
 }
 
 /**
@@ -209,11 +217,13 @@ interface ChannelRunner {
 function failureFromError(
   channel: 'whatsapp' | 'messenger' | 'instagram',
   operation: string,
-  err: unknown
+  err: unknown,
+  accountName?: string
 ): ChannelRegistrationResult {
   if (err instanceof MetaApiError) {
     return {
       channel,
+      ...(accountName !== undefined ? { accountName } : {}),
       status: 'failed',
       message: `${operation} failed: HTTP ${err.httpStatus}${
         err.errorCode !== undefined ? `, code ${err.errorCode}` : ''
@@ -231,10 +241,20 @@ function failureFromError(
   const msg = err instanceof Error ? err.message : String(err);
   return {
     channel,
+    ...(accountName !== undefined ? { accountName } : {}),
     status: 'failed',
     message: `${operation} threw an unexpected error: ${msg}`,
     details: { error: msg }
   };
+}
+
+/**
+ * Suffix appended to per-account result messages so a multi-account summary
+ * names which account each line is about. Empty for `default` so the classic
+ * single-account output is byte-identical to before.
+ */
+function accountSuffix(accountName: string): string {
+  return accountName === 'default' ? '' : ` (account "${accountName}")`;
 }
 
 /**
@@ -291,16 +311,16 @@ function buildWhatsAppRunner(ctx: RegistrationContext, appId: string): ChannelRu
   void appId;
   return {
     channel: 'whatsapp',
-    async run(): Promise<ChannelRegistrationResult> {
+    async run(): Promise<ChannelRegistrationResult[]> {
       // WHY we skip POST /{appId}/subscriptions for whatsapp_business_account:
       // Meta's `/{appId}/subscriptions` endpoint is only documented to accept
       // `object` values of `user`, `page`, `permissions`, and `payments`.
       // While the endpoint sometimes accepts `whatsapp_business_account`
       // depending on app activation state, this is NOT the supported path.
       // The load-bearing call for WhatsApp webhooks is the per-WABA
-      // `POST /{WABA_ID}/subscribed_apps` (see H3 below). The Dashboard
-      // callback URL + verify token must ALSO be configured manually under
-      // App Dashboard → WhatsApp → Configuration → Webhook.
+      // `POST /{WABA_ID}/subscribed_apps`. The Dashboard callback URL + verify
+      // token must ALSO be configured manually under App Dashboard → WhatsApp
+      // → Configuration → Webhook.
       //
       // WHY a WABA matters: a WhatsApp Business Account (WABA) is the
       // top-level "tenant" container in Meta Business that owns one or more
@@ -310,63 +330,76 @@ function buildWhatsAppRunner(ctx: RegistrationContext, appId: string): ChannelRu
       // Meta wires webhooks at the WABA scope. Without this per-WABA
       // subscription, the Dashboard callback URL is configured but no
       // webhooks actually deliver.
-      const wabaId = ctx.config.whatsapp?.businessAccountId;
       const manualBase =
         `Configure callback URL + verify token in App Dashboard → WhatsApp → Configuration → Webhook. ` +
         `Subscribe to fields: ${SUBSCRIBED_FIELDS.whatsapp.join(', ')}.`;
 
-      if (!wabaId) {
-        // No WABA id available — we can't do the programmatic per-WABA
-        // subscription. Surface manual_required with the env-var hint.
-        return {
-          channel: 'whatsapp',
-          status: 'manual_required',
-          message: 'WhatsApp app-level webhook subscription requires manual configuration.',
-          remediation:
-            `${manualBase} ` +
-            `Optionally set WHATSAPP_BUSINESS_ACCOUNT_ID in .env to enable programmatic per-WABA ` +
-            `subscription via this script.`
-        };
-      }
+      const results: ChannelRegistrationResult[] = [];
+      for (const account of configuredAccounts(ctx.config).whatsapp) {
+        const suffix = accountSuffix(account.accountName);
+        const wabaId = account.businessAccountId;
+        if (!wabaId) {
+          // No WABA id available — we can't do the programmatic per-WABA
+          // subscription. Surface manual_required with the env-var hint.
+          const wabaVar =
+            account.accountName === 'default'
+              ? 'WHATSAPP_BUSINESS_ACCOUNT_ID'
+              : `WHATSAPP_BUSINESS_ACCOUNT_ID__${account.accountName}`;
+          results.push({
+            channel: 'whatsapp',
+            accountName: account.accountName,
+            status: 'manual_required',
+            message: `WhatsApp app-level webhook subscription requires manual configuration${suffix}.`,
+            remediation:
+              `${manualBase} ` +
+              `Optionally set ${wabaVar} in .env to enable programmatic per-WABA ` +
+              `subscription via this script.`
+          });
+          continue;
+        }
 
-      try {
-        // Per-WABA subscription is the load-bearing step that actually causes
-        // Meta to deliver webhooks to our configured callback URL.
-        const wabaResult = await subscribeWhatsAppBusinessAccount({
-          wabaId,
-          accessToken: ctx.config.whatsapp!.accessToken,
-          config: resolveGraphConfig(ctx)
-        });
-        return {
-          channel: 'whatsapp',
-          status: 'success',
-          message: `WhatsApp per-WABA subscription configured (WABA ${wabaId}, callback ${ctx.callbackUrl}).`,
-          details: { waba: wabaResult }
-        };
-      } catch (err) {
-        // If the per-WABA subscribe call fails (often a permissions error on
-        // the access token), still surface manual_required — the developer
-        // can complete it in the Dashboard. We attach the helper failure to
-        // `details` so the failure mode is debuggable.
-        const helperError =
-          err instanceof MetaApiError
-            ? {
-                operation: err.operation,
-                httpStatus: err.httpStatus,
-                errorCode: err.errorCode,
-                errorSubCode: err.errorSubCode,
-                fbtraceId: err.fbtraceId,
-                responseBody: err.responseBody
-              }
-            : { error: err instanceof Error ? err.message : String(err) };
-        return {
-          channel: 'whatsapp',
-          status: 'manual_required',
-          message: `WhatsApp per-WABA subscribed_apps POST failed; manual configuration required.`,
-          details: { helperError },
-          remediation: manualBase
-        };
+        try {
+          // Per-WABA subscription is the load-bearing step that actually causes
+          // Meta to deliver webhooks to our configured callback URL.
+          const wabaResult = await subscribeWhatsAppBusinessAccount({
+            wabaId,
+            accessToken: account.accessToken,
+            config: resolveGraphConfig(ctx)
+          });
+          results.push({
+            channel: 'whatsapp',
+            accountName: account.accountName,
+            status: 'success',
+            message: `WhatsApp per-WABA subscription configured (WABA ${wabaId}, callback ${ctx.callbackUrl})${suffix}.`,
+            details: { waba: wabaResult }
+          });
+        } catch (err) {
+          // If the per-WABA subscribe call fails (often a permissions error on
+          // the access token), still surface manual_required — the developer
+          // can complete it in the Dashboard. We attach the helper failure to
+          // `details` so the failure mode is debuggable.
+          const helperError =
+            err instanceof MetaApiError
+              ? {
+                  operation: err.operation,
+                  httpStatus: err.httpStatus,
+                  errorCode: err.errorCode,
+                  errorSubCode: err.errorSubCode,
+                  fbtraceId: err.fbtraceId,
+                  responseBody: err.responseBody
+                }
+              : { error: err instanceof Error ? err.message : String(err) };
+          results.push({
+            channel: 'whatsapp',
+            accountName: account.accountName,
+            status: 'manual_required',
+            message: `WhatsApp per-WABA subscribed_apps POST failed; manual configuration required${suffix}.`,
+            details: { helperError },
+            remediation: manualBase
+          });
+        }
       }
+      return results;
     }
   };
 }
@@ -374,10 +407,11 @@ function buildWhatsAppRunner(ctx: RegistrationContext, appId: string): ChannelRu
 function buildMessengerRunner(ctx: RegistrationContext, appId: string): ChannelRunner {
   return {
     channel: 'messenger',
-    async run(): Promise<ChannelRegistrationResult> {
-      // App-level config first; if that needs manual setup, surface that and
-      // skip the per-page step (no point subscribing the page if Meta hasn't
-      // accepted our callback URL).
+    async run(): Promise<ChannelRegistrationResult[]> {
+      // App-level config first (ONCE per channel, not per account — the
+      // callback URL + field selection are app-global); if that needs manual
+      // setup, surface that and skip the per-page step (no point subscribing
+      // pages if Meta hasn't accepted our callback URL).
       let appLevelDetails: WebhookSubscriptionResult;
       try {
         const outcome = await configureAppSubscription(
@@ -387,41 +421,52 @@ function buildMessengerRunner(ctx: RegistrationContext, appId: string): ChannelR
           SUBSCRIBED_FIELDS.messenger,
           appId
         );
-        if (outcome.kind === 'manual') return outcome.result;
+        if (outcome.kind === 'manual') return [outcome.result];
         appLevelDetails = outcome.raw;
       } catch (err) {
-        return failureFromError('messenger', 'set_webhook_subscription_config(page)', err);
+        return [failureFromError('messenger', 'set_webhook_subscription_config(page)', err)];
       }
 
-      // Per-page subscription. The helper sends `subscribed_fields` as a
-      // comma-separated string in the JSON body — Meta's API quirk
-      // (documented in graph-api.ts and asserted by scripts-graph-api.test.ts).
-      const messenger = ctx.config.messenger;
-      if (!messenger) {
+      // Per-page subscription, one per configured account. The helper sends
+      // `subscribed_fields` as a comma-separated string in the JSON body —
+      // Meta's API quirk (documented in graph-api.ts and asserted by
+      // scripts-graph-api.test.ts).
+      const accounts = configuredAccounts(ctx.config).messenger;
+      if (accounts.length === 0) {
         // Defensive guard — shouldn't happen because the runner is only built
         // when messenger creds exist, but keep the type system happy.
-        return {
-          channel: 'messenger',
-          status: 'skipped',
-          message: 'Messenger credentials not present — skipping per-page subscription.'
-        };
+        return [
+          {
+            channel: 'messenger',
+            status: 'skipped',
+            message: 'Messenger credentials not present — skipping per-page subscription.'
+          }
+        ];
       }
-      try {
-        const pageResult = await subscribeMessengerPageApp({
-          pageId: messenger.pageId,
-          pageAccessToken: messenger.pageAccessToken,
-          subscribedFields: [...SUBSCRIBED_FIELDS.messenger],
-          config: resolveGraphConfig(ctx)
-        });
-        return {
-          channel: 'messenger',
-          status: 'success',
-          message: `Messenger subscription configured: app-level + page ${messenger.pageId}.`,
-          details: { appLevel: appLevelDetails, page: pageResult }
-        };
-      } catch (err) {
-        return failureFromError('messenger', 'subscribe_messenger_page_app', err);
+      const results: ChannelRegistrationResult[] = [];
+      for (const account of accounts) {
+        const suffix = accountSuffix(account.accountName);
+        try {
+          const pageResult = await subscribeMessengerPageApp({
+            pageId: account.pageId,
+            pageAccessToken: account.pageAccessToken,
+            subscribedFields: [...SUBSCRIBED_FIELDS.messenger],
+            config: resolveGraphConfig(ctx)
+          });
+          results.push({
+            channel: 'messenger',
+            accountName: account.accountName,
+            status: 'success',
+            message: `Messenger subscription configured: app-level + page ${account.pageId}${suffix}.`,
+            details: { appLevel: appLevelDetails, page: pageResult }
+          });
+        } catch (err) {
+          results.push(
+            failureFromError('messenger', 'subscribe_messenger_page_app', err, account.accountName)
+          );
+        }
       }
+      return results;
     }
   };
 }
@@ -433,7 +478,7 @@ function buildInstagramRunner(ctx: RegistrationContext, appId: string): ChannelR
   void appId;
   return {
     channel: 'instagram',
-    async run(): Promise<ChannelRegistrationResult> {
+    async run(): Promise<ChannelRegistrationResult[]> {
       // WHY we skip POST /{appId}/subscriptions for object=instagram:
       // Meta's `/{appId}/subscriptions` endpoint is only documented to accept
       // `object` values of `user`, `page`, `permissions`, and `payments`.
@@ -441,42 +486,54 @@ function buildInstagramRunner(ctx: RegistrationContext, appId: string): ChannelR
       // (callback URL + verify token + field selection). The load-bearing
       // call this script CAN make programmatically is the per-IG-user
       // `POST {userId}/subscribed_apps` on graph.instagram.com, which
-      // associates this app with the Instagram User Access Token's account.
-      const instagram = ctx.config.instagram;
-      if (!instagram) {
-        return {
-          channel: 'instagram',
-          status: 'skipped',
-          message: 'Instagram credentials not present — skipping per-user subscription.'
-        };
+      // associates this app with the Instagram User Access Token's account —
+      // and it is genuinely PER USER, so every configured account subscribes
+      // independently with its own token.
+      const accounts = configuredAccounts(ctx.config).instagram;
+      if (accounts.length === 0) {
+        return [
+          {
+            channel: 'instagram',
+            status: 'skipped',
+            message: 'Instagram credentials not present — skipping per-user subscription.'
+          }
+        ];
       }
       const manualHint =
         `Configure callback URL + verify token in App Dashboard → Instagram → Webhooks. ` +
         `Subscribe to fields: ${SUBSCRIBED_FIELDS.instagram.join(', ')}.`;
-      try {
-        // BASE URL DECISION (see file header): we always hit
-        // graph.instagram.com here because the Instagram Business Login flow
-        // (which is the supported path for Instagram messaging in v23+)
-        // issues tokens scoped to that host. Legacy Facebook-Page-linked IG
-        // accounts can in theory work against graph.facebook.com, but those
-        // are deprecated and the dual-attempt logic adds more failure modes
-        // than it solves. If a user has a legacy account, they can override
-        // by setting ctx.apiVersion / forking the helper.
-        const igResult = await subscribeInstagramApp({
-          userId: instagram.userId,
-          accessToken: instagram.accessToken,
-          subscribedFields: [...SUBSCRIBED_FIELDS.instagram],
-          config: resolveGraphConfig(ctx)
-        });
-        return {
-          channel: 'instagram',
-          status: 'success',
-          message: `Instagram per-user subscription configured: user ${instagram.userId}.`,
-          details: { user: igResult, manualHint }
-        };
-      } catch (err) {
-        return failureFromError('instagram', 'subscribe_instagram_app', err);
+      const results: ChannelRegistrationResult[] = [];
+      for (const account of accounts) {
+        const suffix = accountSuffix(account.accountName);
+        try {
+          // BASE URL DECISION (see file header): we always hit
+          // graph.instagram.com here because the Instagram Business Login flow
+          // (which is the supported path for Instagram messaging in v23+)
+          // issues tokens scoped to that host. Legacy Facebook-Page-linked IG
+          // accounts can in theory work against graph.facebook.com, but those
+          // are deprecated and the dual-attempt logic adds more failure modes
+          // than it solves. If a user has a legacy account, they can override
+          // by setting ctx.apiVersion / forking the helper.
+          const igResult = await subscribeInstagramApp({
+            userId: account.userId,
+            accessToken: account.accessToken,
+            subscribedFields: [...SUBSCRIBED_FIELDS.instagram],
+            config: resolveGraphConfig(ctx)
+          });
+          results.push({
+            channel: 'instagram',
+            accountName: account.accountName,
+            status: 'success',
+            message: `Instagram per-user subscription configured: user ${account.userId}${suffix}.`,
+            details: { user: igResult, manualHint }
+          });
+        } catch (err) {
+          results.push(
+            failureFromError('instagram', 'subscribe_instagram_app', err, account.accountName)
+          );
+        }
       }
+      return results;
     }
   };
 }
@@ -546,9 +603,14 @@ export async function registerAllWebhooks(ctx: RegistrationContext): Promise<Reg
       continue;
     }
     logger.debug({ channel: entry.channel }, 'starting channel registration');
-    const result = await entry.run();
-    logger.debug({ channel: result.channel, status: result.status }, 'channel registration completed');
-    results.push(result);
+    const channelResults = await entry.run();
+    for (const result of channelResults) {
+      logger.debug(
+        { channel: result.channel, accountName: result.accountName, status: result.status },
+        'channel registration completed'
+      );
+    }
+    results.push(...channelResults);
   }
 
   // allSucceeded: every non-skipped channel must be `success`. `manual_required`
@@ -634,7 +696,10 @@ function resolveCallbackUrl(args: ReturnType<typeof parseArgs>, env: NodeJS.Proc
 }
 
 function colorStatusLine(result: ChannelRegistrationResult): void {
-  const label = result.channel.toUpperCase();
+  const label =
+    result.accountName !== undefined && result.accountName !== 'default'
+      ? `${result.channel.toUpperCase()}[${result.accountName}]`
+      : result.channel.toUpperCase();
   switch (result.status) {
     case 'success':
       success(`${label}: ${result.message}`);

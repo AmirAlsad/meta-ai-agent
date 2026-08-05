@@ -5,6 +5,7 @@ import {
   formatExpiresIn,
   generateState,
   hasExistingInstagramValue,
+  instagramEnvVarNames,
   maskToken,
   parseAuthorizeUrl,
   parseFlags,
@@ -99,10 +100,11 @@ describe('formatExpiresIn', () => {
 });
 
 describe('parseFlags', () => {
-  it('defaults to all-false flags', () => {
+  it('defaults to all-false flags with the default account', () => {
     expect(parseFlags([])).toEqual({
       help: false,
-      reveal: false
+      reveal: false,
+      account: 'default'
     });
   });
   it('parses --help / -h and --reveal', () => {
@@ -224,5 +226,42 @@ describe('hasExistingInstagramValue', () => {
   });
   it('ignores other env vars that happen to start with INSTAGRAM', () => {
     expect(hasExistingInstagramValue('INSTAGRAM_OTHER=foo\n')).toBe(false);
+  });
+});
+
+describe('multi-account (--account) support', () => {
+  it('parses --account=<name>', () => {
+    expect(parseFlags(['--account=reed'])).toEqual({
+      help: false,
+      reveal: false,
+      account: 'reed'
+    });
+  });
+
+  it('rejects malformed account names', () => {
+    expect(() => parseFlags(['--account='])).toThrow(/--account requires/);
+    expect(() => parseFlags(['--account=bad_name'])).toThrow(/--account requires/);
+  });
+
+  it('instagramEnvVarNames maps default to the bare vars and names to the suffixed form', () => {
+    expect(instagramEnvVarNames('default')).toEqual({
+      userId: 'INSTAGRAM_USER_ID',
+      accessToken: 'INSTAGRAM_ACCESS_TOKEN'
+    });
+    expect(instagramEnvVarNames('reed')).toEqual({
+      userId: 'INSTAGRAM_USER_ID__reed',
+      accessToken: 'INSTAGRAM_ACCESS_TOKEN__reed'
+    });
+  });
+
+  it('hasExistingInstagramValue is account-scoped', () => {
+    const env = 'INSTAGRAM_USER_ID=123\nINSTAGRAM_ACCESS_TOKEN=tok\n';
+    expect(hasExistingInstagramValue(env, 'default')).toBe(true);
+    // A populated default does NOT block capturing a named account…
+    expect(hasExistingInstagramValue(env, 'reed')).toBe(false);
+    // …and a populated named account blocks only itself.
+    const envReed = env + 'INSTAGRAM_ACCESS_TOKEN__reed=tok2\n';
+    expect(hasExistingInstagramValue(envReed, 'reed')).toBe(true);
+    expect(hasExistingInstagramValue(envReed, 'iris')).toBe(false);
   });
 });

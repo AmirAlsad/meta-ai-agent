@@ -43,6 +43,7 @@ import {
 } from '../delivery/queue.js';
 import type { QueueState } from '../delivery/types.js';
 import { MetaApiError } from '../meta/shared/errors.js';
+import { AdapterRegistry } from '../meta/shared/registry.js';
 import type {
   ChannelAdapter,
   ChannelFeature,
@@ -140,8 +141,13 @@ export interface ConversationAgentDeps {
   store: ConversationStore;
   scheduler: BufferScheduler;
   chatClient: ChatClient;
-  /** Configured channel adapters, keyed by channel. Only present channels are wired. */
-  adapters: Partial<Record<Channel, ChannelAdapter>>;
+  /**
+   * Configured send adapters. Either an {@link AdapterRegistry} (multi-account,
+   * keyed `channel:businessId`) or the legacy channel-keyed map — the latter is
+   * wrapped via {@link AdapterRegistry.fromChannelMap} at construction, so every
+   * existing caller keeps working unchanged.
+   */
+  adapters: AdapterRegistry | Partial<Record<Channel, ChannelAdapter>>;
   config: Config;
   logger: pino.Logger;
   /** Injectable [0,1) source for buffer jitter; defaults to `Math.random`. */
@@ -186,7 +192,7 @@ export class ConversationAgent {
   private readonly store: ConversationStore;
   private readonly scheduler: BufferScheduler;
   private readonly chatClient: ChatClient;
-  private readonly adapters: Partial<Record<Channel, ChannelAdapter>>;
+  private readonly adapters: AdapterRegistry;
   private readonly config: Config;
   private readonly logger: pino.Logger;
   private readonly random: () => number;
@@ -259,7 +265,10 @@ export class ConversationAgent {
     this.store = deps.store;
     this.scheduler = deps.scheduler;
     this.chatClient = deps.chatClient;
-    this.adapters = deps.adapters;
+    this.adapters =
+      deps.adapters instanceof AdapterRegistry
+        ? deps.adapters
+        : AdapterRegistry.fromChannelMap(deps.adapters);
     this.config = deps.config;
     this.logger = deps.logger;
     this.random = deps.random ?? Math.random;
@@ -699,10 +708,17 @@ export class ConversationAgent {
           // Nothing to flush (already drained by a prior flush, or no record).
           return undefined;
         }
-        const adapter = this.adapters[record.channel];
-        if (!adapter) {
-          // Channel not configured (no adapter wired) — cannot send a reply.
-          logger.warn({ conversationKey: key, channel: record.channel }, 'no adapter for channel; dropping turn');
+        const account = this.adapters.resolve(record.channel, record.channelScopedBusinessId);
+        const adapter = account?.adapter;
+        if (!account || !adapter) {
+          // No adapter answers for this channel + business id — cannot send a
+          // reply. On a single-account channel this is the old "channel not
+          // configured" case; on a multi-account channel it also covers a
+          // business id no configured account claims.
+          logger.warn(
+            { conversationKey: key, channel: record.channel, businessId: record.channelScopedBusinessId },
+            'no adapter for channel/account; dropping turn'
+          );
           record.state = 'idle';
           delete record.currentOutboundMessageId;
           record.lastActivity = this.now();
@@ -755,6 +771,7 @@ export class ConversationAgent {
         const now = this.now();
         const request: ChatRequest = {
           channel: record.channel,
+          accountName: account.accountName,
           conversationKey: key,
           // Backward-compat aggregated text: the buffered bodies, newline-joined.
           message: batch
@@ -932,9 +949,12 @@ export class ConversationAgent {
           return undefined;
         }
 
-        const adapter = this.adapters[record.channel];
+        const adapter = this.adapters.resolve(record.channel, record.channelScopedBusinessId)?.adapter;
         if (!adapter) {
-          logger.warn({ conversationKey: key, channel: record.channel }, 'no adapter for channel; dropping turn');
+          logger.warn(
+            { conversationKey: key, channel: record.channel, businessId: record.channelScopedBusinessId },
+            'no adapter for channel/account; dropping turn'
+          );
           await this.finalizeTurn(record, traceId);
           return undefined;
         }
@@ -1024,9 +1044,12 @@ export class ConversationAgent {
     const item = currentItem(state);
     if (!item) return; // defensive; isQueueComplete already guarded this.
 
-    const adapter = this.adapters[record.channel];
+    const adapter = this.adapters.resolve(record.channel, record.channelScopedBusinessId)?.adapter;
     if (!adapter) {
-      logger.warn({ conversationKey: key, channel: record.channel }, 'no adapter for channel mid-send; aborting');
+      logger.warn(
+        { conversationKey: key, channel: record.channel, businessId: record.channelScopedBusinessId },
+        'no adapter for channel/account mid-send; aborting'
+      );
       await this.transitionToIdle(key);
       return;
     }
@@ -1508,7 +1531,7 @@ export class ConversationAgent {
         await this.finalizeTurn(record, traceId);
         return;
       }
-      const adapter = this.adapters[record.channel];
+      const adapter = this.adapters.resolve(record.channel, record.channelScopedBusinessId)?.adapter;
       if (!adapter) {
         await this.finalizeTurn(record, traceId);
         return;

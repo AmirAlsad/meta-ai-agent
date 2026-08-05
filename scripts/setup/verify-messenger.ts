@@ -35,6 +35,7 @@ import {
   parseVerifyArgs,
   printVerifyHelp,
   printVerifySummary,
+  selectVerifyAccount,
   VerifyBootstrapError,
   VerifyResultBuilder,
   type ChannelVerifyResult,
@@ -43,6 +44,7 @@ import {
 } from './verify-shared.js';
 import type { CapturedWebhook } from '../lib/capture-server.js';
 import { inspectExistingSubscriptions, SUBSCRIBED_FIELDS } from './register-webhooks.js';
+import { configuredAccounts } from '../../src/config/loader.js';
 import {
   buildGraphUrl,
   getMessengerPage,
@@ -66,12 +68,21 @@ export async function runMessengerVerify(ctx: VerifyContext): Promise<ChannelVer
 
   // ── Step 1: Config check ─────────────────────────────────────────────────
   step(1, 8, 'Config check');
-  if (!ctx.config.messenger || !ctx.config.channels.messenger) {
-    fail('MESSENGER_PAGE_ID / MESSENGER_PAGE_ACCESS_TOKEN missing.');
+  const pageAccount = selectVerifyAccount(
+    configuredAccounts(ctx.config).messenger,
+    ctx.cli.account,
+    'Messenger'
+  );
+  if (!pageAccount || !ctx.config.channels.messenger) {
+    fail('MESSENGER_PAGE_ID / MESSENGER_PAGE_ACCESS_TOKEN missing (for the requested account).');
+    info('For a named account, set MESSENGER_PAGE_ID__<name> / MESSENGER_PAGE_ACCESS_TOKEN__<name> and pass --account=<name>.');
     builder.fail('config', 'Messenger credentials not configured in environment.');
     return builder.build();
   }
-  success(`Configured. Page id: ${ctx.config.messenger.pageId}.`);
+  success(
+    `Configured. Page id: ${pageAccount.pageId}` +
+      (pageAccount.accountName === 'default' ? '.' : ` (account "${pageAccount.accountName}").`)
+  );
   builder.pass('config');
 
   const graphConfig: GraphConfig = { apiVersion: ctx.config.meta.graphApiVersion };
@@ -81,8 +92,8 @@ export async function runMessengerVerify(ctx: VerifyContext): Promise<ChannelVer
   let pageName: string | undefined;
   try {
     const page = await getMessengerPage(
-      ctx.config.messenger.pageId,
-      ctx.config.messenger.pageAccessToken,
+      pageAccount.pageId,
+      pageAccount.pageAccessToken,
       graphConfig
     );
     pageName = typeof page.name === 'string' ? page.name : undefined;
@@ -186,8 +197,8 @@ export async function runMessengerVerify(ctx: VerifyContext): Promise<ChannelVer
     try {
       info(`Sending reply to PSID ${senderId}…`);
       const res = await sendMessengerTextReply({
-        pageId: ctx.config.messenger.pageId,
-        pageAccessToken: ctx.config.messenger.pageAccessToken,
+        pageId: pageAccount.pageId,
+        pageAccessToken: pageAccount.pageAccessToken,
         recipientId: senderId,
         text: REPLY_TEXT,
         config: graphConfig
