@@ -427,6 +427,12 @@ delivery-relevant ones:
 
 Buffer-timing knobs are documented in [Message buffering](./message-buffering.md).
 
+> **Raise `CHAT_ENDPOINT_TIMEOUT_MS` to ~`75000` when the chat endpoint is an LLM
+> brain.** The 30s default is tight for a blocking model call, and a chat-endpoint
+> failure is **not retried** — the timeout surfaces as a `ChatEndpointError` and
+> the user's turn is lost, not deferred. Note that the timeout also bounds the
+> comment endpoint (`CommentChatClient` shares the knob).
+
 ## Known limitations
 
 - Persistence is dual-path (in-memory or Redis); the Stage 6 metrics/status/contact

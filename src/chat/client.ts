@@ -34,6 +34,12 @@ export interface ChatClient {
 export interface HttpChatClientDeps {
   chatEndpointUrl: string;
   timeoutMs: number;
+  /**
+   * OPTIONAL shared secret (`CHAT_ENDPOINT_API_KEY`). When set, every request
+   * carries it as `X-Social-Api-Key`; when unset, no auth header is added and
+   * the request bytes are exactly what they were before this option existed.
+   */
+  apiKey?: string;
   /** Injectable for tests; defaults to `globalThis.fetch`. */
   fetchImpl?: typeof fetch;
   logger?: Pick<pino.Logger, 'warn' | 'debug'>;
@@ -42,12 +48,14 @@ export interface HttpChatClientDeps {
 export class HttpChatClient implements ChatClient {
   private readonly chatEndpointUrl: string;
   private readonly timeoutMs: number;
+  private readonly apiKey?: string;
   private readonly fetchImpl: typeof fetch;
   private readonly logger?: Pick<pino.Logger, 'warn' | 'debug'>;
 
   constructor(deps: HttpChatClientDeps) {
     this.chatEndpointUrl = deps.chatEndpointUrl;
     this.timeoutMs = deps.timeoutMs;
+    this.apiKey = deps.apiKey;
     // Bind to `globalThis` so the default `fetch` keeps its correct receiver.
     this.fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.logger = deps.logger;
@@ -83,9 +91,20 @@ export class HttpChatClient implements ChatClient {
         'calling chat endpoint'
       );
 
+      // Inbound webhooks are authenticated by `X-Hub-Signature-256` and the
+      // admin routes by ADMIN_API_TOKEN, which leaves the OUTBOUND call to the
+      // developer's chat endpoint as the one hop with no authentication at all —
+      // anyone who learns the URL can drive the brain (and its LLM spend). When
+      // CHAT_ENDPOINT_API_KEY is set we send it as a shared secret and the
+      // RECEIVING service enforces it; the transport never validates a response
+      // against it. Omitted entirely when unset so an endpoint that doesn't
+      // expect the header sees byte-identical requests.
       const response = await this.fetchImpl(this.chatEndpointUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.apiKey !== undefined ? { 'X-Social-Api-Key': this.apiKey } : {})
+        },
         body: JSON.stringify(request),
         signal: controller.signal
       });

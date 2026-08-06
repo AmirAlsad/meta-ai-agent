@@ -275,6 +275,25 @@ describe('loadConfig: boolean conversation knobs', () => {
   }
 });
 
+describe('loadConfig: CHAT_ENDPOINT_API_KEY (optional brain-seam shared secret)', () => {
+  it('is undefined when absent (no auth header is sent)', () => {
+    expect(loadConfig(baseEnv()).chatEndpointApiKey).toBeUndefined();
+  });
+
+  it('is undefined when whitespace-only — an empty header would be REJECTED by an enforcing endpoint', () => {
+    expect(loadConfig(baseEnv({ CHAT_ENDPOINT_API_KEY: '   ' })).chatEndpointApiKey).toBeUndefined();
+  });
+
+  it('surfaces the trimmed value on Config', () => {
+    const config = loadConfig(baseEnv({ CHAT_ENDPOINT_API_KEY: '  s3cret-key  ' }));
+    expect(config.chatEndpointApiKey).toBe('s3cret-key');
+  });
+
+  it('does NOT enforce a length floor (unlike ADMIN_API_TOKEN — the receiving service owns the value)', () => {
+    expect(loadConfig(baseEnv({ CHAT_ENDPOINT_API_KEY: 'k' })).chatEndpointApiKey).toBe('k');
+  });
+});
+
 describe('loadConfig: USER_LOOKUP_URL (optional identity enrichment)', () => {
   it('is undefined when absent (enrichment disabled)', () => {
     expect(loadConfig(baseEnv()).userLookupUrl).toBeUndefined();

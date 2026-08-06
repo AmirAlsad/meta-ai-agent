@@ -102,6 +102,12 @@ export function normalizeCommentChatResponse(payload: unknown): NormalizedCommen
 export interface CommentChatClientDeps {
   endpointUrl: string;
   timeoutMs: number;
+  /**
+   * OPTIONAL shared secret (`CHAT_ENDPOINT_API_KEY`), sent as `X-Social-Api-Key`.
+   * Same key and header as the DM client — the comment endpoint defaults to
+   * CHAT_ENDPOINT_URL, so the two surfaces are commonly one service.
+   */
+  apiKey?: string;
   fetchImpl?: typeof fetch;
   logger?: Pick<pino.Logger, 'warn' | 'debug'>;
 }
@@ -110,12 +116,14 @@ export interface CommentChatClientDeps {
 export class CommentChatClient {
   private readonly endpointUrl: string;
   private readonly timeoutMs: number;
+  private readonly apiKey?: string;
   private readonly fetchImpl: typeof fetch;
   private readonly logger?: Pick<pino.Logger, 'warn' | 'debug'>;
 
   constructor(deps: CommentChatClientDeps) {
     this.endpointUrl = deps.endpointUrl;
     this.timeoutMs = deps.timeoutMs;
+    this.apiKey = deps.apiKey;
     this.fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.logger = deps.logger;
   }
@@ -130,9 +138,16 @@ export class CommentChatClient {
       );
       let response: Response;
       try {
+        // Shared-secret auth on the otherwise-unauthenticated hop out to the
+        // developer's endpoint; the receiving service enforces the key. Omitted
+        // when unset so the request bytes are unchanged. See the fuller
+        // rationale at the same site in `../chat/client.ts`.
         response = await this.fetchImpl(this.endpointUrl, {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            ...(this.apiKey !== undefined ? { 'X-Social-Api-Key': this.apiKey } : {})
+          },
           body: JSON.stringify(request),
           signal: controller.signal
         });
