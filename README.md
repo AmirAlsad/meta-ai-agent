@@ -82,7 +82,7 @@ Stage 6 adds the operational surface. The agent records per-outbound-message del
 
 ## Deploying (Railway)
 
-[`railway.json`](./railway.json) is checked in: NIXPACKS builder, `npm ci && npm run build`, `npm start` (`node dist/index.js`), `ON_FAILURE` restarts, and the deploy healthcheck on `GET /health` — the one always-on route with no dependencies (uptime, version, node version; `GET /ready` pings Redis and is for *readiness*, not the deploy gate).
+[`railway.json`](./railway.json) is checked in: RAILPACK builder, `npm ci --include=dev && npm run build`, `npm start` (`node dist/index.js`), `ON_FAILURE` restarts, and the deploy healthcheck on `GET /health` — the one always-on route with no dependencies (uptime, version, node version; `GET /ready` pings Redis and is for *readiness*, not the deploy gate). Three hard-won build facts live in that config (commit `c4b6dc7`, measured against live Railway deploys 2026-08-06): NIXPACKS is no longer a supported builder and dies at BUILD_IMAGE with zero log output; `NODE_ENV=production` makes `npm ci` omit devDependencies, so the buildCommand forces `--include=dev` or `tsc` is missing at build time; and `tsconfig.build.json` pins `rootDir ./src` so the emit lands at `dist/index.js` where `npm start` looks — the old `rootDir ./` emitted `dist/src/index.js`, unnoticed for the repo's whole life because only the tsx dev loop had ever run it.
 
 Two service settings the config file cannot carry:
 
