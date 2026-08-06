@@ -52,6 +52,12 @@ export class NoopIdentityResolver implements IdentityResolver {
 export interface HttpIdentityResolverDeps {
   lookupUrl: string;
   timeoutMs: number;
+  /**
+   * OPTIONAL shared secret (`CHAT_ENDPOINT_API_KEY`), sent as `X-Social-Api-Key`.
+   * The lookup endpoint is the same class of developer-owned hop as the chat
+   * endpoint, so it carries the same key.
+   */
+  apiKey?: string;
   /** Injectable for tests; defaults to `globalThis.fetch`. */
   fetchImpl?: typeof fetch;
   logger?: Pick<pino.Logger, 'warn' | 'debug'>;
@@ -159,6 +165,7 @@ function shapeContact(req: IdentityLookupRequest, payload: unknown): Contact | u
 export class HttpIdentityResolver implements IdentityResolver {
   private readonly lookupUrl: string;
   private readonly timeoutMs: number;
+  private readonly apiKey?: string;
   private readonly fetchImpl: typeof fetch;
   private readonly logger?: Pick<pino.Logger, 'warn' | 'debug'>;
   private readonly contactStore?: ContactStore;
@@ -166,6 +173,7 @@ export class HttpIdentityResolver implements IdentityResolver {
   constructor(deps: HttpIdentityResolverDeps) {
     this.lookupUrl = deps.lookupUrl;
     this.timeoutMs = deps.timeoutMs;
+    this.apiKey = deps.apiKey;
     // Bind to `globalThis` so the default `fetch` keeps its correct receiver.
     this.fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.logger = deps.logger;
@@ -188,9 +196,16 @@ export class HttpIdentityResolver implements IdentityResolver {
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
+      // Shared-secret auth on the otherwise-unauthenticated hop out to the
+      // developer's endpoint; the receiving service enforces the key. Omitted
+      // when unset so the request bytes are unchanged. See the fuller rationale
+      // at the same site in `../chat/client.ts`.
       const response = await this.fetchImpl(this.lookupUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.apiKey !== undefined ? { 'X-Social-Api-Key': this.apiKey } : {})
+        },
         body: JSON.stringify({
           channel: req.channel,
           channelScopedUserId: req.channelScopedUserId,

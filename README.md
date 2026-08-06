@@ -80,6 +80,17 @@ The conversation agent (Stage 5) ties these together. `dispatchWebhook` routes e
 
 Stage 6 adds the operational surface. The agent records per-outbound-message delivery-status history (the [status tracker](./docs/features/status-tracking.md): WhatsApp per-message; Messenger/Instagram translate a [read watermark](./docs/features/read-receipts.md) into the set of message ids it covers — observability only, no queue effect), optionally enriches the sender with an [identity lookup](./docs/features/identity-resolution.md) over `USER_LOOKUP_URL` (fail-open — any failure proceeds without a contact), and instruments every path with provider-agnostic metrics. The HTTP layer issues a per-request `x-trace-id` (injection-guarded) and a child logger threaded into the agent. Operators get `GET /health` + `GET /ready` (always on, unauthenticated; `/ready` runs a real timeout-bounded Redis ping when a client is wired), `GET /metrics` (Prometheus), and the admin introspection routes `GET /admin/conversations/:key`, `GET /admin/status/:messageId`, `GET /admin/queue`, and `GET /admin/dedupe?messageId=<id>`. The admin/metrics routes are **token-gated** (`ADMIN_API_TOKEN`, ≥16 chars) and **guarded at registration** — when no token is set they are not mounted at all (404, not 401) — and admin output is **PII-redacted by default** via an allow-list/fail-closed redactor (`?reveal=true` unmasks for an authenticated operator). See [Operational visibility](./docs/features/operational-visibility.md).
 
+## Deploying (Railway)
+
+[`railway.json`](./railway.json) is checked in: NIXPACKS builder, `npm ci && npm run build`, `npm start` (`node dist/index.js`), `ON_FAILURE` restarts, and the deploy healthcheck on `GET /health` — the one always-on route with no dependencies (uptime, version, node version; `GET /ready` pings Redis and is for *readiness*, not the deploy gate).
+
+Two service settings the config file cannot carry:
+
+- **`NODE_ENV=production` must be set on the service.** `loadConfig` requires `NGROK_DOMAIN` in every other environment — a deploy has a real public URL and no tunnel, so production is the documented bypass ([`src/config/loader.ts`](./src/config/loader.ts), `loadNgrokDomain`). Without it the process throws at boot.
+- **`PORT`** is injected by Railway; the app binds it (default `3000`) and Railway's domain `targetPort` must match.
+
+Also set `CHAT_ENDPOINT_API_KEY` (shared secret sent to the chat endpoint as `X-Social-Api-Key`) and raise `CHAT_ENDPOINT_TIMEOUT_MS` to ~`75000` when the endpoint is an LLM brain — see [Configuration](./docs/features/configuration.md).
+
 ## Documentation
 
 - [Architecture](./docs/ARCHITECTURE.md) — current shape and planned modules.

@@ -158,9 +158,13 @@ export function buildRuntime(
   // so it is always safe to wire) over whichever counter store was selected.
   const limitTracker = createLimitTracker({ store: limitCounterStore, config: config.limits, logger });
 
+  // `apiKey` is `undefined` when CHAT_ENDPOINT_API_KEY is unset, which the
+  // client reads as "send no auth header" — the pre-existing behavior. Passed
+  // to all three brain clients (chat, comment chat, identity lookup).
   const chatClient = new HttpChatClient({
     chatEndpointUrl: config.chatEndpointUrl,
     timeoutMs: config.conversation.chatEndpointTimeoutMs,
+    apiKey: config.chatEndpointApiKey,
     logger
   });
 
@@ -184,6 +188,7 @@ export function buildRuntime(
     ? new HttpIdentityResolver({
         lookupUrl: config.userLookupUrl,
         timeoutMs: config.conversation.userLookupTimeoutMs,
+        apiKey: config.chatEndpointApiKey,
         logger,
         contactStore
       })
@@ -262,6 +267,7 @@ export function buildRuntime(
       chatClient: new CommentChatClient({
         endpointUrl: comments.endpointUrl ?? config.chatEndpointUrl,
         timeoutMs: config.conversation.chatEndpointTimeoutMs,
+        apiKey: config.chatEndpointApiKey,
         logger
       }),
       logger,

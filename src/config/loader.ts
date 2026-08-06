@@ -288,6 +288,17 @@ export interface Config {
   limits: LimitsConfig;
   chatEndpointUrl: string;
   /**
+   * Optional. Shared secret sent as the `X-Social-Api-Key` header on every
+   * request to the developer's endpoints — the chat endpoint, the comment
+   * endpoint, and `userLookupUrl`. OPTIONAL because the header is purely
+   * additive: when unset, those three clients send byte-identical requests to
+   * the ones they always have. Deliberately NO length floor (unlike
+   * `adminApiToken`, which guards routes THIS process serves) — the value is
+   * agreed with the receiving service, so failing boot over a short-but-accepted
+   * shared secret would break a working deploy for no gain.
+   */
+  chatEndpointApiKey?: string;
+  /**
    * Optional. Developer-provided endpoint for identity enrichment — the
    * resolver POSTs `{ channel, channelScopedUserId, channelScopedBusinessId }`
    * and shapes the JSON response into a `Contact`. OPTIONAL because enrichment
@@ -861,6 +872,17 @@ function loadChatEndpointUrl(env: ConfigEnv): string {
 }
 
 /**
+ * Load the OPTIONAL `CHAT_ENDPOINT_API_KEY`. Unset/blank -> `undefined` (the
+ * brain clients send no auth header at all). A whitespace-only value collapses
+ * to `undefined` rather than being sent as an empty `X-Social-Api-Key`: an empty
+ * header would be REJECTED by a receiving service that enforces the key, which
+ * is a far more confusing failure than "no header configured".
+ */
+function loadChatEndpointApiKey(env: ConfigEnv): string | undefined {
+  return trimmed(env, 'CHAT_ENDPOINT_API_KEY');
+}
+
+/**
  * Load the OPTIONAL `USER_LOOKUP_URL` for identity enrichment. Unset/blank ->
  * `undefined` (enrichment disabled; the agent uses a no-op resolver). When
  * present it must parse as a URL — we fail fast with the var name (same posture
@@ -1094,6 +1116,7 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     persistence: loadPersistenceConfig(env),
     limits: loadLimitsConfig(env),
     chatEndpointUrl: loadChatEndpointUrl(env),
+    chatEndpointApiKey: loadChatEndpointApiKey(env),
     userLookupUrl: loadUserLookupUrl(env),
     redisUrl: loadRedisUrl(env),
     adminApiToken: loadAdminApiToken(env),
