@@ -139,6 +139,29 @@ A one-shot diagnostic (`scripts/setup/probe-outbound.ts`) that fires each Stage-
 
 The pure helpers (`parseProbeArgs`, `planChannelOperations`, `makeCapturingFetch`, `pickUsableInbound`, `remainingTargets`, `redactId`) are unit-tested in `tests/unit/scripts-probe-outbound.test.ts`; the live send path is not.
 
+#### Reaction emoji sweep — `--emoji-sweep`
+
+`sendReaction` puts whatever string it is given into `payload.reaction`, nothing in this package validates it, and Meta publishes no accepted-value list for either DM channel. A consumer that lets an agent pick an arbitrary emoji — and sometimes react *instead of* replying — therefore has no way to know whether a given emoji reaches the person. `--emoji-sweep` (`scripts/setup/reaction-sweep.ts`) answers that empirically.
+
+It **replaces** the operation matrix with a one-emoji-at-a-time reaction sweep against a single captured inbound, and after each send asks the operator what actually appeared on the device. That question is the whole point: there are three outcomes and the API only distinguishes two of them —
+
+| | Graph result | Visible to code | 
+|---|---|---|
+| rejected | 4xx | yes — recorded with the error code |
+| accepted **and rendered** | 200 | no — indistinguishable from the row below |
+| accepted and **nothing rendered** | 200 | **no** — the silent drop the sweep exists to find |
+
+A 200 is not proof of delivery, so a human confirms each row. Mechanics worth knowing:
+
+- **Every emoji targets the same message.** A Page holds one reaction per message, so each react replaces the last and the operator watches a single bubble instead of matching reactions to sends from memory.
+- **An unreact precedes every react.** Without clearing, "nothing changed on screen" is ambiguous between a silent drop and a render that resembles the previous one. If the clear itself fails, that row is marked untrustworthy and not prompted.
+- **Presets**: `named` (the four named reactions — the minimum that must pass), `standard` (default; named + a realistic custom set), `full` (adds the Messenger palette as a control group and encoding stress cases: skin-tone modifier, ZWJ sequence, regional-indicator pair, and the unqualified `❤` vs `❤️`). A literal comma-separated list also works.
+- **`--sweep-no-prompt`** reduces it to the API-only half. Every row then reads `unverified`, never `as-sent` — it *cannot* detect a silent drop, and the report must not imply otherwise.
+- **Non-interactive stdin is refused, not downgraded.** Piping the sweep would make `ask` return an empty line for every question, which the answer parser reads as "yes, exactly as sent" — a report full of confirmations nobody made. `--dry-run` likewise forces no-prompt and reports every row `skipped`, since nothing left the machine.
+- Output: a Markdown table per channel plus a verdict (deliverable everywhere / partially / never, and the silent drops called out separately from honest rejections) written to `.captures/reaction-sweep/<session>.md`.
+
+Pure + injectable helpers are unit-tested in `tests/unit/scripts-reaction-sweep.test.ts` (32 tests), including the non-TTY downgrade and the silent-drop verdict.
+
 ### Full-loop harness — `npm run dev:loop` (and `dev:chat`)
 
 `scripts/dev/loop.ts` is a one-command full-stack runner: in a single process it boots the keyword-driven test chat endpoint, the **real `ConversationAgent`** (via `buildRuntime()` exported from `src/index.ts`), an ngrok tunnel, and webhook registration — then points `CHAT_ENDPOINT_URL` at the in-process endpoint. You message the bot from real devices and watch the entire Stage 5 loop (burst buffering, channel-aware ordered delivery, typing injection, dedupe, echo filtering, the IG reply→message downgrade) in one terminal.
