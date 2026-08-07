@@ -160,6 +160,8 @@ A 200 is not proof of delivery, so a human confirms each row. Mechanics worth kn
 - **Non-interactive stdin is refused, not downgraded.** Piping the sweep would make `ask` return an empty line for every question, which the answer parser reads as "yes, exactly as sent" — a report full of confirmations nobody made. `--dry-run` likewise forces no-prompt and reports every row `skipped`, since nothing left the machine.
 - Output: a Markdown table per channel plus a verdict (deliverable everywhere / partially / never, and the silent drops called out separately from honest rejections) written to `.captures/reaction-sweep/<session>.md`.
 
+> **This takes the deployed bot offline while it runs.** `--capture` registers webhooks against `POST /{appId}/subscriptions`, and that callback URL is **app-global** — for the duration of the sweep, every real inbound DM goes to the laptop's ngrok tunnel instead of the deployed service, and the probe drops anything that isn't the inbound it is waiting for. Run it during quiet hours, and restore afterwards with `npm run meta:webhooks -- --callback-url=https://<deployed-host>/webhook` (or set `PUBLIC_BASE_URL` to the deployed host and run it bare). `npm run probe:reactions` scopes to `messenger,instagram` — WhatsApp is not part of this question.
+
 Pure + injectable helpers are unit-tested in `tests/unit/scripts-reaction-sweep.test.ts` (32 tests), including the non-TTY downgrade and the silent-drop verdict.
 
 ### Full-loop harness — `npm run dev:loop` (and `dev:chat`)
