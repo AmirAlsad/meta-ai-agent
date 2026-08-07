@@ -61,7 +61,7 @@ import path from 'node:path';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import pino from 'pino';
 
-import { loadConfig, type Config } from '../../src/config/loader.js';
+import { loadConfig, configuredAccounts, type Config } from '../../src/config/loader.js';
 import { GraphClient } from '../../src/meta/shared/graph-client.js';
 import { MetaApiError } from '../../src/meta/shared/errors.js';
 import { WhatsAppClient } from '../../src/meta/whatsapp/client.js';
@@ -580,6 +580,8 @@ export interface UsableInboundInput {
       type?: string;
       isEcho?: boolean;
       text?: string;
+      /** OUR business id for the account the message was addressed to (page id / IG user id). */
+      channelScopedBusinessId?: string;
     }>;
   };
 }
@@ -634,6 +636,14 @@ export function pickUsableInbound(
 export interface CollectedInbound extends UsableInbound {
   /** The message body as the person typed it — how they identify the bubble on screen. */
   text: string;
+  /**
+   * OUR business id for the account this was addressed to — the page id or IG
+   * user id. Load-bearing: with several pages / IG accounts on one app, the
+   * user id in an inbound is scoped to the account it arrived on, and sending
+   * with a DIFFERENT account's token fails. This is how the right client is
+   * chosen.
+   */
+  businessId: string;
 }
 
 /**
@@ -671,7 +681,8 @@ export function collectUsableInbounds(
       channel: msg.channel,
       recipientId,
       targetMessageId,
-      text: typeof msg.text === 'string' ? msg.text : ''
+      text: typeof msg.text === 'string' ? msg.text : '',
+      businessId: typeof msg.channelScopedBusinessId === 'string' ? msg.channelScopedBusinessId : ''
     });
   }
   return out;
@@ -1422,7 +1433,7 @@ async function runCaptureMode(config: Config, args: ProbeArgs): Promise<void> {
     // channel before sending anything, so it cannot share the answer-on-arrival
     // queue below (which fires the moment the first message lands).
     if (args.sweepBatch && args.emojiSweep) {
-      await runBatchMode(capture, targets, clients, args);
+      await runBatchMode(capture, targets, args, buildAccountSenders(config, graph, logger));
       return;
     }
 
@@ -1523,6 +1534,24 @@ function captureBatch(
     const armQuiet = (): void => {
       if (quietTimer) clearTimeout(quietTimer);
       quietTimer = setTimeout(() => {
+        // A channel that has sent NOTHING yet is not "quiet", it is "not
+        // started" — the operator is still on the other channel's thread. The
+        // quiet window is for deciding a burst has ENDED, and a burst that
+        // never began has no end to detect.
+        //
+        // This cost two runs on 2026-08-07: Instagram filled its quota, the
+        // operator moved to Messenger, and 25s later the whole run settled with
+        // Messenger untouched. Waiting on the safety net instead is the right
+        // trade — a slow run beats a run that silently tests half of what was
+        // asked for.
+        const untouched = targets.filter((c) => (perChannel.get(c) ?? []).length === 0);
+        if (untouched.length > 0) {
+          info(
+            `Quiet for ${BATCH_QUIET_MS / 1000}s, but ${untouched.join(', ')} has not started — still waiting. ` +
+              `Ctrl-C if you only meant to do the others.`
+          );
+          return;
+        }
         info(`No new messages for ${BATCH_QUIET_MS / 1000}s — proceeding with what arrived.`);
         settle();
       }, BATCH_QUIET_MS);
@@ -1739,8 +1768,8 @@ function reportSummary(
 async function runBatchMode(
   capture: CaptureServerHandle,
   targets: readonly Channel[],
-  clients: ChannelClients,
-  args: ProbeArgs
+  args: ProbeArgs,
+  senders: Map<string, ReactionSender>
 ): Promise<void> {
   const emojis = args.emojiSweep ?? [];
   divider('batch sweep — send your messages');
@@ -1763,18 +1792,38 @@ async function runBatchMode(
       continue;
     }
     divider(`channel: ${channel}`);
-    const client = clients[channel] as ReactionSender | undefined;
+
+    // Pick the client for the account this conversation actually arrived on.
+    // Falling back to the channel-default client is exactly the bug documented
+    // on buildAccountSenders, so a missing account is a hard skip with the id
+    // named — never a silent send from the wrong page.
+    const businessId = collected[0]!.businessId;
+    const client = senders.get(`${channel}:${businessId}`);
     if (!client) {
-      warn(`${channel}: not configured — skipped.`);
+      warn(
+        `${channel}: no configured account matches business id "${businessId}" — skipped. ` +
+          `Known: ${[...senders.keys()].filter((k) => k.startsWith(`${channel}:`)).join(', ') || '(none)'}.`
+      );
       continue;
     }
+    // A burst that spans two of our own accounts cannot be swept as one run:
+    // the ids after the first would be sent with the wrong token.
+    const strays = collected.filter((c) => c.businessId !== businessId);
+    if (strays.length > 0) {
+      warn(
+        `${channel}: ${strays.length} message(s) arrived on a DIFFERENT account of ours and were dropped — ` +
+          `sweep one account at a time.`
+      );
+    }
+    const usable = collected.filter((c) => c.businessId === businessId);
+
     const outcomes = await runBatchSweep({
       channel,
       client,
       // Every collected inbound on a channel is from the same person (the
       // operator), so the first one's recipient id is the conversation's.
-      recipientId: collected[0]!.recipientId,
-      targets: collected.map((c) => ({ targetMessageId: c.targetMessageId, text: c.text })),
+      recipientId: usable[0]!.recipientId,
+      targets: usable.map((c) => ({ targetMessageId: c.targetMessageId, text: c.text })),
       emojis,
       pacingMs: args.sweepPacingMs
     });
@@ -1926,6 +1975,51 @@ async function reportSweep(sweeps: readonly ChannelSweep[], dryRun: boolean): Pr
 }
 
 /** Construct only the clients for configured channels (over the shared graph). */
+/**
+ * Per-account senders, keyed `channel:businessId`.
+ *
+ * ── Why this exists (a real, measured failure) ──────────────────────────────
+ * {@link buildClients} builds ONE client per channel from the legacy
+ * single-account config fields — the "default" page / IG user. The production
+ * runtime does not: `src/index.ts` registers one adapter PER ACCOUNT in an
+ * `AdapterRegistry` keyed by business id, and routes an inbound to the adapter
+ * for the account it was addressed to.
+ *
+ * That difference is not cosmetic when an app has several pages. A PSID/IGSID
+ * is scoped to the account that received it, so sending with another account's
+ * token fails — and fails in a way that reads like a content problem:
+ *
+ *   - Messenger: `(#100) No matching user found` (subcode 2018001)
+ *   - Instagram: HTTP 500, code 1, "An unknown error has occurred."
+ *
+ * On 2026-08-07 that cost a full reaction sweep on both channels: 24 sends, all
+ * rejected, and the uniformity across every emoji — including plain ❤️ and 👍 —
+ * was the only thing that distinguished it from a genuine finding about Meta's
+ * accepted vocabulary. A probe whose failures are indistinguishable from the
+ * thing it is probing is worse than no probe.
+ */
+function buildAccountSenders(
+  config: Config,
+  graph: GraphClient,
+  logger: pino.Logger
+): Map<string, ReactionSender> {
+  const accounts = configuredAccounts(config);
+  const byBusinessId = new Map<string, ReactionSender>();
+  for (const account of accounts.messenger) {
+    byBusinessId.set(`messenger:${account.pageId}`, new MessengerClient({ config: account, graph, logger }));
+  }
+  for (const account of accounts.instagram) {
+    byBusinessId.set(`instagram:${account.userId}`, new InstagramClient({ config: account, graph, logger }));
+  }
+  for (const account of accounts.whatsapp) {
+    byBusinessId.set(
+      `whatsapp:${account.phoneNumberId}`,
+      new WhatsAppClient({ config: account, graph, apiVersion: config.meta.graphApiVersion, logger })
+    );
+  }
+  return byBusinessId;
+}
+
 function buildClients(config: Config, graph: GraphClient, logger: pino.Logger): ChannelClients {
   const clients: ChannelClients = {};
   if (config.whatsapp)

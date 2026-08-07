@@ -18,6 +18,8 @@ import {
   planChannelOperations,
   makeCapturingFetch,
   pickUsableInbound,
+  collectUsableInbounds,
+  mergeCollected,
   redactId,
   remainingTargets,
   type CapturedRequest,
@@ -242,6 +244,8 @@ function cap(
     channelMessageId?: string;
     type?: string;
     isEcho?: boolean;
+    text?: string;
+    channelScopedBusinessId?: string;
   }>
 ): UsableInboundInput {
   return { parsed: { messages } };
@@ -368,5 +372,94 @@ describe('remainingTargets', () => {
     remainingTargets(targets, handled);
     expect(targets).toEqual(['whatsapp', 'messenger']);
     expect([...handled]).toEqual(['whatsapp']);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* collectUsableInbounds + mergeCollected (batch sweep)                       */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('collectUsableInbounds', () => {
+  it('returns EVERY usable message in a delivery, not just the first', () => {
+    // Meta bundles messages sent in quick succession into one webhook. The
+    // single-pick sibling would keep one and drop the rest, and a twelve-message
+    // burst would silently come up short.
+    const got = collectUsableInbounds(
+      cap([
+        { channel: 'messenger', channelScopedUserId: 'PSID', channelMessageId: 'm_1', type: 'text', text: '1', channelScopedBusinessId: 'PAGE' },
+        { channel: 'messenger', channelScopedUserId: 'PSID', channelMessageId: 'm_2', type: 'text', text: '2', channelScopedBusinessId: 'PAGE' }
+      ]),
+      ['messenger']
+    );
+    expect(got.map((c) => c.targetMessageId)).toEqual(['m_1', 'm_2']);
+    expect(got.map((c) => c.text)).toEqual(['1', '2']);
+  });
+
+  it('carries the business id — the account whose token can actually send', () => {
+    // This field is why the 2026-08-07 sweep failed 24/24: without it the probe
+    // sent every reaction with the DEFAULT page/IG token while the ids were
+    // scoped to a named account.
+    const got = collectUsableInbounds(
+      cap([{ channel: 'instagram', channelScopedUserId: 'IGSID', channelMessageId: 'aWdf1', channelScopedBusinessId: '17841_REED' }]),
+      ['instagram']
+    );
+    expect(got[0]!.businessId).toBe('17841_REED');
+  });
+
+  it('drops reaction-type inbounds — their id is synthetic and unreactable', () => {
+    const got = collectUsableInbounds(
+      cap([
+        { channel: 'messenger', channelScopedUserId: 'PSID', channelMessageId: 'PSID-m_9-react', type: 'reaction', channelScopedBusinessId: 'PAGE' },
+        { channel: 'messenger', channelScopedUserId: 'PSID', channelMessageId: 'm_1', type: 'text', channelScopedBusinessId: 'PAGE' }
+      ]),
+      ['messenger']
+    );
+    expect(got.map((c) => c.targetMessageId)).toEqual(['m_1']);
+  });
+
+  it('skips echoes and off-target channels', () => {
+    const got = collectUsableInbounds(
+      cap([
+        { channel: 'messenger', channelScopedUserId: 'PSID', channelMessageId: 'm_echo', isEcho: true, channelScopedBusinessId: 'PAGE' },
+        { channel: 'whatsapp', channelScopedUserId: '1555', channelMessageId: 'wamid.X', channelScopedBusinessId: 'PHONE' },
+        { channel: 'messenger', channelScopedUserId: 'PSID', channelMessageId: 'm_1', channelScopedBusinessId: 'PAGE' }
+      ]),
+      ['messenger']
+    );
+    expect(got.map((c) => c.targetMessageId)).toEqual(['m_1']);
+  });
+});
+
+describe('mergeCollected', () => {
+  const item = (id: string) => ({
+    channel: 'messenger' as const,
+    recipientId: 'PSID',
+    targetMessageId: id,
+    text: id,
+    businessId: 'PAGE'
+  });
+
+  it('drops ids already held — a re-delivered webhook must not fill the quota', () => {
+    // Without this, one re-delivery puts twelve DIFFERENT emoji on the SAME
+    // message, each replacing the last: the operator sees one reaction and
+    // eleven go unmeasured while the report claims twelve results.
+    const merged = mergeCollected([item('m_1'), item('m_2')], [item('m_2'), item('m_3')], 12);
+    expect(merged.map((c) => c.targetMessageId)).toEqual(['m_1', 'm_2', 'm_3']);
+  });
+
+  it('never exceeds the quota', () => {
+    const merged = mergeCollected([item('m_1')], [item('m_2'), item('m_3'), item('m_4')], 2);
+    expect(merged).toHaveLength(2);
+  });
+
+  it('preserves arrival order — emoji are paired to messages positionally', () => {
+    const merged = mergeCollected([], [item('m_3'), item('m_1'), item('m_2')], 12);
+    expect(merged.map((c) => c.targetMessageId)).toEqual(['m_3', 'm_1', 'm_2']);
+  });
+
+  it('does not mutate the existing array', () => {
+    const existing = [item('m_1')];
+    mergeCollected(existing, [item('m_2')], 12);
+    expect(existing).toHaveLength(1);
   });
 });
