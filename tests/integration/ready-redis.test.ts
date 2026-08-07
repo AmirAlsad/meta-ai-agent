@@ -94,3 +94,59 @@ describe('GET /ready Redis ping (injected fake client, hardware-free)', () => {
     expect(res.body.checks.redis).toEqual({ status: 'configured' });
   });
 });
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* REDIS_REQUIRED — a missing URL must fail LOUDLY when Redis is provisioned  */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('GET /ready with REDIS_REQUIRED', () => {
+  /**
+   * Build a config with NO redisUrl, since that is the state under test: a
+   * deployment that has a Redis but lost the URL. `loadConfig` treats a blank
+   * REDIS_URL as unset, which is exactly how the real incident presented — a
+   * Railway `${{Service.VAR}}` reference that resolved to an empty string.
+   */
+  function configWithoutRedis(required: boolean): Config {
+    const { REDIS_URL: _drop, ...envWithoutRedis } = BASE_ENV;
+    const config = loadConfig({ ...envWithoutRedis, ...(required ? { REDIS_REQUIRED: 'true' } : {}) });
+    return config;
+  }
+
+  it('defaults to OFF — no redisUrl is still ready (the historical in-memory mode)', async () => {
+    // The non-vacuity anchor. If this ever fails, the change stopped being
+    // opt-in and broke every deployment that legitimately runs without Redis.
+    const config = configWithoutRedis(false);
+    expect(config.persistence.redisRequired).toBe(false);
+    const app = createApp({ config, logger });
+    const res = await request(app).get('/ready');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ready');
+    expect(res.body.checks.redis.status).toBe('not_configured');
+  });
+
+  it('when required, a missing REDIS_URL fails readiness with 503', async () => {
+    // The bug this pins: the transport ran a whole afternoon on an in-memory
+    // queue while /ready answered 200 `ready`, because a blank REDIS_URL loads
+    // as unset and "unset" was treated as a valid mode.
+    const config = configWithoutRedis(true);
+    expect(config.persistence.redisRequired).toBe(true);
+    const app = createApp({ config, logger });
+    const res = await request(app).get('/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('not_ready');
+    expect(res.body.checks.redis.status).toBe('error');
+    expect(String(res.body.checks.redis.error)).toMatch(/REDIS_REQUIRED/);
+  });
+
+  it('when required AND the URL is present, the normal ping path still runs', async () => {
+    // REDIS_REQUIRED must gate only the MISSING-url branch — it must not
+    // short-circuit the real ping, or a live-but-broken Redis would read as ok.
+    const config = makeConfig();
+    config.persistence.redisRequired = true;
+    const app = createApp({ config, logger, redisClient: rejectingClient });
+    const res = await request(app).get('/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.checks.redis.status).toBe('error');
+    expect(String(res.body.checks.redis.error)).toMatch(/ECONNREFUSED/);
+  });
+});
