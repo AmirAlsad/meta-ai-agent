@@ -32,9 +32,10 @@
     "meta:webhooks": "node --import tsx scripts/setup/register-webhooks.ts",
     "tokens:refresh:instagram": "node --import tsx scripts/setup/refresh-instagram-tokens.ts",
     "probe:outbound": "node --import tsx scripts/setup/probe-outbound.ts",
-    "probe:reactions": "node --import tsx scripts/setup/probe-outbound.ts --capture --only=messenger,instagram --emoji-sweep",
+    "probe:reactions": "node --import tsx scripts/setup/probe-outbound.ts --capture --only=messenger,instagram --sweep-batch --emoji-sweep",
     "capture:fixtures": "node --import tsx scripts/capture/fixture-capture.ts",
-    "capture:guided": "node --import tsx scripts/capture/guided-capture.ts"
+    "capture:guided": "node --import tsx scripts/capture/guided-capture.ts",
+    "probe:reactions:interactive": "node --import tsx scripts/setup/probe-outbound.ts --capture --only=messenger,instagram --emoji-sweep"
   },
   "keywords": [
     "meta",
