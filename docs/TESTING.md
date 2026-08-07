@@ -156,6 +156,25 @@ A 200 is not proof of delivery, so a human confirms each row. Mechanics worth kn
 - **Every emoji targets the same message.** A Page holds one reaction per message, so each react replaces the last and the operator watches a single bubble instead of matching reactions to sends from memory.
 - **An unreact precedes every react.** Without clearing, "nothing changed on screen" is ambiguous between a silent drop and a render that resembles the previous one. If the clear itself fails, that row is marked untrustworthy and not prompted.
 - **Presets**: `named` (the four named reactions — the minimum that must pass), `standard` (default; named + a realistic custom set), `full` (adds the Messenger palette as a control group and encoding stress cases: skin-tone modifier, ZWJ sequence, regional-indicator pair, and the unqualified `❤` vs `❤️`). A literal comma-separated list also works.
+
+##### Two modes: batch (default) and interactive
+
+**`npm run probe:reactions` runs the BATCH mode** (`--sweep-batch`), which is both the TTY-free option and the better instrument. It collects N short messages from you and puts **one emoji on each**, so every reaction stays on screen at once — you look once, from a screenshot, instead of answering after every send. Three things follow from that:
+
+1. **No clear step, so no clear-failure ambiguity.** Nothing is replaced, so "the bubble is bare" needs no prior state to interpret.
+2. **The evidence is durable.** A screenshot of twelve reactions is a record; twelve terminal answers are a memory.
+3. **Substitutions are obvious.** Side-by-side bubbles show a coerced emoji at a glance, where an operator reading `[3/12] 😆` one at a time tends to see what they were told to expect.
+
+A batch run produces **half a result** — the API half. Every accepted row comes back `unverified` and stays that way until your readings are applied:
+
+```
+npm run probe:reactions                                   # sends, prints a worksheet, saves <session>-worksheet.json
+npm run probe:outbound -- --sweep-apply=<worksheet.json> --answers="1=y,2=n,3=a thumbs up"
+```
+
+`y` = exactly that emoji · `n` = nothing rendered · anything else = what you actually saw. An **unanswered** row stays `unverified` and is loudly reported, never promoted to `as-sent` — "you didn't mention it" and "you confirmed it" are different facts and only one is evidence. An answer on an API-**rejected** row is ignored, so a mis-keyed row can't manufacture a delivery Meta refused; an answer referencing a row that doesn't exist is a hard error for the same reason.
+
+`npm run probe:reactions:interactive` is the sequential variant: one message, one emoji at a time, cleared between each, asking as it goes. It needs a real terminal (see below) and is the right choice when you want the verdict without a second step.
 - **`--sweep-no-prompt`** reduces it to the API-only half. Every row then reads `unverified`, never `as-sent` — it *cannot* detect a silent drop, and the report must not imply otherwise.
 - **Non-interactive stdin is refused, not downgraded.** Piping the sweep would make `ask` return an empty line for every question, which the answer parser reads as "yes, exactly as sent" — a report full of confirmations nobody made. `--dry-run` likewise forces no-prompt and reports every row `skipped`, since nothing left the machine.
 - Output: a Markdown table per channel plus a verdict (deliverable everywhere / partially / never, and the silent drops called out separately from honest rejections) written to `.captures/reaction-sweep/<session>.md`.

@@ -51,7 +51,8 @@ Developer / live testing (real Meta accounts + ngrok; **dev-only tooling under `
 
 ```bash
 npm run probe:outbound           # Fire each outbound send method at real recipients; report what Meta accepts/rejects. --capture = round-trip (tunnel + capture a live inbound per channel, then fire the matrix back at it); --dry-run builds bodies without sending
-npm run probe:reactions          # = probe:outbound --capture --emoji-sweep. Sweeps a candidate emoji list one at a time and asks what actually rendered on the device — the only way to catch a reaction Meta 200s and silently drops. Needs an interactive terminal (see docs/TESTING.md)
+npm run probe:reactions          # BATCH emoji sweep: you send N short DMs, it puts ONE emoji on EACH so they all stay on screen, then prints a worksheet. Finish with `probe:outbound -- --sweep-apply=<worksheet.json> --answers="1=y,2=n,…"`. The only way to catch a reaction Meta 200s and silently drops. No TTY needed
+npm run probe:reactions:interactive  # Sequential variant: one message, one emoji at a time, asks as it goes. Needs a REAL terminal — it refuses a piped run rather than fabricate confirmations (see docs/TESTING.md)
 npm run dev:chat                 # Keyword-driven stand-in chat endpoint (ChatRequest→ChatResponse): reply/react/multi/typing/template/media/silence/<anything>→echo
 npm run dev:loop                 # One-command full stack: test chat endpoint + real ConversationAgent + ngrok tunnel + webhook registration, so you can message the bot from real devices and watch the Stage 5 loop
 npm run showcase                 # Scripted live showcase: real buildRuntime + a deterministic in-process chat endpoint + ngrok + webhook registration, walking a per-channel scenario matrix (text/reply/reaction/typing/media/template) at a real device; writes raw captures + summary.json to .captures/meta-showcase/<session>/. Flags: --channel, --only, --list (works WITHOUT creds), --media-url, --timeout-ms

@@ -184,6 +184,8 @@ export interface SweepOutcome {
   rendered: RenderVerdict;
   /** Free-text the operator typed when the verdict was `substituted`. */
   note?: string;
+  /** Batch mode only: the message text this reaction was placed on, so the operator can map row → bubble. */
+  targetText?: string;
 }
 
 /** `👍🏽` → `U+1F44D U+1F3FD`. The one identity that survives a terminal, a doc, and a copy/paste. */
@@ -358,6 +360,180 @@ export async function runReactionSweep(args: SweepArgs): Promise<SweepOutcome[]>
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
+/* Batch sweep — one emoji per message, no operator in the send loop          */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * One message the batch sweep will react to.
+ *
+ * `text` is how the person identifies the bubble on their screen ("the one
+ * where I typed 7"), which is the whole reason batch mode is usable at all.
+ */
+export interface BatchTarget {
+  targetMessageId: string;
+  text: string;
+}
+
+export interface BatchSweepArgs {
+  channel: Channel;
+  client: ReactionSender;
+  recipientId: string;
+  targets: readonly BatchTarget[];
+  emojis: readonly string[];
+  pacingMs: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Put ONE emoji on EACH message, so every reaction stays on screen at once.
+ *
+ * ── Why this is the better instrument, not just the TTY-free one ────────────
+ * The sequential sweep asks a human to remember what a bubble looked like a
+ * moment ago, one emoji at a time, twelve times. This asks them to look once.
+ * Three concrete advantages fall out of that:
+ *
+ *   1. **No clear step, so no clear-failure ambiguity.** Nothing is replaced,
+ *      so "the bubble is bare" needs no prior state to interpret.
+ *   2. **The evidence is durable.** A screenshot of twelve reactions is a
+ *      record; twelve terminal answers are a memory.
+ *   3. **Substitutions become obvious.** If Meta coerces our emoji to its own
+ *      palette, twelve side-by-side bubbles show it at a glance — where one at
+ *      a time, an operator reading "[3/12] 😆" tends to see what they were told
+ *      to expect.
+ *
+ * The cost is that the render verdict is filled in AFTERWARDS: every row comes
+ * back `unverified` and stays that way until the operator's answers are applied
+ * (see `applyBatchAnswers`). A batch worksheet is not a result — it is half of
+ * one, and `isDeliverable` will keep saying NO until the other half arrives.
+ * That is deliberate: the failure mode this whole probe exists to catch is
+ * assuming a send worked.
+ *
+ * Pairs are positional: emoji[i] goes on targets[i]. Extra emoji beyond the
+ * collected targets are NOT sent, and the caller must report them as untested.
+ */
+export async function runBatchSweep(args: BatchSweepArgs): Promise<SweepOutcome[]> {
+  const { channel, client, recipientId, targets, emojis } = args;
+  const sleep = args.sleep ?? defaultSleep;
+  const pacingMs = args.pacingMs > 0 ? args.pacingMs : DEFAULT_PACING_MS;
+
+  const pairCount = Math.min(targets.length, emojis.length);
+  const outcomes: SweepOutcome[] = [];
+
+  info(`${channel}: placing ${pairCount} reactions, one per message.`);
+
+  for (let i = 0; i < pairCount; i += 1) {
+    const emoji = emojis[i] as string;
+    const target = targets[i] as BatchTarget;
+    const codepoints = toCodepoints(emoji);
+
+    let apiAccepted = true;
+    let errorCode: number | undefined;
+    let httpStatus: number | undefined;
+    let errorMessage: string | undefined;
+    try {
+      await client.sendReaction(recipientId, target.targetMessageId, emoji);
+    } catch (err) {
+      apiAccepted = false;
+      if (err instanceof MetaApiError) {
+        errorCode = err.errorCode;
+        httpStatus = err.httpStatus;
+        errorMessage = err.message;
+      } else {
+        errorMessage = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    const label = `[${i + 1}/${pairCount}] ${emoji} ${codepoints} → your message "${target.text}"`;
+    if (apiAccepted) success(`${label} — API accepted`);
+    else fail(`${label} — API REJECTED${errorCode !== undefined ? ` (code ${errorCode})` : ''}: ${errorMessage ?? ''}`);
+
+    outcomes.push({
+      emoji,
+      codepoints,
+      apiAccepted,
+      ...(errorCode !== undefined ? { errorCode } : {}),
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(errorMessage !== undefined ? { errorMessage } : {}),
+      // Nothing was replaced, so there is no prior reaction whose survival
+      // could confuse the reading. `clearedFirst` is true in the sense the
+      // report cares about: this row's verdict is trustworthy once answered.
+      clearedFirst: true,
+      // A rejected send cannot have rendered; everything else awaits eyes.
+      rendered: apiAccepted ? 'unverified' : 'nothing',
+      targetText: target.text
+    });
+
+    await sleep(pacingMs);
+  }
+
+  if (emojis.length > pairCount) {
+    // Never let a shortfall pass as a completed sweep.
+    warn(
+      `${channel}: only ${targets.length} message(s) captured, so ${emojis.length - pairCount} emoji went UNTESTED: ` +
+        `${emojis.slice(pairCount).join(' ')}. Send more messages and re-run to cover them.`
+    );
+  }
+
+  return outcomes;
+}
+
+/**
+ * Apply the operator's after-the-fact answers to a batch worksheet.
+ *
+ * Answers are keyed by the 1-based row number the worksheet printed. An
+ * unanswered row stays `unverified` — never silently promoted to `as-sent`,
+ * because "he didn't mention it" and "he confirmed it" are different facts and
+ * only one of them is evidence.
+ *
+ * A row whose API call was REJECTED ignores any answer: it cannot have
+ * rendered, and an operator mis-keying a row must not be able to manufacture a
+ * delivery that Meta refused.
+ */
+export function applyBatchAnswers(
+  outcomes: readonly SweepOutcome[],
+  answers: ReadonlyMap<number, string>
+): SweepOutcome[] {
+  return outcomes.map((o, idx) => {
+    const answer = answers.get(idx + 1)?.trim();
+    if (!o.apiAccepted || answer === undefined || answer === '') return { ...o };
+    if (/^(y|yes)$/i.test(answer)) return { ...o, rendered: 'as-sent' as const };
+    if (/^(n|no|nothing|none)$/i.test(answer)) return { ...o, rendered: 'nothing' as const };
+    return { ...o, rendered: 'substituted' as const, note: answer };
+  });
+}
+
+/**
+ * Parse an answer spec like `1=y,2=n,3=a thumbs up` into a row→answer map.
+ *
+ * Commas separate rows and the FIRST `=` splits key from value, so an answer
+ * may contain `=` but not a comma — an acceptable limit for "what do you see".
+ * A malformed or duplicate row number throws rather than being dropped: a
+ * silently ignored answer would leave that row `unverified` while the operator
+ * believed they had answered it.
+ */
+export function parseBatchAnswers(spec: string): Map<number, string> {
+  const map = new Map<number, string>();
+  for (const chunk of spec.split(',')) {
+    const part = chunk.trim();
+    if (part === '') continue;
+    const eq = part.indexOf('=');
+    if (eq <= 0) {
+      throw new Error(`--answers: "${part}" is not <row>=<answer> (e.g. 3=y or 3=a thumbs up).`);
+    }
+    const row = Number(part.slice(0, eq).trim());
+    if (!Number.isInteger(row) || row < 1) {
+      throw new Error(`--answers: "${part}" has a non-positive-integer row number.`);
+    }
+    if (map.has(row)) {
+      throw new Error(`--answers: row ${row} answered twice.`);
+    }
+    map.set(row, part.slice(eq + 1).trim());
+  }
+  if (map.size === 0) throw new Error('--answers resolved to zero answers.');
+  return map;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
 /* Reporting (pure — unit-tested)                                             */
 /* ────────────────────────────────────────────────────────────────────────── */
 
@@ -401,6 +577,29 @@ export function summarizeSweep(sweeps: readonly ChannelSweep[]): {
   }
 
   return { deliverableEverywhere, partial, neverDeliverable, silentDrops };
+}
+
+/**
+ * The worksheet a batch sweep prints: which emoji landed on which message, and
+ * the row numbers the operator answers against.
+ *
+ * Printed to the CONSOLE (not just a file) because it is the thing the operator
+ * reads while holding the phone.
+ */
+export function formatBatchWorksheet(sweeps: readonly ChannelSweep[]): string {
+  const lines: string[] = [];
+  for (const { channel, outcomes } of sweeps) {
+    lines.push('');
+    lines.push(`${channel} — look at the thread and report each row:`);
+    for (let i = 0; i < outcomes.length; i += 1) {
+      const o = outcomes[i] as SweepOutcome;
+      const status = o.apiAccepted ? '' : '   [API REJECTED — expect nothing here]';
+      lines.push(`  ${String(i + 1).padStart(2)}. your message "${o.targetText ?? ''}"  should show  ${o.emoji}${status}`);
+    }
+  }
+  lines.push('');
+  lines.push('Answer per row: y = exactly that emoji · n = nothing · or describe what you actually see.');
+  return lines.join('\n');
 }
 
 /** Render the sweep as a Markdown report — the artifact that outlives the terminal. */

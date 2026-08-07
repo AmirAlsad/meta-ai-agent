@@ -58,7 +58,7 @@
 
 import 'dotenv/config';
 import path from 'node:path';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import pino from 'pino';
 
 import { loadConfig, type Config } from '../../src/config/loader.js';
@@ -74,6 +74,10 @@ import { registerAllWebhooks } from './register-webhooks.js';
 import {
   parseSweepList,
   runReactionSweep,
+  runBatchSweep,
+  applyBatchAnswers,
+  parseBatchAnswers,
+  formatBatchWorksheet,
   formatSweepMarkdown,
   summarizeSweep,
   isDeliverable,
@@ -139,6 +143,16 @@ export interface ProbeArgs {
   emojiSweep?: string[];
   /** Sweep mode: skip the per-emoji operator confirmation (API results only). */
   sweepNoPrompt: boolean;
+  /**
+   * BATCH sweep: put one emoji on each of N captured messages so every
+   * reaction stays on screen at once, and collect the operator's readings
+   * afterwards instead of in the send loop. Needs no TTY.
+   */
+  sweepBatch: boolean;
+  /** Apply operator answers to a saved batch worksheet (path to its .json). No network. */
+  sweepApply?: string;
+  /** Answer spec for --sweep-apply, e.g. `1=y,2=n,3=a thumbs up`. */
+  answers?: string;
   /** Sweep mode: milliseconds between sends. */
   sweepPacingMs: number;
   /** Print usage and exit. */
@@ -173,6 +187,7 @@ export function parseProbeArgs(argv: readonly string[]): ProbeArgs {
     capture: false,
     acceptInvalidSignatures: false,
     sweepNoPrompt: false,
+    sweepBatch: false,
     sweepPacingMs: DEFAULT_SWEEP_PACING_MS,
     help: false
   };
@@ -208,6 +223,22 @@ export function parseProbeArgs(argv: readonly string[]): ProbeArgs {
     }
     if (raw === '--sweep-no-prompt') {
       flags.sweepNoPrompt = true;
+      continue;
+    }
+    if (raw === '--sweep-batch') {
+      flags.sweepBatch = true;
+      continue;
+    }
+    if (raw.startsWith('--sweep-apply=')) {
+      flags.sweepApply = requireValue(raw, '--sweep-apply', 'a batch worksheet .json path');
+      continue;
+    }
+    if (raw.startsWith('--answers=')) {
+      const value = raw.slice('--answers='.length).trim();
+      if (value === '') {
+        throw new Error('--answers requires a value, e.g. --answers="1=y,2=n,3=a thumbs up".');
+      }
+      flags.answers = value;
       continue;
     }
     if (raw.startsWith('--sweep-pacing=')) {
@@ -548,6 +579,7 @@ export interface UsableInboundInput {
       channelMessageId?: string;
       type?: string;
       isEcho?: boolean;
+      text?: string;
     }>;
   };
 }
@@ -596,6 +628,80 @@ export function pickUsableInbound(
     if (firstAny === undefined) firstAny = usable;
   }
   return firstAny;
+}
+
+/** One collected inbound in batch mode: the ids plus the text, so the operator can map bubble → emoji. */
+export interface CollectedInbound extends UsableInbound {
+  /** The message body as the person typed it — how they identify the bubble on screen. */
+  text: string;
+}
+
+/**
+ * Collect EVERY usable inbound for the target channels out of one captured
+ * webhook, in delivery order.
+ *
+ * The single-pick sibling {@link pickUsableInbound} exists for round-trip mode,
+ * which needs exactly one target. Batch mode needs them all: Meta commonly
+ * bundles several messages into ONE webhook delivery when they're sent in quick
+ * succession, so picking one per delivery would silently discard most of a
+ * twelve-message burst and the sweep would come up short with no explanation.
+ *
+ * Same "usable" test as the sibling (not an echo, has both ids), but WITHOUT
+ * the prefer-text shortcut — a caller wanting all of them cannot also want an
+ * early return. Non-text inbounds are kept; a reaction inbound is filtered by
+ * the caller, which knows a reaction's id is synthetic and unreactable.
+ */
+export function collectUsableInbounds(
+  cap: UsableInboundInput,
+  targets: readonly Channel[]
+): CollectedInbound[] {
+  const targetSet = new Set(targets);
+  const out: CollectedInbound[] = [];
+  for (const msg of cap.parsed.messages) {
+    if (!targetSet.has(msg.channel)) continue;
+    if (msg.isEcho) continue;
+    // A reaction's channelMessageId is a synthetic `sender-target-action`
+    // string Meta will not accept as a react target — reacting to one would
+    // produce a rejection that says nothing about the emoji under test.
+    if (msg.type === 'reaction') continue;
+    const recipientId = nonEmpty(msg.channelScopedUserId);
+    const targetMessageId = nonEmpty(msg.channelMessageId);
+    if (recipientId === undefined || targetMessageId === undefined) continue;
+    out.push({
+      channel: msg.channel,
+      recipientId,
+      targetMessageId,
+      text: typeof msg.text === 'string' ? msg.text : ''
+    });
+  }
+  return out;
+}
+
+/**
+ * Merge freshly-collected inbounds into a per-channel accumulator, dropping
+ * ids already held.
+ *
+ * WHY the dedupe is load-bearing: Meta re-delivers a webhook it believes we
+ * failed to ack, and the capture server acks generously. Without this, one
+ * re-delivered burst would fill the whole quota with duplicate ids and the
+ * sweep would put twelve different emoji on the SAME message — each replacing
+ * the last, so the operator would see one reaction and eleven emoji would be
+ * silently unmeasured while the report claimed twelve results.
+ */
+export function mergeCollected(
+  existing: readonly CollectedInbound[],
+  incoming: readonly CollectedInbound[],
+  limit: number
+): CollectedInbound[] {
+  const seen = new Set(existing.map((c) => c.targetMessageId));
+  const merged = [...existing];
+  for (const c of incoming) {
+    if (merged.length >= limit) break;
+    if (seen.has(c.targetMessageId)) continue;
+    seen.add(c.targetMessageId);
+    merged.push(c);
+  }
+  return merged;
 }
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -1053,7 +1159,30 @@ async function main(): Promise<void> {
   // an empty line and score the whole run "as-sent" — a report full of
   // confirmations nobody made. Refuse up front rather than downgrade, because
   // the operator asked for the confirmed variant and should get it or nothing.
-  if (args.emojiSweep && !args.sweepNoPrompt && !args.dryRun && !process.stdin.isTTY) {
+  // Apply mode is offline bookkeeping — no config, no clients, no network.
+  if (args.sweepApply !== undefined) {
+    await runApplyMode(args);
+    return;
+  }
+
+  // --sweep-batch only has a code path inside capture mode, and it is inert
+  // without a candidate list. Both would otherwise fail SILENTLY — the probe
+  // would run its ordinary matrix and report success, and the operator would
+  // read that as a completed sweep.
+  if (args.sweepBatch && !args.emojiSweep) {
+    fail('--sweep-batch needs --emoji-sweep (it is a mode OF the sweep, not a sweep of its own).');
+    process.exitCode = 2;
+    return;
+  }
+  if (args.sweepBatch && !args.capture) {
+    fail('--sweep-batch requires --capture: it collects the messages it reacts to off a live tunnel.');
+    process.exitCode = 2;
+    return;
+  }
+
+  // Batch mode is exempt: it never asks a question mid-run, collecting the
+  // operator's readings afterwards via --sweep-apply instead.
+  if (args.emojiSweep && !args.sweepBatch && !args.sweepNoPrompt && !args.dryRun && !process.stdin.isTTY) {
     fail(
       'Reaction sweep needs an interactive terminal to ask what rendered on your device. ' +
         'Run it directly (not piped), or pass --sweep-no-prompt for an API-only sweep ' +
@@ -1289,6 +1418,14 @@ async function runCaptureMode(config: Config, args: ProbeArgs): Promise<void> {
     const graph = buildGraphClient(config, logger, args.dryRun ? sink : undefined);
     const clients = buildClients(config, graph, logger);
 
+    // BATCH sweep is a different capture shape: it collects MANY inbounds per
+    // channel before sending anything, so it cannot share the answer-on-arrival
+    // queue below (which fires the moment the first message lands).
+    if (args.sweepBatch && args.emojiSweep) {
+      await runBatchMode(capture, targets, clients, args);
+      return;
+    }
+
     divider('waiting for inbound');
     info(
       `Message the bot now from each channel you want to test: ${targets.join(', ')}. ` +
@@ -1332,6 +1469,94 @@ async function runCaptureMode(config: Config, args: ProbeArgs): Promise<void> {
     unregister();
     await closeCaptureResources(capture, tunnel);
   }
+}
+
+/**
+ * How long the batch collector waits after the LAST new inbound before
+ * deciding the operator is done sending.
+ *
+ * Sized above a slow thumb-typed message but well below the patience of
+ * someone watching a terminal. It only matters when fewer messages arrive than
+ * emoji to test — a full quota settles immediately.
+ */
+const BATCH_QUIET_MS = 25 * 1000;
+
+interface BatchCaptureResult {
+  /** Collected inbounds per channel, capped at the emoji count. */
+  perChannel: Map<Channel, CollectedInbound[]>;
+}
+
+/**
+ * Batch mode's collector: gather up to `quota` DISTINCT inbound messages per
+ * target channel, then settle.
+ *
+ * Settles on the first of: every target channel at full quota; a quiet period
+ * with at least one message collected somewhere; or the safety-net timeout.
+ * The quiet-period exit is what makes "send as many as you feel like" work —
+ * the operator never has to hit exactly twelve, and a short run is reported as
+ * a short run rather than hanging.
+ */
+function captureBatch(
+  capture: CaptureServerHandle,
+  targets: readonly Channel[],
+  quota: number
+): Promise<BatchCaptureResult> {
+  return new Promise((resolve) => {
+    const perChannel = new Map<Channel, CollectedInbound[]>();
+    for (const c of targets) perChannel.set(c, []);
+
+    let unsubscribe: (() => void) | undefined;
+    let quietTimer: NodeJS.Timeout | undefined;
+    let settled = false;
+
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      if (quietTimer) clearTimeout(quietTimer);
+      clearTimeout(safety);
+      unsubscribe?.();
+      resolve({ perChannel });
+    };
+
+    const safety = setTimeout(settle, CAPTURE_TIMEOUT_MS);
+
+    const armQuiet = (): void => {
+      if (quietTimer) clearTimeout(quietTimer);
+      quietTimer = setTimeout(() => {
+        info(`No new messages for ${BATCH_QUIET_MS / 1000}s — proceeding with what arrived.`);
+        settle();
+      }, BATCH_QUIET_MS);
+    };
+
+    unsubscribe = capture.onWebhook((cap: CapturedWebhook) => {
+      const collected = collectUsableInbounds(cap, targets);
+      if (collected.length === 0) return;
+
+      let anyNew = false;
+      for (const channel of targets) {
+        const incoming = collected.filter((c) => c.channel === channel);
+        if (incoming.length === 0) continue;
+        const before = perChannel.get(channel) ?? [];
+        const after = mergeCollected(before, incoming, quota);
+        if (after.length > before.length) {
+          anyNew = true;
+          perChannel.set(channel, after);
+          info(`${channel}: ${after.length}/${quota} messages collected (latest: "${after[after.length - 1]!.text}")`);
+        }
+      }
+      if (!anyNew) return;
+
+      // Full quota everywhere is the clean exit — no need to wait out the quiet
+      // window when there is nothing left to collect.
+      const complete = targets.every((c) => (perChannel.get(c) ?? []).length >= quota);
+      if (complete) {
+        success('Every channel reached its message quota.');
+        settle();
+        return;
+      }
+      armQuiet();
+    });
+  });
 }
 
 interface CaptureOnArrivalArgs {
@@ -1503,6 +1728,153 @@ function reportSummary(
 }
 
 /**
+ * Batch sweep orchestration: collect messages, place one emoji on each, then
+ * hand the operator a worksheet and STOP.
+ *
+ * It deliberately does not try to reach a verdict. A batch run produces half a
+ * result — the API half — and the other half arrives later via `--sweep-apply`.
+ * Printing a summary here would invite reading "12 accepted" as "12 delivered",
+ * which is precisely the conflation this probe exists to break.
+ */
+async function runBatchMode(
+  capture: CaptureServerHandle,
+  targets: readonly Channel[],
+  clients: ChannelClients,
+  args: ProbeArgs
+): Promise<void> {
+  const emojis = args.emojiSweep ?? [];
+  divider('batch sweep — send your messages');
+  info(
+    `Send ${emojis.length} short, DISTINCT messages to the bot on each of: ${targets.join(', ')} — ` +
+      `"1", "2", "3" … is ideal, since you will read the results off them.`
+  );
+  info(
+    `Each gets ONE emoji, so all ${emojis.length} reactions stay on screen at once. ` +
+      `I settle when every channel has ${emojis.length}, or ${BATCH_QUIET_MS / 1000}s after your last message.`
+  );
+
+  const { perChannel } = await captureBatch(capture, targets, emojis.length);
+
+  const sweeps: ChannelSweep[] = [];
+  for (const channel of targets) {
+    const collected = perChannel.get(channel) ?? [];
+    if (collected.length === 0) {
+      warn(`${channel}: no messages captured — nothing swept.`);
+      continue;
+    }
+    divider(`channel: ${channel}`);
+    const client = clients[channel] as ReactionSender | undefined;
+    if (!client) {
+      warn(`${channel}: not configured — skipped.`);
+      continue;
+    }
+    const outcomes = await runBatchSweep({
+      channel,
+      client,
+      // Every collected inbound on a channel is from the same person (the
+      // operator), so the first one's recipient id is the conversation's.
+      recipientId: collected[0]!.recipientId,
+      targets: collected.map((c) => ({ targetMessageId: c.targetMessageId, text: c.text })),
+      emojis,
+      pacingMs: args.sweepPacingMs
+    });
+    sweeps.push({ channel, outcomes });
+  }
+
+  if (sweeps.length === 0) {
+    warn('No channel produced a sweep. Nothing to report.');
+    return;
+  }
+
+  divider('now look at your phone');
+  process.stdout.write(`${formatBatchWorksheet(sweeps)}\n`);
+
+  const sessionId = new Date().toISOString().replace(/[:.]/g, '-');
+  const dir = path.resolve(process.cwd(), '.captures', 'reaction-sweep');
+  const jsonPath = path.join(dir, `${sessionId}-worksheet.json`);
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(jsonPath, JSON.stringify({ sessionId, sweeps }, null, 2), 'utf8');
+    success(`Worksheet saved: ${jsonPath}`);
+    info('When you have read the thread, finish it with:');
+    info(`  npm run probe:outbound -- --sweep-apply=${jsonPath} --answers="1=y,2=y,3=n,…"`);
+  } catch (err) {
+    warn(`Could not save the worksheet (${err instanceof Error ? err.message : String(err)}).`);
+    warn('Copy the table above before closing this terminal — it is the only record.');
+  }
+}
+
+/**
+ * Apply operator answers to a saved batch worksheet and emit the final report.
+ * Pure with respect to the network — no client is constructed and no config is
+ * loaded, so it works long after the sweep, on any machine.
+ */
+async function runApplyMode(args: ProbeArgs): Promise<void> {
+  const worksheetPath = args.sweepApply as string;
+  if (args.answers === undefined) {
+    fail('--sweep-apply needs --answers="1=y,2=n,3=a thumbs up".');
+    process.exitCode = 2;
+    return;
+  }
+
+  let parsed: { sessionId?: string; sweeps?: ChannelSweep[] };
+  try {
+    parsed = JSON.parse(await readFile(worksheetPath, 'utf8')) as typeof parsed;
+  } catch (err) {
+    fail(`Could not read the worksheet: ${err instanceof Error ? err.message : String(err)}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const sweeps = parsed.sweeps;
+  if (!Array.isArray(sweeps) || sweeps.length === 0) {
+    fail('That worksheet holds no sweeps.');
+    process.exitCode = 1;
+    return;
+  }
+
+  let answers: Map<number, string>;
+  try {
+    answers = parseBatchAnswers(args.answers);
+  } catch (err) {
+    fail(err instanceof Error ? err.message : String(err));
+    process.exitCode = 2;
+    return;
+  }
+
+  // Rows are numbered PER CHANNEL in the worksheet, so answers apply per
+  // channel too. Reject an answer beyond a channel's row count rather than
+  // dropping it — a mis-keyed row would otherwise leave a real row unverified
+  // while the operator believed it answered.
+  const applied: ChannelSweep[] = [];
+  for (const { channel, outcomes } of sweeps) {
+    const overflow = [...answers.keys()].filter((row) => row > outcomes.length);
+    if (overflow.length > 0) {
+      fail(`${channel} has ${outcomes.length} rows, but answers reference row(s) ${overflow.join(', ')}.`);
+      process.exitCode = 2;
+      return;
+    }
+    applied.push({ channel, outcomes: applyBatchAnswers(outcomes, answers) });
+  }
+
+  const unanswered = applied.flatMap(({ channel, outcomes }) =>
+    outcomes
+      .map((o, i) => ({ o, row: i + 1, channel }))
+      .filter(({ o }) => o.apiAccepted && o.rendered === 'unverified')
+  );
+  if (unanswered.length > 0) {
+    // Loud, because an unanswered row reads as "not deliverable" in the verdict
+    // and could be mistaken for a finding.
+    warn(
+      `${unanswered.length} row(s) went unanswered and stay "unverified" (NOT counted as delivered): ` +
+        unanswered.map(({ channel, row }) => `${channel}#${row}`).join(', ')
+    );
+  }
+
+  await reportSweep(applied, false);
+}
+
+/**
  * Report the reaction sweep: the verdict on the console, the full table to a
  * file.
  *
@@ -1659,6 +2031,19 @@ function printHelp(): void {
       '                       or a comma-separated emoji list (--emoji-sweep=🔥,💪).',
       '                       Needs a real inbound target: pair with --capture, or',
       '                       pass --fb-target / --ig-target / --wa-target.',
+      '  --sweep-batch        BATCH sweep (needs --capture). Collects N messages',
+      '                       from you and puts ONE emoji on EACH, so all the',
+      '                       reactions stay on screen at once — you look once,',
+      '                       from a screenshot, instead of answering after every',
+      '                       send. Needs no interactive terminal. Emits a',
+      '                       worksheet; finish it with --sweep-apply.',
+      '  --sweep-apply=<f>    Apply your readings to a saved batch worksheet .json',
+      '                       and print the final verdict. Offline — no config, no',
+      '                       network. Pair with --answers.',
+      '  --answers=<spec>     Readings for --sweep-apply, as <row>=<answer> pairs:',
+      '                       --answers="1=y,2=n,3=a thumbs up". y = exactly that',
+      '                       emoji, n = nothing rendered, anything else = what you',
+      '                       actually saw. An unanswered row stays "unverified".',
       '  --sweep-no-prompt    Sweep without the per-emoji device confirmation.',
       '                       API results only — cannot detect a silent drop, and',
       '                       every row is reported "unverified", not "as-sent".',

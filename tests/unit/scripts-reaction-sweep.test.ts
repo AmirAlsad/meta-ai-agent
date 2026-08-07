@@ -14,6 +14,9 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   parseSweepList,
   runReactionSweep,
+  runBatchSweep,
+  applyBatchAnswers,
+  parseBatchAnswers,
   summarizeSweep,
   formatSweepMarkdown,
   isDeliverable,
@@ -296,6 +299,144 @@ describe('runReactionSweep', () => {
     };
     const results = await runReactionSweep({ ...BASE, client, emojis: ['🔥'] });
     expect(results).toHaveLength(1);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Batch sweep                                                                */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+describe('runBatchSweep', () => {
+  const BATCH_BASE = {
+    channel: 'instagram' as const,
+    recipientId: 'IGSID',
+    pacingMs: 0,
+    sleep: async () => {}
+  };
+
+  function targets(n: number) {
+    return Array.from({ length: n }, (_, i) => ({
+      targetMessageId: `m_${i + 1}`,
+      text: String(i + 1)
+    }));
+  }
+
+  it('pairs emoji to messages POSITIONALLY, one each', async () => {
+    const client = fakeClient();
+    await runBatchSweep({ ...BATCH_BASE, client, targets: targets(3), emojis: ['❤️', '👍', '😆'] });
+    expect(client.calls).toEqual([
+      { recipient: 'IGSID', target: 'm_1', emoji: '❤️' },
+      { recipient: 'IGSID', target: 'm_2', emoji: '👍' },
+      { recipient: 'IGSID', target: 'm_3', emoji: '😆' }
+    ]);
+  });
+
+  it('never clears — every reaction must coexist', async () => {
+    // A clear here would wipe the previous message's reaction and defeat the
+    // entire point of the mode: one screenshot showing all of them.
+    const client = fakeClient();
+    await runBatchSweep({ ...BATCH_BASE, client, targets: targets(3), emojis: ['❤️', '👍', '😆'] });
+    expect(client.calls.some((c) => c.emoji === '')).toBe(false);
+  });
+
+  it('stops at the number of messages captured and leaves the rest untested', async () => {
+    const client = fakeClient();
+    const results = await runBatchSweep({
+      ...BATCH_BASE,
+      client,
+      targets: targets(2),
+      emojis: ['❤️', '👍', '😆', '‼️']
+    });
+    // Only what could actually be tested is reported. Reporting four rows off
+    // two messages would be a fabricated result.
+    expect(results).toHaveLength(2);
+    expect(client.calls).toHaveLength(2);
+  });
+
+  it('carries the message text so the operator can map row → bubble', async () => {
+    const client = fakeClient();
+    const results = await runBatchSweep({ ...BATCH_BASE, client, targets: targets(2), emojis: ['❤️', '👍'] });
+    expect(results.map((r) => r.targetText)).toEqual(['1', '2']);
+  });
+
+  it('leaves accepted rows UNVERIFIED — a batch run is half a result', async () => {
+    const client = fakeClient();
+    const results = await runBatchSweep({ ...BATCH_BASE, client, targets: targets(1), emojis: ['❤️'] });
+    expect(results[0]!.apiAccepted).toBe(true);
+    expect(results[0]!.rendered).toBe('unverified');
+    expect(isDeliverable(results[0]!)).toBe(false);
+  });
+
+  it('records a rejection as nothing-rendered and keeps going', async () => {
+    const client = fakeClient((emoji) =>
+      emoji === '👍'
+        ? new MetaApiError({ operation: 'instagram.sendReaction', httpStatus: 400, errorCode: 100, responseBody: {} })
+        : undefined
+    );
+    const results = await runBatchSweep({ ...BATCH_BASE, client, targets: targets(3), emojis: ['❤️', '👍', '😆'] });
+    expect(results.map((r) => r.apiAccepted)).toEqual([true, false, true]);
+    expect(results[1]!.rendered).toBe('nothing');
+  });
+});
+
+describe('parseBatchAnswers', () => {
+  it('parses row=answer pairs', () => {
+    expect([...parseBatchAnswers('1=y,2=n,3=a thumbs up')]).toEqual([
+      [1, 'y'],
+      [2, 'n'],
+      [3, 'a thumbs up']
+    ]);
+  });
+
+  it('allows = inside the answer text', () => {
+    expect(parseBatchAnswers('1=looks like 2=3').get(1)).toBe('looks like 2=3');
+  });
+
+  it('rejects a duplicate row rather than letting the last one win', () => {
+    // Silently overwriting would discard a reading the operator actually made.
+    expect(() => parseBatchAnswers('1=y,1=n')).toThrow(/row 1 answered twice/);
+  });
+
+  it('rejects malformed and non-positive rows', () => {
+    expect(() => parseBatchAnswers('y')).toThrow(/not <row>=<answer>/);
+    expect(() => parseBatchAnswers('0=y')).toThrow(/non-positive-integer/);
+    expect(() => parseBatchAnswers('x=y')).toThrow(/non-positive-integer/);
+  });
+
+  it('rejects an empty spec', () => {
+    expect(() => parseBatchAnswers(' , ')).toThrow(/zero answers/);
+  });
+});
+
+describe('applyBatchAnswers', () => {
+  const rows = [
+    outcome({ emoji: '❤️', rendered: 'unverified' }),
+    outcome({ emoji: '👍', rendered: 'unverified' }),
+    outcome({ emoji: '😆', rendered: 'unverified' }),
+    outcome({ emoji: '‼️', apiAccepted: false, rendered: 'nothing' })
+  ];
+
+  it('maps y / n / free text onto the three verdicts', () => {
+    const applied = applyBatchAnswers(rows, new Map([[1, 'y'], [2, 'n'], [3, 'a thumbs up']]));
+    expect(applied.map((r) => r.rendered)).toEqual(['as-sent', 'nothing', 'substituted', 'nothing']);
+    expect(applied[2]!.note).toBe('a thumbs up');
+  });
+
+  it('leaves an UNANSWERED row unverified — silence is not confirmation', () => {
+    const applied = applyBatchAnswers(rows, new Map([[1, 'y']]));
+    expect(applied[1]!.rendered).toBe('unverified');
+    expect(isDeliverable(applied[1]!)).toBe(false);
+  });
+
+  it('ignores an answer on a REJECTED row — a typo must not manufacture a delivery', () => {
+    const applied = applyBatchAnswers(rows, new Map([[4, 'y']]));
+    expect(applied[3]!.rendered).toBe('nothing');
+    expect(isDeliverable(applied[3]!)).toBe(false);
+  });
+
+  it('does not mutate the input', () => {
+    applyBatchAnswers(rows, new Map([[1, 'y']]));
+    expect(rows[0]!.rendered).toBe('unverified');
   });
 });
 
