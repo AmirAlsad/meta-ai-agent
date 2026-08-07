@@ -58,6 +58,7 @@
 
 import 'dotenv/config';
 import path from 'node:path';
+import { mkdir, writeFile } from 'node:fs/promises';
 import pino from 'pino';
 
 import { loadConfig, type Config } from '../../src/config/loader.js';
@@ -70,6 +71,17 @@ import type { Channel } from '../../src/meta/types.js';
 import { startTunnel } from '../lib/tunnel.js';
 import { startCaptureServer, type CapturedWebhook, type CaptureServerHandle } from '../lib/capture-server.js';
 import { registerAllWebhooks } from './register-webhooks.js';
+import {
+  parseSweepList,
+  runReactionSweep,
+  formatSweepMarkdown,
+  summarizeSweep,
+  isDeliverable,
+  SWEEP_PRESETS,
+  type ChannelSweep,
+  type ReactionSender,
+  type SweepOutcome
+} from './reaction-sweep.js';
 import {
   info,
   success,
@@ -118,11 +130,31 @@ export interface ProbeArgs {
    * configured secrets, so real inbounds should verify.
    */
   acceptInvalidSignatures: boolean;
+  /**
+   * Reaction-emoji sweep mode: REPLACE the operation matrix with a
+   * one-emoji-at-a-time reaction sweep against the resolved target. Present =
+   * on; the value is the resolved candidate list. See `reaction-sweep.ts` for
+   * why this is its own mode rather than a longer matrix.
+   */
+  emojiSweep?: string[];
+  /** Sweep mode: skip the per-emoji operator confirmation (API results only). */
+  sweepNoPrompt: boolean;
+  /** Sweep mode: milliseconds between sends. */
+  sweepPacingMs: number;
   /** Print usage and exit. */
   help: boolean;
 }
 
 const VALID_CHANNELS: ReadonlySet<Channel> = new Set(ALL_CHANNELS);
+
+/**
+ * Default gap between sweep sends. Sized for two things at once: staying well
+ * clear of the per-second send ceiling (Instagram's is the tightest), and
+ * giving the device time to actually PAINT the new reaction before the operator
+ * is asked what they see — a prompt that arrives before the render would
+ * collect a wrong answer, which is worse than a slow probe.
+ */
+const DEFAULT_SWEEP_PACING_MS = 1200;
 
 /**
  * Parse `argv` into {@link ProbeArgs}. Throws on unknown flags / empty values
@@ -140,6 +172,8 @@ export function parseProbeArgs(argv: readonly string[]): ProbeArgs {
     yes: false,
     capture: false,
     acceptInvalidSignatures: false,
+    sweepNoPrompt: false,
+    sweepPacingMs: DEFAULT_SWEEP_PACING_MS,
     help: false
   };
 
@@ -162,6 +196,26 @@ export function parseProbeArgs(argv: readonly string[]): ProbeArgs {
     }
     if (raw === '--accept-invalid-signatures') {
       flags.acceptInvalidSignatures = true;
+      continue;
+    }
+    if (raw === '--emoji-sweep') {
+      flags.emojiSweep = parseSweepList(undefined);
+      continue;
+    }
+    if (raw.startsWith('--emoji-sweep=')) {
+      flags.emojiSweep = parseSweepList(raw.slice('--emoji-sweep='.length));
+      continue;
+    }
+    if (raw === '--sweep-no-prompt') {
+      flags.sweepNoPrompt = true;
+      continue;
+    }
+    if (raw.startsWith('--sweep-pacing=')) {
+      const value = Number(raw.slice('--sweep-pacing='.length).trim());
+      if (!Number.isFinite(value) || value < 0) {
+        throw new Error('--sweep-pacing requires a non-negative number of milliseconds, e.g. --sweep-pacing=1500.');
+      }
+      flags.sweepPacingMs = value;
       continue;
     }
     if (raw.startsWith('--only=')) {
@@ -640,6 +694,16 @@ export interface ResolvedChannel {
 }
 
 /**
+ * What one channel's run produced. `outcomes` is the matrix vocabulary every
+ * reporting path already speaks; `sweep` is the richer per-emoji record that
+ * only reaction-sweep mode produces and only the sweep report reads.
+ */
+interface RunChannelResult {
+  outcomes: OperationOutcome[];
+  sweep?: SweepOutcome[];
+}
+
+/**
  * Run the planned operations for a single RESOLVED channel, wrapping each in
  * its own try/catch and recording an outcome. Dependent ops (reply / reaction)
  * reuse a captured message id from the first sendText when no explicit target
@@ -651,10 +715,18 @@ export interface ResolvedChannel {
 async function runResolvedChannel(
   resolved: ResolvedChannel,
   clients: ChannelClients,
-  text: string
-): Promise<OperationOutcome[]> {
+  args: ProbeArgs
+): Promise<RunChannelResult> {
   const { channel, recipientId } = resolved;
   const explicitTarget = resolved.targetMessageId;
+  const text = args.text;
+
+  // Sweep mode REPLACES the matrix (see reaction-sweep.ts): the matrix's other
+  // ops would each consume a send slot and add nothing to the question being
+  // asked, and its single hardcoded 👍 is the very thing being generalized.
+  if (args.emojiSweep) {
+    return runSweepForChannel(resolved, clients, args);
+  }
   const plan = planChannelOperations(channel, {
     ...(explicitTarget !== undefined ? { target: explicitTarget } : {}),
     hasTarget: explicitTarget !== undefined
@@ -710,7 +782,93 @@ async function runResolvedChannel(
     }
   }
 
-  return outcomes;
+  return { outcomes };
+}
+
+/**
+ * Sweep one channel: resolve its client, refuse cleanly without a target, then
+ * hand off to the pure-ish sweep runner.
+ *
+ * WHY the no-target case is a SKIP rather than a throw: in capture mode every
+ * channel always has a target, so this only fires in flag-driven mode, where
+ * one channel lacking a `--*-target` must not abort the channels that have one.
+ */
+async function runSweepForChannel(
+  resolved: ResolvedChannel,
+  clients: ChannelClients,
+  args: ProbeArgs
+): Promise<RunChannelResult> {
+  const { channel, recipientId } = resolved;
+  const target = resolved.targetMessageId;
+  const emojis = args.emojiSweep ?? [];
+
+  if (target === undefined) {
+    return {
+      outcomes: [
+        {
+          name: 'emojiSweep',
+          status: 'skipped',
+          // A sweep reacts to an INBOUND message; there is no sendText to
+          // borrow an id from, because reacting to our own outbound is a
+          // different (and unsupported) act.
+          reason: `needs a real inbound message id — pass ${targetFlagFor(channel)} or use --capture`
+        }
+      ]
+    };
+  }
+
+  const client = clients[channel] as ReactionSender | undefined;
+  if (!client) {
+    return { outcomes: [{ name: 'emojiSweep', status: 'skipped', reason: 'channel not configured' }] };
+  }
+
+  const sweep = await runReactionSweep({
+    channel,
+    client,
+    recipientId,
+    targetMessageId: target,
+    emojis,
+    // Dry-run FORCES no-prompt: the capturing fetch means nothing reached a
+    // phone, so asking "what do you see?" would collect an answer about the
+    // previous run's leftovers and record it as this run's evidence.
+    noPrompt: args.sweepNoPrompt || args.dryRun,
+    pacingMs: args.sweepPacingMs
+  });
+
+  // In dry-run every row is a SKIP, not a pass or a failure. Projecting them as
+  // accepted would report delivery for a reaction that never left the machine;
+  // projecting them as rejected would cry wolf. Neither is true — nothing was
+  // tested.
+  if (args.dryRun) {
+    return {
+      outcomes: sweep.map((o) => ({
+        name: `react ${o.emoji}`,
+        status: 'skipped' as const,
+        reason: 'dry-run: body built, nothing sent'
+      })),
+      sweep
+    };
+  }
+
+  // Project the sweep onto the matrix's outcome vocabulary so the existing
+  // per-channel summary keeps working. `accepted` here means DELIVERED, not
+  // merely 200 — an API accept that rendered nothing is reported as rejected,
+  // because for this probe's purpose it failed.
+  const outcomes: OperationOutcome[] = sweep.map((o) =>
+    isDeliverable(o)
+      ? { name: `react ${o.emoji}`, status: 'accepted' as const }
+      : {
+          name: `react ${o.emoji}`,
+          status: 'rejected' as const,
+          error: new Error(
+            o.apiAccepted
+              ? `API accepted but rendered "${o.rendered}"${o.note ? ` (${o.note})` : ''}`
+              : (o.errorMessage ?? 'rejected')
+          )
+        }
+  );
+
+  return { outcomes, sweep };
 }
 
 /**
@@ -722,14 +880,14 @@ async function runChannel(
   sel: ChannelSelection,
   clients: ChannelClients,
   args: ProbeArgs
-): Promise<OperationOutcome[]> {
+): Promise<RunChannelResult> {
   const explicitTarget = explicitTargetFor(sel.channel, args);
   const resolved: ResolvedChannel = {
     channel: sel.channel,
     recipientId: sel.recipient,
     ...(explicitTarget !== undefined ? { targetMessageId: explicitTarget } : {})
   };
-  return runResolvedChannel(resolved, clients, args.text);
+  return runResolvedChannel(resolved, clients, args);
 }
 
 interface RunOperationArgs {
@@ -891,6 +1049,20 @@ async function main(): Promise<void> {
 
   divider('meta-ai-agent: outbound probe');
 
+  // A prompting sweep on a non-interactive stdin would read every question as
+  // an empty line and score the whole run "as-sent" — a report full of
+  // confirmations nobody made. Refuse up front rather than downgrade, because
+  // the operator asked for the confirmed variant and should get it or nothing.
+  if (args.emojiSweep && !args.sweepNoPrompt && !args.dryRun && !process.stdin.isTTY) {
+    fail(
+      'Reaction sweep needs an interactive terminal to ask what rendered on your device. ' +
+        'Run it directly (not piped), or pass --sweep-no-prompt for an API-only sweep ' +
+        '(which cannot detect a silent drop).'
+    );
+    process.exitCode = 2;
+    return;
+  }
+
   // Load config with a friendly error (loadConfig is strict and throws).
   let config: Config;
   try {
@@ -966,9 +1138,10 @@ async function main(): Promise<void> {
 
   // Run each selected channel's plan.
   const perChannel: Array<{ channel: Channel; outcomes: OperationOutcome[] }> = [];
+  const sweeps: ChannelSweep[] = [];
   for (const sel of selected) {
     divider(`channel: ${sel.channel}`);
-    const outcomes = await runChannel(sel, clients, args);
+    const { outcomes, sweep } = await runChannel(sel, clients, args);
     if (!args.dryRun) {
       for (const o of outcomes) reportOutcome(o);
     } else {
@@ -977,7 +1150,9 @@ async function main(): Promise<void> {
       for (const o of outcomes) reportOutcome(o);
     }
     perChannel.push({ channel: sel.channel, outcomes });
+    if (sweep) sweeps.push({ channel: sel.channel, outcomes: sweep });
   }
+  if (sweeps.length > 0) await reportSweep(sweeps, args.dryRun);
 
   // Dry-run: pretty-print every captured request grouped by channel.
   if (args.dryRun) {
@@ -1124,11 +1299,11 @@ async function runCaptureMode(config: Config, args: ProbeArgs): Promise<void> {
     // Drive the on-arrival flow: subscribe, run each channel's matrix on arrival
     // through a serialized queue, finish when all targets are handled (or the
     // safety-net timeout fires). Returns the per-channel outcomes that ran.
-    const { perChannel, handled } = await captureOnArrival({
+    const { perChannel, handled, sweeps } = await captureOnArrival({
       capture,
       targets,
       clients,
-      text: args.text
+      args
     });
 
     // Report which channels never messaged before we settled.
@@ -1146,6 +1321,7 @@ async function runCaptureMode(config: Config, args: ProbeArgs): Promise<void> {
 
     // Summary + verdict (same format as flag-driven mode).
     reportSummary(perChannel, args.dryRun);
+    if (sweeps.length > 0) await reportSweep(sweeps, args.dryRun);
   } catch (err) {
     fail(`Capture mode error: ${err instanceof Error ? err.message : String(err)}`);
     process.exitCode = process.exitCode ?? 1;
@@ -1162,7 +1338,7 @@ interface CaptureOnArrivalArgs {
   capture: CaptureServerHandle;
   targets: readonly Channel[];
   clients: ChannelClients;
-  text: string;
+  args: ProbeArgs;
 }
 
 interface CaptureOnArrivalResult {
@@ -1170,6 +1346,8 @@ interface CaptureOnArrivalResult {
   perChannel: Array<{ channel: Channel; outcomes: OperationOutcome[] }>;
   /** The set of channels that were handled (an inbound arrived + matrix ran). */
   handled: Set<Channel>;
+  /** Per-emoji sweep records — populated only in `--emoji-sweep` mode. */
+  sweeps: ChannelSweep[];
 }
 
 /**
@@ -1192,10 +1370,11 @@ interface CaptureOnArrivalResult {
  * before resolving so no stray webhook is processed after settle.
  */
 function captureOnArrival(args: CaptureOnArrivalArgs): Promise<CaptureOnArrivalResult> {
-  const { capture, targets, clients, text } = args;
+  const { capture, targets, clients, args: probeArgs } = args;
   return new Promise((resolve) => {
     const handled = new Set<Channel>();
     const perChannel: Array<{ channel: Channel; outcomes: OperationOutcome[] }> = [];
+    const sweeps: ChannelSweep[] = [];
 
     // Serialized send queue: arrivals are pushed here; `drain` empties it one
     // channel at a time. `worker` is the single in-flight drain promise (or
@@ -1212,7 +1391,7 @@ function captureOnArrival(args: CaptureOnArrivalArgs): Promise<CaptureOnArrivalR
       // Stop receiving FIRST so no late webhook enqueues after we decide to
       // finish, then wait for any in-flight matrix to finish printing.
       unsubscribe?.();
-      void Promise.resolve(worker).then(() => resolve({ perChannel, handled }));
+      void Promise.resolve(worker).then(() => resolve({ perChannel, handled, sweeps }));
     };
 
     const drain = async (): Promise<void> => {
@@ -1226,9 +1405,10 @@ function captureOnArrival(args: CaptureOnArrivalArgs): Promise<CaptureOnArrivalR
           recipientId: inbound.recipientId,
           targetMessageId: inbound.targetMessageId
         };
-        const outcomes = await runResolvedChannel(resolved, clients, text);
+        const { outcomes, sweep } = await runResolvedChannel(resolved, clients, probeArgs);
         for (const o of outcomes) reportOutcome(o);
         perChannel.push({ channel: inbound.channel, outcomes });
+        if (sweep) sweeps.push({ channel: inbound.channel, outcomes: sweep });
       }
     };
 
@@ -1322,6 +1502,57 @@ function reportSummary(
   }
 }
 
+/**
+ * Report the reaction sweep: the verdict on the console, the full table to a
+ * file.
+ *
+ * WHY it writes a file: the sweep's whole output is a table someone has to read
+ * days later while deciding what vocabulary to give a coach, and terminal
+ * scrollback is not a record. `.captures/` is already gitignored (it can hold
+ * real user ids), which is why the report lands there rather than in `docs/`.
+ */
+async function reportSweep(sweeps: readonly ChannelSweep[], dryRun: boolean): Promise<void> {
+  divider('reaction emoji sweep');
+
+  for (const { channel, outcomes } of sweeps) {
+    const delivered = outcomes.filter(isDeliverable).length;
+    const line = `${channel.padEnd(10)} delivered=${delivered}/${outcomes.length}`;
+    if (delivered === outcomes.length) success(line);
+    else fail(line);
+  }
+
+  const summary = summarizeSweep(sweeps);
+  info(`Deliverable everywhere: ${summary.deliverableEverywhere.join(' ') || '(none)'}`);
+  if (summary.partial.length > 0) info(`Deliverable on some channels only: ${summary.partial.join(' ')}`);
+  if (summary.neverDeliverable.length > 0) fail(`Never deliverable: ${summary.neverDeliverable.join(' ')}`);
+  if (summary.silentDrops.length > 0) {
+    // The headline finding. An API accept that rendered nothing is invisible in
+    // production — no error, no metric, no log line — so it is the one result
+    // that must not scroll past unremarked.
+    fail(
+      `SILENT DROPS (200 from Meta, nothing on screen): ${summary.silentDrops
+        .map((d) => `${d.emoji} on ${d.channel}`)
+        .join(', ')}`
+    );
+  }
+
+  if (dryRun) {
+    warn('Dry-run: no reaction actually left this machine, so every verdict above is meaningless.');
+    return;
+  }
+
+  const sessionId = new Date().toISOString().replace(/[:.]/g, '-');
+  const dir = path.resolve(process.cwd(), '.captures', 'reaction-sweep');
+  const file = path.join(dir, `${sessionId}.md`);
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(file, formatSweepMarkdown(sweeps, sessionId), 'utf8');
+    success(`Sweep report: ${file}`);
+  } catch (err) {
+    warn(`Could not write the sweep report (${err instanceof Error ? err.message : String(err)}). Table above is the record.`);
+  }
+}
+
 /** Construct only the clients for configured channels (over the shared graph). */
 function buildClients(config: Config, graph: GraphClient, logger: pino.Logger): ChannelClients {
   const clients: ChannelClients = {};
@@ -1343,6 +1574,14 @@ function buildClients(config: Config, graph: GraphClient, logger: pino.Logger): 
  * are still counted — this is an upper-bound estimate for the confirm prompt.
  */
 function countRealOperations(selected: readonly ChannelSelection[], args: ProbeArgs): number {
+  // Sweep mode replaces the matrix, so the matrix plan would badly understate
+  // it: each emoji is TWO calls (the clear, then the react), plus one final
+  // clear per channel. The confirm prompt has to name the real number — it is
+  // the operator's only chance to notice they asked for 76 live sends.
+  if (args.emojiSweep) {
+    const perChannel = args.emojiSweep.length * 2 + 1;
+    return selected.filter((sel) => explicitTargetFor(sel.channel, args) !== undefined).length * perChannel;
+  }
   let count = 0;
   for (const sel of selected) {
     const explicitTarget = explicitTargetFor(sel.channel, args);
@@ -1410,6 +1649,20 @@ function printHelp(): void {
       '  --fb-target=<mid>    Real INBOUND Messenger mid (reaction/reply target).',
       '  --ig-target=<mid>    Real INBOUND Instagram mid (reaction/reply target).',
       '  --text=<string>      Probe message text. Default includes a timestamp.',
+      '  --emoji-sweep[=<v>]  REACTION EMOJI SWEEP. Replaces the operation matrix',
+      '                       with a one-emoji-at-a-time reaction sweep against a',
+      '                       single inbound message, asking you after each what',
+      '                       actually appeared on your device. Answers the one',
+      '                       question the API cannot: does a 200 mean the person',
+      '                       received it? <v> is a preset',
+      `                       (${Object.keys(SWEEP_PRESETS).join(' | ')}; default standard)`,
+      '                       or a comma-separated emoji list (--emoji-sweep=🔥,💪).',
+      '                       Needs a real inbound target: pair with --capture, or',
+      '                       pass --fb-target / --ig-target / --wa-target.',
+      '  --sweep-no-prompt    Sweep without the per-emoji device confirmation.',
+      '                       API results only — cannot detect a silent drop, and',
+      '                       every row is reported "unverified", not "as-sent".',
+      '  --sweep-pacing=<ms>  Gap between sweep sends. Default 1200.',
       '  --dry-run            Build + print each request body WITHOUT hitting',
       '                       Meta (uses a capturing fetch — zero real sends).',
       '                       Composes with --capture (real inbound, fake sends).',
