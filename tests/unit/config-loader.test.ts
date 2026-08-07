@@ -383,7 +383,10 @@ describe('loadConfig: persistence section (Stage 10)', () => {
       conversationTtlSeconds: 86400,
       bufferQueueName: 'meta-ai-buffer-timers',
       bufferWorkerConcurrency: 10,
-      readyRedisTimeoutMs: 2000
+      readyRedisTimeoutMs: 2000,
+      // Default OFF: an absent REDIS_URL stays a valid mode unless a deployment
+      // explicitly declares it provisioned one (REDIS_REQUIRED).
+      redisRequired: false
     });
   });
 
@@ -394,7 +397,10 @@ describe('loadConfig: persistence section (Stage 10)', () => {
       conversationTtlSeconds: 86400,
       bufferQueueName: 'meta-ai-buffer-timers',
       bufferWorkerConcurrency: 10,
-      readyRedisTimeoutMs: 2000
+      readyRedisTimeoutMs: 2000,
+      // Default OFF: an absent REDIS_URL stays a valid mode unless a deployment
+      // explicitly declares it provisioned one (REDIS_REQUIRED).
+      redisRequired: false
     });
     expect(a).not.toBe(b); // fresh copy each call
   });

@@ -134,6 +134,27 @@ export interface PersistenceConfig {
   bufferWorkerConcurrency: number;
   /** Timeout (ms) for the GET /ready Redis ping. Default 2000. */
   readyRedisTimeoutMs: number;
+  /**
+   * Whether Redis is REQUIRED for this deployment (`REDIS_REQUIRED`). Default
+   * false, which preserves the historical behaviour: no `REDIS_URL` is a valid
+   * mode (the in-memory scheduler) and `/ready` still answers 200.
+   *
+   * WHY the opt-in exists: on a deployment that DOES rely on Redis, an absent or
+   * empty `REDIS_URL` is a misconfiguration, not a mode — and it is silent.
+   * `loadRedisUrl` treats blank as unset, so the app boots on the in-memory
+   * scheduler and `/ready` reports `redis: not_configured` while still returning
+   * `status: ready`. Every pending send then lives only in process memory and is
+   * lost on the next restart, with nothing logged.
+   *
+   * That is not hypothetical: on 2026-08-07 a Railway reference variable
+   * (`${{Service.VAR}}`) failed to resolve because the target service's name had
+   * a leading space. It resolved to an EMPTY STRING, the transport came up on the
+   * in-memory queue, and `/ready` answered 200 `ready` throughout.
+   *
+   * Set true wherever a Redis is provisioned. Then a missing `REDIS_URL` fails
+   * readiness loudly instead of degrading in silence.
+   */
+  redisRequired: boolean;
 }
 
 /**
@@ -714,7 +735,8 @@ const PERSISTENCE_DEFAULTS: PersistenceConfig = {
   conversationTtlSeconds: 86400, // 1 day
   bufferQueueName: 'meta-ai-buffer-timers',
   bufferWorkerConcurrency: 10,
-  readyRedisTimeoutMs: 2000
+  readyRedisTimeoutMs: 2000,
+  redisRequired: false
 };
 
 /**
@@ -732,7 +754,8 @@ function loadPersistenceConfig(env: ConfigEnv): PersistenceConfig {
     conversationTtlSeconds: loadPositiveInt(env, 'CONVERSATION_TTL_SECONDS', d.conversationTtlSeconds),
     bufferQueueName: trimmed(env, 'BUFFER_QUEUE_NAME') ?? d.bufferQueueName,
     bufferWorkerConcurrency: loadPositiveInt(env, 'BUFFER_WORKER_CONCURRENCY', d.bufferWorkerConcurrency),
-    readyRedisTimeoutMs: loadPositiveInt(env, 'READY_REDIS_TIMEOUT_MS', d.readyRedisTimeoutMs)
+    readyRedisTimeoutMs: loadPositiveInt(env, 'READY_REDIS_TIMEOUT_MS', d.readyRedisTimeoutMs),
+    redisRequired: loadBoolean(env, 'REDIS_REQUIRED', d.redisRequired)
   };
 }
 

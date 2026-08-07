@@ -340,7 +340,13 @@ type ReadinessCheck = { status: string; [field: string]: unknown };
  *    the impl `kind` + the returned stats. A missing scheduler is reported as
  *    `not_configured` (still ready — Stage 5 apps may run without one wired here).
  *  - `redis` (Stage 10):
- *      • `config.redisUrl` unset                  → `not_configured` (ready).
+ *      • `config.redisUrl` unset, `redisRequired` FALSE → `not_configured` (ready).
+ *      • `config.redisUrl` unset, `redisRequired` TRUE  → `error`, readiness FAILS.
+ *        A deployment that provisioned a Redis and then lost the URL is
+ *        misconfigured, not running in a valid no-Redis mode — and it is silent
+ *        otherwise, because a blank URL loads as unset and the app falls back to
+ *        the in-memory scheduler while `/ready` still answers 200. See
+ *        `PersistenceConfig.redisRequired` for the incident this comes from.
  *      • set but no `redisClient` handed in       → `configured` (ready —
  *        presence-only; the client wasn't injected, so there is nothing to ping).
  *      • set WITH a `redisClient`                 → race `ping()` against
@@ -373,7 +379,15 @@ async function buildReadinessReport(deps: {
   // redis check (Stage 10): presence-only when not configured / no client, else
   // a real timeout-bounded PING.
   if (!deps.config.redisUrl) {
-    checks.redis = { status: 'not_configured' };
+    if (deps.config.persistence.redisRequired) {
+      ready = false;
+      checks.redis = {
+        status: 'error',
+        error: 'REDIS_URL is required (REDIS_REQUIRED=true) but is unset or empty'
+      };
+    } else {
+      checks.redis = { status: 'not_configured' };
+    }
   } else if (!deps.redisClient) {
     checks.redis = { status: 'configured' };
   } else {
