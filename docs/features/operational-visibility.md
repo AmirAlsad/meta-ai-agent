@@ -17,6 +17,7 @@ The whole surface is constructed in [`src/http/app.ts`](../../src/http/app.ts) (
 | `GET /admin/status/:messageId` | token | `ADMIN_API_TOKEN` set **and** a status tracker wired |
 | `GET /admin/queue` | token | `ADMIN_API_TOKEN` set **and** a buffer scheduler wired |
 | `GET /admin/dedupe?messageId=<id>` | token | `ADMIN_API_TOKEN` set **and** a conversation store wired |
+| `GET /stats/daily?since=&until=` | token (**a different one**) | `STATS_API_TOKEN` set **and** a stats store wired |
 
 - `GET /health` (always, unauthenticated) returns `{ status: 'ok', uptimeSeconds, version, nodeVersion }`.
 - `GET /ready` (always, unauthenticated) returns the readiness report (below). 503 when any check fails, 200 otherwise.
@@ -25,6 +26,8 @@ The whole surface is constructed in [`src/http/app.ts`](../../src/http/app.ts) (
 - `GET /admin/status/:messageId` returns a PII-redacted `StatusRecord` (token-gated; `?reveal=true` unmasks). See [Status tracking](./status-tracking.md).
 - `GET /admin/queue` returns `{ kind, stats? }` from the buffer scheduler — `kind` is the impl (`in_memory` / `bullmq`) and `stats` carries the scheduler's job counts. **No PII** (counts only), so no redactor and no `?reveal`. `getStats()` is **timeout-raced** against `READY_REDIS_TIMEOUT_MS` (reused as the bound) so a wedged scheduler — e.g. a hung BullMQ `getJobCounts` against a stalled Redis — can't hang the route; on timeout/throw it 500s rather than leaving the client hanging.
 - `GET /admin/dedupe?messageId=<id>` returns `{ messageId, present, ttlSeconds? }` from `store.peekInboundHandle` — a non-destructive peek answering "did Meta's 7-day redelivery of this id get deduped?". **No PII** (a boolean + remaining TTL). The `messageId` query param is **required**: a missing/empty one is a **400** (not a silent `false`), so a typo'd probe is an obvious error rather than a misleading "not present".
+
+- `GET /stats/daily?since=YYYY-MM-DD&until=YYYY-MM-DD` returns `{ days: StatsDay[] }` — per-account, per-channel, per-UTC-day DM volume. **No PII** (dates, account names, channels, integers), so no redactor and no `?reveal`. `since` is **required**; `until` defaults to today (UTC). A malformed date, a reversed span, or a span longer than `MAX_RANGE_DAYS` is a **400**; a store failure is a **500**. Dates are validated in the route *before* the store call so a caller's bad input and a backing-store failure cannot both surface as the same error. See [DM volume stats](./stats.md) for what is counted and where.
 
 ### The registration guard: token unset → 404, not 401
 
@@ -40,9 +43,24 @@ The rationale: a 401-on-an-always-mounted route would *advertise* that an admin 
 
 When the token *is* set, the route is mounted and an absent/wrong token returns **401** (`{ error: 'unauthorized' }`).
 
+`GET /stats/daily` follows the same rule with its own pair of conditions: `config.statsApiToken` **and** a wired `statsStore`. An unconfigured deploy therefore 404s there too, and — because the guard is a conjunction — so does a deploy that set the token but wired no store.
+
 ### Constant-time auth
 
 `validateAdminToken` ([`src/http/auth.ts`](../../src/http/auth.ts)) accepts either `Authorization: Bearer <token>` or `x-admin-api-token: <token>` and compares against the expected token with `crypto.timingSafeEqual`. The comparison is constant-time even on a length mismatch: `constantTimeStringEquals` allocates a padded buffer and still runs `timingSafeEqual` so a length-mismatched probe spends a comparison cost proportional to the provided length, narrowing the timing channel.
+
+Both admin and stats auth are thin wrappers over one `validateBearerToken(req, expected, headerName)`; the header name is the parameter, and the behaviour of `validateAdminToken` is unchanged from before the extraction.
+
+### Two tokens, and why the stats reader does not get the admin one
+
+`ADMIN_API_TOKEN` and `STATS_API_TOKEN` are **separate credentials on purpose**, and this is the security claim the stats surface exists to make: *the identity that pulls DM counts on a schedule cannot read a private conversation.*
+
+- Each route compares against **exactly one** expected value. `validateBearerToken` never consults a token set, so there is no path by which one credential opens two surfaces.
+- The header names differ (`x-admin-api-token` vs `x-stats-api-token`), so a misconfigured client offers the wrong one and gets a clean 401 rather than accidental access.
+- `loadConfig` **throws at boot** when the two values are equal. One string wearing two names is the separation in name only, and it is the single way to defeat the claim above without any code being wrong.
+- The claim is asserted **in both directions** by [`tests/integration/stats-routes.test.ts`](../../tests/integration/stats-routes.test.ts): the stats token is rejected on `/admin/conversations/:key`, `/admin/status/:messageId`, `/admin/queue`, `/admin/dedupe` and `/metrics` (with a seeded conversation and status record behind the first two, so a leak would return real content), and the admin token is rejected on `/stats/daily`. A final case re-checks that each surface still serves *its own* token, so the rejections are about the credential rather than a route that stopped working.
+
+The admin identity gains nothing from being refused the counts — it can already read the conversations those counts summarise. The separation runs one way and that is the direction that matters.
 
 ## The `/ready` check shape
 
@@ -164,19 +182,23 @@ The policy is **allow-list / fail-closed**: the inbound/outbound/record/status r
 | [`src/http/app.ts`](../../src/http/app.ts) | All routes (incl. `/admin/queue`, `/admin/dedupe`) + the registration guards + `buildReadinessReport` + the `onReject` → `webhook_secret_rejections_total` wiring. |
 | [`src/http/security.ts`](../../src/http/security.ts) | The signature verifier + the optional `onReject(reason)` callback feeding the rejection counter. |
 | [`src/http/trace.ts`](../../src/http/trace.ts) | `traceMiddleware`, the `x-trace-id` injection guard, the pino child logger. |
-| [`src/http/auth.ts`](../../src/http/auth.ts) | `validateAdminToken` + constant-time `constantTimeStringEquals`. |
+| [`src/http/auth.ts`](../../src/http/auth.ts) | `validateBearerToken` + the `validateAdminToken` / `validateStatsToken` wrappers + constant-time `constantTimeStringEquals`. |
+| [`src/stats/store.ts`](../../src/stats/store.ts) | The `StatsStore` interface, the date/key helpers, and `InMemoryStatsStore`. See [DM volume stats](./stats.md). |
+| [`src/stats/redis-store.ts`](../../src/stats/redis-store.ts) | `RedisStatsStore` — the durable path (Lua `INCR`/`PEXPIRE`/`SADD`, chunked `MGET` reads). |
 | [`src/http/redaction.ts`](../../src/http/redaction.ts) | Allow-list / fail-closed redactors + the `mask*` helpers. |
 | [`src/metrics/collector.ts`](../../src/metrics/collector.ts) | `MetricsCollector` interface, `InMemoryMetricsCollector` (cardinality cap), `NoopMetricsCollector`. |
 | [`src/metrics/registry.ts`](../../src/metrics/registry.ts) | `createAgentMetrics`, the named handles, `normalizeErrorCodeLabel`. |
 | [`src/metrics/prometheus.ts`](../../src/metrics/prometheus.ts) | `renderPrometheus`, `PROMETHEUS_CONTENT_TYPE`. |
 | [`src/index.ts`](../../src/index.ts) | Wires the in-memory collector/tracker/contact-store and passes the deps into `createApp`. |
-| [`src/config/loader.ts`](../../src/config/loader.ts) | `ADMIN_API_TOKEN` (≥16 chars), `USER_LOOKUP_URL`, `USER_LOOKUP_TIMEOUT_MS`. |
+| [`src/config/loader.ts`](../../src/config/loader.ts) | `ADMIN_API_TOKEN` (≥16 chars), `STATS_API_TOKEN` (≥16 chars, must differ from the admin token), `STATS_RETENTION_DAYS`, `USER_LOOKUP_URL`, `USER_LOOKUP_TIMEOUT_MS`. |
 
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ADMIN_API_TOKEN` | unset | Gates `/metrics` + `/admin/*` (constant-time bearer check). When unset, those routes are not mounted (404). When set, must be ≥16 chars (≥32 recommended). |
+| `STATS_API_TOKEN` | unset | Gates `GET /stats/daily` and **nothing else**. Same ≥16-char floor and same 404-when-unset guard. **Must not equal `ADMIN_API_TOKEN`** — `loadConfig` throws if it does. |
+| `STATS_RETENTION_DAYS` | `400` | How many days of DM-volume history the stats store keeps (Redis key TTL / in-memory sweep). Positive integer, capped at the store's `MAX_RANGE_DAYS` (1000) so nothing is retained that a single read cannot reach. |
 | `REDIS_URL` | unset | Selects the Stage 10 Redis persistence path; surfaced in `/ready` as `not_configured` / `configured` / a real `ping()` (`ok`/`error`) when the Redis runtime injects the client. See [Persistence](./persistence.md). |
 
 See [Configuration](./configuration.md) for the full env reference (including the identity knobs).

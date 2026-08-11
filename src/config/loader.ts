@@ -1,3 +1,5 @@
+import { MAX_RANGE_DAYS } from '../stats/store.js';
+
 export type ConfigEnv = NodeJS.ProcessEnv;
 
 export interface Channels {
@@ -331,6 +333,25 @@ export interface Config {
   userLookupUrl?: string;
   redisUrl?: string;
   adminApiToken?: string;
+  /**
+   * Optional. Bearer token for `GET /stats/daily` (`STATS_API_TOKEN`). Unset ⇒
+   * the route is never registered and 404s, exactly like the admin routes.
+   *
+   * DELIBERATELY SEPARATE from {@link Config.adminApiToken}, and the whole point
+   * of the surface: the identity that pulls DM volume on a schedule reads
+   * per-day COUNTS and must not be able to read conversation transcripts. Two
+   * tokens make that a property of the credential rather than a promise about
+   * the caller — so `loadConfig` also refuses a config where the two are equal.
+   */
+  statsApiToken?: string;
+  /**
+   * How many days of DM-volume history the stats store keeps
+   * (`STATS_RETENTION_DAYS`, default {@link DEFAULT_STATS_RETENTION_DAYS}).
+   * OPTIONAL on the type for hand-assembled configs (same rationale as
+   * `webhookGapAlertMinutes`); `loadConfig` always populates it, and consumers
+   * read it as `?? DEFAULT_STATS_RETENTION_DAYS`.
+   */
+  statsRetentionDays?: number;
   /**
    * Webhook delivery-gap alerting (`WEBHOOK_GAP_ALERT_MINUTES`): when > 0, a
    * channel that has delivered at least one webhook this process lifetime and
@@ -978,6 +999,49 @@ function loadAdminApiToken(env: ConfigEnv): string | undefined {
   return value;
 }
 
+/**
+ * Default DM-volume retention: a bit over a year, so a marketing read can always
+ * compare this month against the same month last year.
+ */
+export const DEFAULT_STATS_RETENTION_DAYS = 400;
+
+/**
+ * Load the OPTIONAL `STATS_API_TOKEN`. Unset/blank -> `undefined` (the
+ * `/stats/daily` route simply doesn't mount — see `createApp`). When SET it is a
+ * bearer credential on a public deploy, so it carries the same 16-char floor as
+ * `ADMIN_API_TOKEN` — the counts it guards are not PII, but a guessable token is
+ * a foot-gun regardless of what is behind it.
+ */
+function loadStatsApiToken(env: ConfigEnv): string | undefined {
+  const value = trimmed(env, 'STATS_API_TOKEN');
+  if (value === undefined) return undefined;
+  if (value.length < 16) {
+    throw new Error(
+      `Invalid STATS_API_TOKEN: must be at least 16 characters (got ${value.length}). ` +
+        'Use a high-entropy secret of >=32 characters.'
+    );
+  }
+  return value;
+}
+
+/**
+ * Load `STATS_RETENTION_DAYS` (default {@link DEFAULT_STATS_RETENTION_DAYS}).
+ * A positive integer, capped at the stats store's `MAX_RANGE_DAYS`: retaining
+ * more history than a single `range()` call will enumerate produces days that
+ * are stored and paid for but unreadable through the route that exists to read
+ * them, which is a misconfiguration worth failing the boot over.
+ */
+function loadStatsRetentionDays(env: ConfigEnv): number {
+  const value = loadPositiveInt(env, 'STATS_RETENTION_DAYS', DEFAULT_STATS_RETENTION_DAYS);
+  if (value > MAX_RANGE_DAYS) {
+    throw new Error(
+      `Invalid STATS_RETENTION_DAYS: ${value}. Expected a positive integer <= ${MAX_RANGE_DAYS} ` +
+        '(the maximum span GET /stats/daily will read in one call).'
+    );
+  }
+  return value;
+}
+
 export function loadConfig(env: ConfigEnv = process.env): Config {
   const meta: MetaConfig = {
     appId: trimmed(env, 'META_APP_ID'),
@@ -1111,6 +1175,19 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
   assertUniqueBusinessIds('Messenger', accounts.messenger, a => (a as NamedMessengerConfig).pageId);
   assertUniqueBusinessIds('Instagram', accounts.instagram, a => (a as NamedInstagramConfig).userId);
 
+  // Two tokens that are the same string are one token wearing two names: the CI
+  // identity that pulls counts would also open /admin/conversations. Refuse at
+  // boot rather than ship a separation that only looks like one.
+  const adminApiToken = loadAdminApiToken(env);
+  const statsApiToken = loadStatsApiToken(env);
+  if (adminApiToken !== undefined && statsApiToken === adminApiToken) {
+    throw new Error(
+      'STATS_API_TOKEN must not equal ADMIN_API_TOKEN. The stats token exists so a ' +
+        'scheduled reader of DM counts cannot read conversation PII; sharing one value ' +
+        'defeats that. Generate a second, independent secret.'
+    );
+  }
+
   const channels: Channels = {
     whatsapp: accounts.whatsapp.length > 0,
     messenger: accounts.messenger.length > 0,
@@ -1142,7 +1219,9 @@ export function loadConfig(env: ConfigEnv = process.env): Config {
     chatEndpointApiKey: loadChatEndpointApiKey(env),
     userLookupUrl: loadUserLookupUrl(env),
     redisUrl: loadRedisUrl(env),
-    adminApiToken: loadAdminApiToken(env),
+    adminApiToken,
+    ...(statsApiToken !== undefined ? { statsApiToken } : {}),
+    statsRetentionDays: loadStatsRetentionDays(env),
     webhookGapAlertMinutes: loadNonNegativeInt(env, 'WEBHOOK_GAP_ALERT_MINUTES', 0),
     publicBaseUrl: trimmed(env, 'PUBLIC_BASE_URL'),
     ...(() => {

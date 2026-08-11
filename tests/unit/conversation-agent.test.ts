@@ -31,6 +31,8 @@ import type { IdentityResolver, IdentityLookupRequest } from '../../src/identity
 import type { Contact } from '../../src/identity/types.js';
 import type { InboundMediaHydrator } from '../../src/meta/shared/media-hydrator.js';
 import type { LimitTracker } from '../../src/limits/tracker.js';
+import { AdapterRegistry } from '../../src/meta/shared/registry.js';
+import type { StatsMetric, StatsStore } from '../../src/stats/store.js';
 import type { ErrorClassification } from '../../src/limits/retry.js';
 import { MetaApiError } from '../../src/meta/shared/errors.js';
 import { createIdleConversation, type ConversationRecord } from '../../src/conversation/types.js';
@@ -221,6 +223,14 @@ function makeHarness(opts: {
   mediaHydrator?: InboundMediaHydrator;
   /** Optional Stage 10 limit tracker (fake or real). */
   limitTracker?: LimitTracker;
+  /** Optional durable DM-volume counters. */
+  statsStore?: StatsStore;
+  /**
+   * Optional adapter REGISTRY, used instead of the channel map when a test needs
+   * a genuinely multi-account channel (the channel map always collapses to one
+   * `default` account per channel).
+   */
+  registry?: AdapterRegistry;
 }): Harness {
   const config = makeConfig();
   opts.configMutate?.(config);
@@ -238,7 +248,7 @@ function makeHarness(opts: {
     store,
     scheduler,
     chatClient: chat,
-    adapters: adapters as Partial<Record<Channel, ChannelAdapter>>,
+    adapters: opts.registry ?? (adapters as Partial<Record<Channel, ChannelAdapter>>),
     config,
     logger: silentLogger,
     random: () => 0.5, // mid-range jitter, fully deterministic
@@ -248,7 +258,8 @@ function makeHarness(opts: {
     ...(statusTracker ? { statusTracker } : {}),
     ...(opts.identityResolver ? { identityResolver: opts.identityResolver } : {}),
     ...(opts.mediaHydrator ? { mediaHydrator: opts.mediaHydrator } : {}),
-    ...(opts.limitTracker ? { limitTracker: opts.limitTracker } : {})
+    ...(opts.limitTracker ? { limitTracker: opts.limitTracker } : {}),
+    ...(opts.statsStore ? { statsStore: opts.statsStore } : {})
   });
   return {
     agent,
@@ -371,6 +382,36 @@ function makeResolver(result: Contact | undefined): IdentityResolver & { calls: 
     async resolve(req: IdentityLookupRequest): Promise<Contact | undefined> {
       calls.push(req);
       return result;
+    }
+  };
+}
+
+interface RecordingStatsStore extends StatsStore {
+  increments: Array<{ account: string; channel: Channel; metric: StatsMetric; now: number }>;
+  /** How many times `metric` was bumped (optionally for one account only). */
+  countOf(metric: StatsMetric, account?: string): number;
+}
+
+/**
+ * A {@link StatsStore} that records every `increment` instead of storing counts.
+ * `opts.increment` replaces the body — used to prove that a store VIOLATING the
+ * never-throws contract still cannot affect delivery. `range` is unused by the
+ * agent and throws if something reaches for it.
+ */
+function makeStatsStore(opts: { increment?: () => Promise<void> } = {}): RecordingStatsStore {
+  const increments: RecordingStatsStore['increments'] = [];
+  return {
+    increments,
+    countOf(metric: StatsMetric, account?: string): number {
+      return increments.filter(c => c.metric === metric && (account === undefined || c.account === account))
+        .length;
+    },
+    async increment(account: string, channel: Channel, metric: StatsMetric, now: number): Promise<void> {
+      if (opts.increment) return opts.increment();
+      increments.push({ account, channel, metric, now });
+    },
+    async range(): Promise<never> {
+      throw new Error('range is not exercised from the agent');
     }
   };
 }
@@ -3494,6 +3535,186 @@ describe('ConversationAgent', () => {
       // The reaction resolved to the LAST buffered inbound id, not the first.
       expect(adapter.sendReaction).toHaveBeenCalledTimes(1);
       expect(adapter.sendReaction).toHaveBeenCalledWith('fb-user', 'm_last', '🔥');
+      await h.agent.close();
+    });
+  });
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Durable DM-volume counters (statsStore)                                */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  describe('durable DM-volume counters (statsStore)', () => {
+    it('counts conversations_started, messages_in and messages_out over one turn', async () => {
+      const stats = makeStatsStore();
+      const h = makeHarness({ responses: [textResponse('hi there')], statsStore: stats });
+
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.s1' }));
+      await flushBuffer();
+
+      expect(stats.countOf('conversations_started')).toBe(1);
+      expect(stats.countOf('messages_in')).toBe(1);
+      expect(stats.countOf('messages_out')).toBe(1);
+      // Every count carries the ACCOUNT NAME (the channel map registers one
+      // `default` account per channel), the channel, and the injected clock.
+      for (const call of stats.increments) {
+        expect(call.account).toBe('default');
+        expect(call.channel).toBe('whatsapp');
+        expect(call.now).toBe(FIXED_NOW);
+      }
+      await h.agent.close();
+    });
+
+    it('does NOT double-count messages_in when Meta redelivers the same inbound', async () => {
+      // The hook sits PAST the dedupe claim precisely so the 7-day redelivery
+      // Meta performs until it sees a 200 cannot inflate the number.
+      const stats = makeStatsStore();
+      const h = makeHarness({ responses: [textResponse('hi')], statsStore: stats });
+
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.dup' }));
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.dup' }));
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.dup' }));
+
+      expect(stats.countOf('messages_in')).toBe(1);
+      expect(stats.countOf('conversations_started')).toBe(1);
+      await h.agent.close();
+    });
+
+    it('counts a second, genuinely-new inbound but not a second conversation', async () => {
+      const stats = makeStatsStore();
+      const h = makeHarness({ responses: [textResponse('hi')], statsStore: stats });
+
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.a' }));
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.b' }));
+
+      expect(stats.countOf('messages_in')).toBe(2);
+      expect(stats.countOf('conversations_started')).toBe(1);
+      await h.agent.close();
+    });
+
+    it('counts nothing for an echo of our own outbound', async () => {
+      const stats = makeStatsStore();
+      const h = makeHarness({ responses: [textResponse('hi')], statsStore: stats });
+
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.echo', isEcho: true }));
+
+      expect(stats.increments).toHaveLength(0);
+      await h.agent.close();
+    });
+
+    it('counts one messages_out per real Graph send, not per queue item', async () => {
+      // A typing bubble is a UX side-effect, not a message — it is excluded by
+      // the same `makesGraphSend` flag the limit tracker's throughput uses.
+      const stats = makeStatsStore();
+      const h = makeHarness({
+        responses: [{ actions: [{ type: 'typing', durationMs: 500 }, { type: 'message', text: 'one' }] }],
+        statsStore: stats
+      });
+
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.typ' }));
+      await flushBuffer();
+
+      expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledTimes(1);
+      expect(stats.countOf('messages_out')).toBe(1);
+      await h.agent.close();
+    });
+
+    it('a stats store whose increment REJECTS does not break delivery or duplicate a send', async () => {
+      // increment is contractually fail-open, but the outbound hook sits inside
+      // sendNext's try — whose catch may schedule a RETRY. A throwing counter
+      // must not be able to send a second copy of a DM.
+      const stats = makeStatsStore({
+        increment: async () => {
+          throw new Error('stats backend exploded');
+        }
+      });
+      // Messenger advances `on_send`, so a clean turn reaches `idle` here and the
+      // assertion covers the whole path rather than stopping at the send.
+      const h = makeHarness({ responses: [textResponse('still delivered')], statsStore: stats });
+
+      await h.agent.handleInbound(
+        inbound({ channel: 'messenger', channelMessageId: 'm.boom', channelScopedUserId: 'fb-user' })
+      );
+      await flushBuffer();
+
+      expect(h.chat.complete).toHaveBeenCalledTimes(1);
+      expect(h.adapters.messenger!.sendText).toHaveBeenCalledTimes(1);
+      expect(h.adapters.messenger!.sendText).toHaveBeenCalledWith('fb-user', 'still delivered');
+      // The turn completed normally despite every count failing.
+      const record = await h.store.getConversation('messenger:biz-1:fb-user');
+      expect(record!.state).toBe('idle');
+      await h.agent.close();
+    });
+
+    it('attributes counts to the ACCOUNT NAME on a multi-account channel', async () => {
+      const reed = makeAdapter('instagram', () => true);
+      const iris = makeAdapter('instagram', () => true);
+      const registry = new AdapterRegistry();
+      registry.register({ channel: 'instagram', accountName: 'reed', businessId: 'ig-reed', adapter: reed });
+      registry.register({ channel: 'instagram', accountName: 'iris', businessId: 'ig-iris', adapter: iris });
+
+      const stats = makeStatsStore();
+      const h = makeHarness({ responses: [textResponse('hey')], statsStore: stats, registry });
+
+      await h.agent.handleInbound(
+        inbound({
+          channel: 'instagram',
+          channelMessageId: 'ig.1',
+          channelScopedUserId: 'ig-user',
+          channelScopedBusinessId: 'ig-iris'
+        })
+      );
+      await flushBuffer();
+
+      expect(iris.sendText).toHaveBeenCalledTimes(1);
+      expect(reed.sendText).not.toHaveBeenCalled();
+      expect(stats.increments.every(c => c.account === 'iris')).toBe(true);
+      expect(stats.countOf('messages_in', 'iris')).toBe(1);
+      expect(stats.countOf('messages_out', 'iris')).toBe(1);
+      await h.agent.close();
+    });
+
+    it('SKIPS the count (never guesses) when no configured account claims the business id', async () => {
+      // Two accounts on the channel and neither claims `ig-stranger`, so
+      // AdapterRegistry.resolve is undefined — the same condition under which the
+      // flush path drops the turn as unanswerable.
+      const registry = new AdapterRegistry();
+      registry.register({
+        channel: 'instagram',
+        accountName: 'reed',
+        businessId: 'ig-reed',
+        adapter: makeAdapter('instagram', () => true)
+      });
+      registry.register({
+        channel: 'instagram',
+        accountName: 'iris',
+        businessId: 'ig-iris',
+        adapter: makeAdapter('instagram', () => true)
+      });
+
+      const stats = makeStatsStore();
+      const h = makeHarness({ responses: [textResponse('hey')], statsStore: stats, registry });
+
+      await h.agent.handleInbound(
+        inbound({
+          channel: 'instagram',
+          channelMessageId: 'ig.stranger',
+          channelScopedUserId: 'ig-user',
+          channelScopedBusinessId: 'ig-stranger'
+        })
+      );
+      await flushBuffer();
+
+      expect(stats.increments).toHaveLength(0);
+      await h.agent.close();
+    });
+
+    it('counts nothing at all when no stats store is wired', async () => {
+      // The whole surface is additive: an agent built without one behaves
+      // exactly as before, which is what every other test in this file asserts.
+      const h = makeHarness({ responses: [textResponse('hi')] });
+      await h.agent.handleInbound(inbound({ channelMessageId: 'wamid.none' }));
+      await flushBuffer();
+      expect(h.adapters.whatsapp!.sendText).toHaveBeenCalledTimes(1);
       await h.agent.close();
     });
   });

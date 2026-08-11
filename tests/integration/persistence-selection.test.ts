@@ -20,8 +20,12 @@
 import { describe, expect, it } from 'vitest';
 import request from 'supertest';
 import pino from 'pino';
+import { Redis } from 'ioredis';
 import { buildRuntime } from '../../src/index.js';
 import { loadConfig, type Config } from '../../src/config/loader.js';
+import { RedisStatsStore } from '../../src/stats/redis-store.js';
+
+const STATS_TOKEN = 'stats-secret-token-1234567890';
 
 const BASE_ENV: Record<string, string> = {
   META_APP_SECRET: 'test-app-secret-1234567890',
@@ -60,6 +64,36 @@ describe('buildRuntime persistence selection', () => {
         await runtime.close();
       }
     });
+
+    it('wires an in-memory stats store — GET /stats/daily answers when a token is set', async () => {
+      // The route mounts only when a stats store is wired, so a 200 here is the
+      // externally observable proof that buildRuntime selected one.
+      const config = makeConfig({ STATS_API_TOKEN: STATS_TOKEN });
+      const runtime = buildRuntime(config, logger);
+      try {
+        const res = await request(runtime.app)
+          .get('/stats/daily')
+          .query({ since: '2026-08-01', until: '2026-08-10' })
+          .set('Authorization', `Bearer ${STATS_TOKEN}`);
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ days: [] });
+      } finally {
+        await runtime.close();
+      }
+    });
+
+    it('does NOT mount /stats/daily without STATS_API_TOKEN', async () => {
+      const runtime = buildRuntime(makeConfig(), logger);
+      try {
+        const res = await request(runtime.app)
+          .get('/stats/daily')
+          .query({ since: '2026-08-01' })
+          .set('Authorization', `Bearer ${STATS_TOKEN}`);
+        expect(res.status).toBe(404);
+      } finally {
+        await runtime.close();
+      }
+    });
   });
 
   // Gate the live-Redis branch on TEST_REDIS_URL so CI stays hardware-free.
@@ -78,6 +112,36 @@ describe('buildRuntime persistence selection', () => {
         expect(res.body.checks.scheduler.status).toBe('ok');
         expect(res.body.checks.scheduler.kind).toBe('bullmq');
       } finally {
+        await runtime.close();
+      }
+    });
+
+    it('wires a REDIS-backed stats store — /stats/daily reads the Redis keyspace', async () => {
+      // Write through an INDEPENDENT RedisStatsStore against the same Redis, then
+      // read through the runtime's route. The row can only appear if buildRuntime
+      // selected the Redis store on this branch; an InMemoryStatsStore would
+      // answer with an empty span.
+      const url = process.env.TEST_REDIS_URL as string;
+      const config = makeConfig({ REDIS_URL: url, STATS_API_TOKEN: STATS_TOKEN });
+      const runtime = buildRuntime(config, logger);
+      const probeRedis = new Redis(url);
+      const probe = new RedisStatsStore({ redis: probeRedis, retentionDays: 400 });
+      const account = `probe-${Date.now()}`;
+      const today = new Date().toISOString().slice(0, 10);
+      try {
+        await probe.increment(account, 'instagram', 'messages_in', Date.now());
+
+        const res = await request(runtime.app)
+          .get('/stats/daily')
+          .query({ since: today, until: today })
+          .set('Authorization', `Bearer ${STATS_TOKEN}`);
+        expect(res.status).toBe(200);
+        const row = (res.body.days as Array<{ account: string; messages_in: number }>).find(
+          d => d.account === account
+        );
+        expect(row?.messages_in).toBe(1);
+      } finally {
+        probeRedis.disconnect();
         await runtime.close();
       }
     });

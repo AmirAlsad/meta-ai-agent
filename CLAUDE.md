@@ -26,10 +26,10 @@ npm run dev                # runs src/index.ts via tsx; needs .env (autostarts o
 Run a single test file: `npx vitest run --config vitest.config.ts tests/unit/security.test.ts`
 Run a single test by name: append `-t "<name>"`.
 
-Redis/BullMQ integration tests (Stage 10: `tests/integration/redis-store.test.ts`, `limits-redis-store.test.ts`, the Redis branch of `persistence-selection.test.ts`) are **gated on `TEST_REDIS_URL`** — without it they `describe.skip`, so the default `npm test` (and CI) stays hardware-free. The suite is **1322 unit (54 files) + 93 integration tests**, of which **22 are Redis-gated** and skip without `TEST_REDIS_URL` — so the default `npm test` runs 1322 unit + 71 integration. To exercise them locally against a real Redis:
+Redis/BullMQ integration tests (Stage 10: `tests/integration/redis-store.test.ts`, `limits-redis-store.test.ts`, `stats-redis-store.test.ts`, the Redis branch of `persistence-selection.test.ts`) are **gated on `TEST_REDIS_URL`** — without it they `describe.skip`, so the default `npm test` (and CI) stays hardware-free. The suite is **1517 unit (60 files) + 131 integration tests**, of which **32 are Redis-gated** and skip without `TEST_REDIS_URL` — so the default `npm test` runs 1517 unit + 99 integration. To exercise them locally against a real Redis:
 
 ```bash
-TEST_REDIS_URL=redis://127.0.0.1:6399 npm run test:integration   # runs all 93 integration tests
+TEST_REDIS_URL=redis://127.0.0.1:6399 npm run test:integration   # runs all 131 integration tests
 ```
 
 Stage 3 setup and capture scripts (real Meta App + ngrok required, **never run in CI**):
