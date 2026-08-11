@@ -7,7 +7,7 @@ import type { Config } from '../config/loader.js';
 import { configuredAccounts, tokenFormatWarnings } from '../config/loader.js';
 import { createMetaSignatureVerifier } from './security.js';
 import { traceMiddleware, requestContextFromLocals } from './trace.js';
-import { validateAdminToken } from './auth.js';
+import { validateAdminToken, validateStatsToken } from './auth.js';
 import { redactConversationRecord, redactStatusRecord } from './redaction.js';
 import { parseMetaWebhook } from '../meta/parser.js';
 import type { IncomingMessage, ParseResult, StatusUpdate } from '../meta/types.js';
@@ -20,6 +20,13 @@ import { renderPrometheus, PROMETHEUS_CONTENT_TYPE } from '../metrics/prometheus
 import type { StatusTracker } from '../status/tracker.js';
 import type { ConversationStore } from '../conversation/store.js';
 import type { BufferScheduler } from '../conversation/scheduler.js';
+import {
+  DAY_MS,
+  MAX_RANGE_DAYS,
+  parseIsoDate,
+  utcDateFromMillis,
+  type StatsStore
+} from '../stats/store.js';
 
 /**
  * Minimal structural shape of an ioredis client for the GET /ready ping. Defined
@@ -73,6 +80,12 @@ export interface AppDeps {
    * token) becomes an alertable error instead of a late discovery.
    */
   webhookGapMonitor?: WebhookGapMonitor;
+  /**
+   * Durable DM-volume counters (optional): required — together with
+   * `config.statsApiToken` — to MOUNT GET /stats/daily. Same registration guard
+   * as the admin routes; see the route for why the token is a separate one.
+   */
+  statsStore?: StatsStore;
 }
 
 /**
@@ -427,7 +440,8 @@ export function createApp(deps: AppDeps): express.Express {
     scheduler,
     redisClient,
     commentAgent,
-    webhookGapMonitor
+    webhookGapMonitor,
+    statsStore
   } = deps;
   const app = express();
   const startedAtMs = Date.now();
@@ -738,6 +752,73 @@ export function createApp(deps: AppDeps): express.Express {
         })
         .catch((err: unknown) => {
           logger.error({ err, method: req.method, path: req.path }, 'admin dedupe route error');
+          if (!res.headersSent) res.status(500).json({ error: 'internal_error' });
+        });
+    });
+  }
+
+  // ── GET /stats/daily (token-gated, GUARDED AT REGISTRATION) ───────────────
+  // Per-account, per-UTC-day DM volume. Mounted ONLY when `statsApiToken` is set
+  // AND a stats store is wired — same rule as the admin routes above: an
+  // unconfigured deploy 404s rather than 401ing, so it never advertises that the
+  // surface exists.
+  //
+  // SECURITY, and the reason this is not just another /admin route: the caller is
+  // a scheduled job that pulls counts every day, and it must not be able to read
+  // conversation transcripts. It therefore authenticates with `statsApiToken`
+  // ONLY — the admin token is rejected here, and this token is rejected on
+  // /admin/* and /metrics, because each route compares against exactly one
+  // expected value. `loadConfig` additionally refuses a config where the two
+  // tokens are equal. NO PII: the response is dates, account names, channels and
+  // integers, so there is no redactor and no ?reveal.
+  if (config.statsApiToken && statsStore) {
+    const statsToken = config.statsApiToken;
+    const stats = statsStore;
+    app.get('/stats/daily', (req: Request, res: Response) => {
+      if (!validateStatsToken(req, statsToken)) {
+        res.status(401).json({ error: 'unauthorized' });
+        return;
+      }
+      const sinceRaw = typeof req.query.since === 'string' ? req.query.since.trim() : '';
+      const untilRaw = typeof req.query.until === 'string' ? req.query.until.trim() : '';
+      // `until` defaults to TODAY (UTC), which is also how the store buckets.
+      const until = untilRaw === '' ? utcDateFromMillis(Date.now()) : untilRaw;
+
+      // Validate the span HERE, before the store call, even though `range` would
+      // validate it again. WHY: `range` throws one error type for both a caller's
+      // malformed date and a backing-store failure, and those are a 400 and a 500.
+      // Checking first means a throw out of `range` below is unambiguously the
+      // store's, and a bad date never becomes a silent full-range scan.
+      let sinceMs: number;
+      let untilMs: number;
+      try {
+        sinceMs = parseIsoDate(sinceRaw, 'since');
+        untilMs = parseIsoDate(until, 'until');
+      } catch (err) {
+        res.status(400).json({ error: (err as Error).message });
+        return;
+      }
+      if (untilMs < sinceMs) {
+        res.status(400).json({ error: `until (${until}) is before since (${sinceRaw})` });
+        return;
+      }
+      const days = Math.round((untilMs - sinceMs) / DAY_MS) + 1;
+      if (days > MAX_RANGE_DAYS) {
+        res.status(400).json({
+          error: `range of ${days} days exceeds the ${MAX_RANGE_DAYS}-day maximum`
+        });
+        return;
+      }
+
+      // Floating promise needs its own .catch(): a rejection would otherwise be
+      // swallowed by `void` and leave the client hanging (mirrors /admin/*).
+      void stats
+        .range(sinceRaw, until)
+        .then(rows => {
+          res.json({ days: rows });
+        })
+        .catch((err: unknown) => {
+          logger.error({ err, method: req.method, path: req.path }, 'stats daily route error');
           if (!res.headersSent) res.status(500).json({ error: 'internal_error' });
         });
     });

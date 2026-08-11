@@ -12,6 +12,7 @@ import {
   loadConfig,
   tokenFormatWarnings
 } from '../../src/config/loader.js';
+import { MAX_RANGE_DAYS } from '../../src/stats/store.js';
 
 /**
  * A minimal env that satisfies every required loader rule EXCEPT the one
@@ -356,6 +357,85 @@ describe('loadConfig: ADMIN_API_TOKEN (PII-guarding bearer token)', () => {
   it('accepts exactly 16 chars (the floor)', () => {
     const token = '0123456789abcdef'; // 16
     expect(loadConfig(baseEnv({ ADMIN_API_TOKEN: token })).adminApiToken).toBe(token);
+  });
+});
+
+describe('loadConfig: STATS_API_TOKEN (the separate stats credential)', () => {
+  it('is undefined when unset — GET /stats/daily simply does not mount', () => {
+    expect(loadConfig(baseEnv()).statsApiToken).toBeUndefined();
+  });
+
+  it('is undefined when whitespace-only (trim-empty-as-unset)', () => {
+    expect(loadConfig(baseEnv({ STATS_API_TOKEN: '   ' })).statsApiToken).toBeUndefined();
+  });
+
+  it('throws (naming the var) when set but shorter than 16 chars', () => {
+    expect(() => loadConfig(baseEnv({ STATS_API_TOKEN: 'short-token' }))).toThrow(
+      /Invalid STATS_API_TOKEN.*at least 16 characters/
+    );
+  });
+
+  it('surfaces a >=16-char token on Config', () => {
+    const token = 'stats-token-1234567890';
+    expect(loadConfig(baseEnv({ STATS_API_TOKEN: token })).statsApiToken).toBe(token);
+  });
+
+  it('coexists with a DIFFERENT admin token', () => {
+    const config = loadConfig(
+      baseEnv({ ADMIN_API_TOKEN: 'admin-token-1234567890', STATS_API_TOKEN: 'stats-token-1234567890' })
+    );
+    expect(config.adminApiToken).toBe('admin-token-1234567890');
+    expect(config.statsApiToken).toBe('stats-token-1234567890');
+  });
+
+  it('throws when the two tokens are the SAME value', () => {
+    // The whole point of a second token is that the daily counts reader cannot
+    // open /admin/conversations. One shared value is that separation in name only.
+    const same = 'one-token-to-rule-them-all';
+    expect(() => loadConfig(baseEnv({ ADMIN_API_TOKEN: same, STATS_API_TOKEN: same }))).toThrow(
+      /STATS_API_TOKEN must not equal ADMIN_API_TOKEN/
+    );
+  });
+
+  it('does not trip the equality guard when only the stats token is set', () => {
+    expect(loadConfig(baseEnv({ STATS_API_TOKEN: 'stats-token-1234567890' })).adminApiToken).toBeUndefined();
+  });
+});
+
+describe('loadConfig: STATS_RETENTION_DAYS', () => {
+  it('defaults to 400', () => {
+    expect(loadConfig(baseEnv()).statsRetentionDays).toBe(400);
+  });
+
+  it('accepts an explicit positive integer', () => {
+    expect(loadConfig(baseEnv({ STATS_RETENTION_DAYS: '90' })).statsRetentionDays).toBe(90);
+  });
+
+  it('throws on zero or a negative value', () => {
+    expect(() => loadConfig(baseEnv({ STATS_RETENTION_DAYS: '0' }))).toThrow(
+      /Invalid STATS_RETENTION_DAYS/
+    );
+    expect(() => loadConfig(baseEnv({ STATS_RETENTION_DAYS: '-5' }))).toThrow(
+      /Invalid STATS_RETENTION_DAYS/
+    );
+  });
+
+  it('throws on a non-integer', () => {
+    expect(() => loadConfig(baseEnv({ STATS_RETENTION_DAYS: '30.5' }))).toThrow(
+      /Invalid STATS_RETENTION_DAYS/
+    );
+  });
+
+  it('throws above MAX_RANGE_DAYS — retention the read route cannot span in one call', () => {
+    expect(() => loadConfig(baseEnv({ STATS_RETENTION_DAYS: String(MAX_RANGE_DAYS + 1) }))).toThrow(
+      new RegExp(`Invalid STATS_RETENTION_DAYS.*<= ${MAX_RANGE_DAYS}`)
+    );
+  });
+
+  it('accepts exactly MAX_RANGE_DAYS (the ceiling)', () => {
+    expect(loadConfig(baseEnv({ STATS_RETENTION_DAYS: String(MAX_RANGE_DAYS) })).statsRetentionDays).toBe(
+      MAX_RANGE_DAYS
+    );
   });
 });
 

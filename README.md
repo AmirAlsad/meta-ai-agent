@@ -124,6 +124,7 @@ Also set `CHAT_ENDPOINT_API_KEY` (shared secret sent to the chat endpoint as `X-
 - [Read receipts](./docs/features/read-receipts.md) — Stage 6 WhatsApp `read` vs Messenger/Instagram watermark, and the `READ_RECEIPTS_ENABLED` knob.
 - [Identity resolution](./docs/features/identity-resolution.md) — Stage 6 optional fail-open enrichment over `USER_LOOKUP_URL`.
 - [Operational visibility](./docs/features/operational-visibility.md) — Stage 6 health/ready/metrics/admin routes, redaction, tracing, and the metrics model.
+- [DM volume stats](./docs/features/stats.md) — durable per-account, per-day conversation/message counters and the counts-only `GET /stats/daily`, gated by its own `STATS_API_TOKEN` so a scheduled reader of volume cannot read a conversation.
 - [Persistence](./docs/features/persistence.md) — Stage 10 dual-path conversation store + BullMQ buffer scheduler selected on `REDIS_URL`, and the real `/ready` Redis ping.
 - [Rate limiting](./docs/features/rate-limiting.md) — Stage 10 per-channel pacing, double-send-safe transient retry, the WhatsApp out-of-window template re-prompt, and the track-only per-hour/per-day counters.
 - [Setup verification](./docs/features/setup-verification.md) — `npm run setup:*` walkthrough.

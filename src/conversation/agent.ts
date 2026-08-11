@@ -59,6 +59,7 @@ import type { IdentityResolver } from '../identity/resolver.js';
 import type { LimitTracker } from '../limits/tracker.js';
 import { MESSENGER_SEND_SUBCODE_HINTS } from '../limits/error-codes.js';
 import type { StatusTracker } from '../status/tracker.js';
+import type { StatsMetric, StatsStore } from '../stats/store.js';
 import { calculateBufferTimeout } from './buffering.js';
 import type { BufferScheduler } from './scheduler.js';
 import type { ConversationStore } from './store.js';
@@ -187,6 +188,20 @@ export interface ConversationAgentDeps {
    * unconditionally (it fail-opens), so this is wired in production.
    */
   limitTracker?: LimitTracker;
+  /**
+   * OPTIONAL durable DM-volume counters — additive and track-only. Absent ⇒ no
+   * counts are kept and every behaviour here is byte-identical to before.
+   *
+   * Distinct from `metrics`: the Prometheus counters are per-channel, in-process,
+   * and reset on deploy; these are per-ACCOUNT, per-UTC-day, and outlive the
+   * process, because DM volume is a marketing number read weeks later and Meta's
+   * API serves no Instagram DM metric at all. Three hooks write it —
+   * `conversations_started` (a first inbound for a key), `messages_in` (past the
+   * dedupe claim) and `messages_out` (beside the limit tracker's throughput
+   * accounting). All three go through {@link ConversationAgent.countStat}, which
+   * cannot throw and therefore cannot change what is delivered.
+   */
+  statsStore?: StatsStore;
 }
 
 export class ConversationAgent {
@@ -206,6 +221,8 @@ export class ConversationAgent {
   private readonly mediaHydrator?: InboundMediaHydrator;
   /** OPTIONAL Stage 10 limits surface — undefined ⇒ no pacing/retry/window re-prompt. */
   private readonly limitTracker?: LimitTracker;
+  /** OPTIONAL durable DM-volume counters — undefined ⇒ nothing is counted. */
+  private readonly statsStore?: StatsStore;
 
   /**
    * Per-conversation delivery-timeout fallback timers, keyed by conversation
@@ -280,6 +297,7 @@ export class ConversationAgent {
     this.statusTracker = deps.statusTracker;
     this.mediaHydrator = deps.mediaHydrator;
     this.limitTracker = deps.limitTracker;
+    this.statsStore = deps.statsStore;
 
     // Register the buffer-flush handler exactly once. The scheduler fires this
     // after a conversation's burst window elapses (see calculateBufferTimeout).
@@ -374,6 +392,66 @@ export class ConversationAgent {
   }
 
   /* ──────────────────────────────────────────────────────────────────────── */
+  /* Durable DM-volume counters (track-only)                                   */
+  /* ──────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Bump one durable per-account, per-UTC-day counter. No-op when no stats store
+   * is wired.
+   *
+   * THE COUNTER IS KEYED ON THE ACCOUNT NAME, NOT THE BUSINESS ID. A business id
+   * is an opaque Page / IG-user id; the account name (`reed`, `iris`, …) is what
+   * the marketing side joins on, and it is already the identity the agent puts on
+   * every {@link ChatRequest}. So resolution goes through the SAME
+   * {@link AdapterRegistry.resolve} the outbound path uses — there is exactly one
+   * mapping from a record to an account in this class and this reuses it.
+   *
+   * WHEN THE ACCOUNT DOES NOT RESOLVE, THE COUNT IS SKIPPED (and warned), never
+   * attributed to a placeholder. `resolve` returns undefined only when no
+   * configured account claims this business id AND the channel has more than one
+   * account — i.e. on a genuinely multi-account channel receiving traffic for an
+   * identity this deploy does not serve. That is the same condition under which
+   * the flush path drops the turn as unanswerable, so the skipped count is a
+   * message this transport never handled rather than volume gone missing. A
+   * sentinel account (`unknown`) was the alternative and is worse: it is
+   * indistinguishable from a real account of that name, and a wrong number in a
+   * store read weeks later is not recoverable, whereas a missing one is visible.
+   *
+   * THE try/catch IS NOT REDUNDANT with {@link StatsStore.increment}'s own
+   * fail-open contract, and is here for a delivery-correctness reason rather than
+   * a defensive one. Both stores in this repo honour the contract; the guard is
+   * about WHERE the outbound hook sits — inside {@link sendNext}'s try, whose
+   * catch CLASSIFIES the error and may schedule a RETRY of the send that already
+   * succeeded. So a store that broke the contract would not merely lose a count:
+   * it would send a second copy of a DM to a real person. A counter must not be
+   * able to do that, and the contract is a promise made by a module this class
+   * does not own. The inbound hooks are guarded for the same reason at lower
+   * stakes: a throw there lands in `handleInboundImpl`'s catch and would drop the
+   * message instead of buffering it.
+   */
+  private async countStat(
+    channel: Channel,
+    businessId: string,
+    metric: StatsMetric,
+    logger: pino.Logger
+  ): Promise<void> {
+    if (!this.statsStore) return;
+    try {
+      const accountName = this.adapters.resolve(channel, businessId)?.accountName;
+      if (accountName === undefined) {
+        logger.warn(
+          { channel, businessId, metric },
+          'stats: no configured account answers for this business id; count skipped'
+        );
+        return;
+      }
+      await this.statsStore.increment(accountName, channel, metric, this.now());
+    } catch (err) {
+      logger.warn({ err, channel, businessId, metric }, 'stats: count failed (fail-open)');
+    }
+  }
+
+  /* ──────────────────────────────────────────────────────────────────────── */
   /* Inbound                                                                  */
   /* ──────────────────────────────────────────────────────────────────────── */
 
@@ -425,10 +503,20 @@ export class ConversationAgent {
       // A genuinely-new (claimed) message accepted for processing.
       this.metrics?.inboundMessages.inc({ channel: message.channel, type: message.type });
 
+      // DURABLE VOLUME (track-only): count the inbound HERE, past the dedupe
+      // claim above and past the echo filter before it — so Meta's 7-day
+      // redelivery of the same id cannot double-count, and the agent's own
+      // echoed output is never counted as something the audience sent.
+      await this.countStat(message.channel, message.channelScopedBusinessId, 'messages_in', logger);
+
       const key = conversationKeyFor(message);
       const now = this.now();
+      // Split from the `??` so the MISS is observable: a miss is the only point
+      // in the transport that distinguishes a new conversation from a continuing
+      // one — after this line the record exists and the distinction is gone.
+      const existing = await this.store.getConversation(key);
       const record =
-        (await this.store.getConversation(key)) ??
+        existing ??
         createIdleConversation({
           key,
           channel: message.channel,
@@ -436,6 +524,19 @@ export class ConversationAgent {
           channelScopedBusinessId: message.channelScopedBusinessId,
           now
         });
+      if (existing === undefined) {
+        // NOTE what this counts: conversation records expire (`CONVERSATION_TTL_
+        // SECONDS`), so a user returning after the TTL starts a "new" conversation
+        // by this measure. That matches the marketing reading (a fresh thread),
+        // and no cheaper signal exists — the transport keeps no identity beyond
+        // the record it just failed to find.
+        await this.countStat(
+          message.channel,
+          message.channelScopedBusinessId,
+          'conversations_started',
+          logger
+        );
+      }
 
       // Identity enrichment (Stage 6, OPTIONAL + fail-open). Runs UNDER the per-key
       // lock (handleInboundImpl already holds it) so the awaited resolve serializes
@@ -1210,6 +1311,16 @@ export class ConversationAgent {
       // accounting side-effect of a confirmed send.
       if (this.limitTracker && makesGraphSend) {
         await this.limitTracker.recordOutbound(record.channel, record.channelScopedBusinessId);
+      }
+
+      // DURABLE VOLUME (track-only): the same gate and the same fail-open
+      // contract as recordOutbound above — `makesGraphSend` is what separates a
+      // real Graph send from a typing bubble, so the two accounting side-effects
+      // stay in lock-step on exactly the same items. Counted only on the success
+      // path: an item that threw is skipped or retried below, and a retry that
+      // later succeeds passes back through here exactly once.
+      if (makesGraphSend) {
+        await this.countStat(record.channel, record.channelScopedBusinessId, 'messages_out', logger);
       }
     } catch (error) {
       // On a Meta API failure, bound the error_code label to the known set.

@@ -3,7 +3,13 @@ import path from 'node:path';
 import express from 'express';
 import pino from 'pino';
 import { Redis } from 'ioredis';
-import { loadConfig, configuredAccounts, commentsConfig, type Config } from './config/loader.js';
+import {
+  loadConfig,
+  configuredAccounts,
+  commentsConfig,
+  DEFAULT_STATS_RETENTION_DAYS,
+  type Config
+} from './config/loader.js';
 import { CommentAgent } from './comments/agent.js';
 import { CommentChatClient } from './comments/chat.js';
 import { InstagramCommentPoller } from './comments/ig-poller.js';
@@ -25,6 +31,9 @@ import { InMemoryLimitCounterStore } from './limits/store.js';
 import type { LimitCounterStore } from './limits/store.js';
 import { RedisLimitCounterStore } from './limits/redis-store.js';
 import { createLimitTracker } from './limits/tracker.js';
+import { InMemoryStatsStore } from './stats/store.js';
+import type { StatsStore } from './stats/store.js';
+import { RedisStatsStore } from './stats/redis-store.js';
 import { InMemoryMetricsCollector } from './metrics/collector.js';
 import { createAgentMetrics } from './metrics/registry.js';
 import { InMemoryStatusTracker } from './status/tracker.js';
@@ -133,6 +142,12 @@ export function buildRuntime(
   let store: ConversationStore;
   let scheduler: BufferScheduler;
   let limitCounterStore: LimitCounterStore;
+  // The DM-volume counters follow the SAME dual path on the SAME shared client —
+  // one more keyspace on the connection the conversation and limits stores
+  // already hold, never a second connection. On the in-memory path the counts are
+  // per-process and lost on restart, exactly like the limits windows.
+  let statsStore: StatsStore;
+  const statsRetentionDays = config.statsRetentionDays ?? DEFAULT_STATS_RETENTION_DAYS;
   if (config.redisUrl) {
     redis = new Redis(config.redisUrl);
     store = new RedisConversationStore({
@@ -148,10 +163,12 @@ export function buildRuntime(
       logger
     });
     limitCounterStore = new RedisLimitCounterStore({ redis, logger });
+    statsStore = new RedisStatsStore({ redis, retentionDays: statsRetentionDays, logger });
   } else {
     store = new InMemoryConversationStore({ dedupeTtlSeconds: config.conversation.dedupeTtlSeconds });
     scheduler = new InMemoryBufferScheduler();
     limitCounterStore = new InMemoryLimitCounterStore();
+    statsStore = new InMemoryStatsStore({ retentionDays: statsRetentionDays });
   }
 
   // The limit tracker is built in BOTH paths (it fail-opens on a pacing error,
@@ -230,6 +247,7 @@ export function buildRuntime(
     identityResolver,
     statusTracker,
     limitTracker,
+    statsStore,
     ...(mediaHydrator ? { mediaHydrator } : {})
   });
 
@@ -310,6 +328,7 @@ export function buildRuntime(
     statusTracker,
     store,
     scheduler,
+    statsStore,
     // Hand the shared client (Redis path only) to /ready so it can ping it. On
     // the in-memory path this is undefined and /ready reports presence-only.
     ...(redis ? { redisClient: redis } : {})
@@ -327,6 +346,10 @@ export function buildRuntime(
     commentPoller?.stop();
     webhookGapMonitor?.stop();
     await agent.close();
+    // Before the shared client goes away. Both implementations' `close` is a
+    // no-op today (the Redis one BORROWS this client and must not disconnect it),
+    // but calling it keeps the store's lifecycle its own.
+    await statsStore.close?.();
     if (redis) redis.disconnect();
   };
 

@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import httpMocks from 'node-mocks-http';
 import type { Request } from 'express';
-import { validateAdminToken, constantTimeStringEquals } from '../../src/http/auth.js';
+import {
+  validateAdminToken,
+  validateBearerToken,
+  validateStatsToken,
+  constantTimeStringEquals
+} from '../../src/http/auth.js';
 
 const EXPECTED = 'super-secret-admin-token';
 
@@ -71,6 +76,45 @@ describe('validateAdminToken', () => {
       'x-admin-api-token': EXPECTED
     });
     expect(validateAdminToken(req, EXPECTED)).toBe(true);
+  });
+});
+
+describe('validateStatsToken', () => {
+  const STATS = 'super-secret-stats-token';
+
+  it('returns true for a valid Authorization: Bearer token', () => {
+    expect(validateStatsToken(makeReq({ authorization: `Bearer ${STATS}` }), STATS)).toBe(true);
+  });
+
+  it('returns true for a valid x-stats-api-token header', () => {
+    expect(validateStatsToken(makeReq({ 'x-stats-api-token': STATS }), STATS)).toBe(true);
+  });
+
+  it('IGNORES the x-admin-api-token header, even carrying the right stats value', () => {
+    // The header name is part of the separation: a client configured for the
+    // admin surface must not authenticate against the stats surface by accident.
+    expect(validateStatsToken(makeReq({ 'x-admin-api-token': STATS }), STATS)).toBe(false);
+  });
+
+  it('returns false for the admin token', () => {
+    expect(validateStatsToken(makeReq({ authorization: `Bearer ${EXPECTED}` }), STATS)).toBe(false);
+  });
+
+  it('returns false when no auth header is present', () => {
+    expect(validateStatsToken(makeReq(), STATS)).toBe(false);
+  });
+});
+
+describe('validateBearerToken (the parameterized form)', () => {
+  it('reads the header name it is given', () => {
+    const req = makeReq({ 'x-custom-token': EXPECTED });
+    expect(validateBearerToken(req, EXPECTED, 'x-custom-token')).toBe(true);
+    expect(validateBearerToken(req, EXPECTED, 'x-other-token')).toBe(false);
+  });
+
+  it('always accepts Authorization: Bearer regardless of the header name', () => {
+    const req = makeReq({ authorization: `Bearer ${EXPECTED}` });
+    expect(validateBearerToken(req, EXPECTED, 'x-anything')).toBe(true);
   });
 });
 
