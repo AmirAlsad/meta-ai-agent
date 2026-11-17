@@ -217,7 +217,7 @@ These govern the async-`failed`-status path, the failure categories, the track-o
 ## Conventions
 
 - TypeScript ESM (`"type": "module"`). Internal imports of `.ts` files use `.js` specifiers (Node ESM resolution: `import { createApp } from './http/app.js'`).
-- Node `>=20`. Vitest for tests; `node-mocks-http` for Express handler unit tests; `supertest` for integration tests against the real Express app.
+- Node 24 (`engines.node: "24.x"`). Vitest for tests; `node-mocks-http` for Express handler unit tests; `supertest` for integration tests against the real Express app.
 - Root runtime `dependencies` are deliberately lean: `express`, `pino`, `dotenv`, and — added in Stage 10 — `ioredis` (the Redis client backing `RedisConversationStore` / `RedisLimitCounterStore`) and `bullmq` (the durable buffer scheduler). These stay model-provider-free (see Project Scope); do not add a model SDK. Redis/BullMQ integration tests are gated on `TEST_REDIS_URL` so CI needs no Redis (see Commands).
 - Structured logging with `pino`. Include enough fields to debug webhook delivery, signature failures, channel routing, and (later) chat-endpoint failures. The integration tests assert specific `traceMarker` values — `inbound.whatsapp`, `inbound.messenger`, `inbound.instagram`, `inbound.unknown` — preserve those when extending the dispatcher.
 - Capture artifacts (`.captures/`) and `.env` are gitignored and may contain phone numbers, tunnel URLs, message content, and secrets — manually redact before promoting captures into `tests/fixtures/meta/captured/` (Stage 3 workflow — see [Payload capture](./docs/features/payload-capture.md)).
