@@ -97,7 +97,7 @@ function buildQueryString(query: Record<string, string | number | undefined>): s
  * `operation` is a free-form label (e.g. `'get_whatsapp_phone_number'`) used
  * in error messages and logs.
  *
- * Uses Node 20's built-in `fetch`; no extra HTTP dep required.
+ * Uses Node's built-in `fetch`; no extra HTTP dep required.
  */
 export async function graphFetch<T = unknown>(
   url: string,
