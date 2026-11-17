@@ -82,13 +82,23 @@ Stage 6 adds the operational surface. The agent records per-outbound-message del
 
 ## Deploying (Railway)
 
-[`railway.json`](./railway.json) is checked in: RAILPACK builder, `npm ci --include=dev && npm run build`, `npm start` (`node dist/index.js`), `ON_FAILURE` restarts, and the deploy healthcheck on `GET /health` — the one always-on route with no dependencies (uptime, version, node version; `GET /ready` pings Redis and is for *readiness*, not the deploy gate). Two build facts in that config are proven, one is precautionary (all measured against live Railway deploys 2026-08-06, commit `c4b6dc7`):
+Railway reads no `railway.json` after 2026-12-01, so the deploy settings live on the Railway service itself. Set them there, or in whatever manages your Railway project's settings (the Delirio deployment keeps them in `DelirioInteraction`'s `railway-settings.json`, entry `MetaTransport`):
 
-- **Proven:** `NODE_ENV=production` makes `npm ci` omit devDependencies, so the buildCommand forces `--include=dev` or `tsc` is missing at build time.
-- **Proven:** `tsconfig.build.json` pins `rootDir ./src` so the emit lands at `dist/index.js`, where `npm start` and `package.json` `main`/`types` point. The inherited `rootDir ./` emitted `dist/src/index.js` and had never been exercised — only the tsx dev loop had ever run this repo.
-- **Precautionary, causality NOT established:** the builder is `RAILPACK`, not `NIXPACKS`. Five consecutive builds died at `BUILD_IMAGE` with zero log output while `railway.json` said `NIXPACKS`, and the first build with `RAILPACK` produced full output — but every service in the sibling `DelirioInteraction` project also declares `NIXPACKS` and builds green today (all of them resolve to `RAILPACK` in Railway's deployment metadata, so the field may simply be ignored there). The isolating experiment — flip only this field back and redeploy — has not been run. Treat `RAILPACK` as the safe current value, not as evidence that `NIXPACKS` is dead.
+| Setting | Value |
+|---|---|
+| Builder | Railpack (Node from `engines.node` in `package.json`) |
+| Build command | `npm ci --include=dev && npm run build` |
+| Start command | `node dist/index.js`, never `npm start`: npm does not forward SIGTERM, and the graceful shutdown in `src/index.ts` needs it |
+| Healthcheck path | `/health`, the one always-on route with no dependencies (uptime, version, node version; `GET /ready` pings Redis and is for *readiness*, not the deploy gate) |
+| Restart policy | `ON_FAILURE` |
 
-Two service settings the config file cannot carry:
+Two build facts behind those values are proven, one is precautionary (all measured against live Railway deploys 2026-08-06, commit `c4b6dc7`):
+
+- **Proven:** `NODE_ENV=production` makes `npm ci` omit devDependencies, so the build command forces `--include=dev` or `tsc` is missing at build time.
+- **Proven:** `tsconfig.build.json` pins `rootDir ./src` so the emit lands at `dist/index.js`, where the start command and `package.json` `main`/`types` point. The inherited `rootDir ./` emitted `dist/src/index.js` and had never been exercised — only the tsx dev loop had ever run this repo.
+- **Precautionary, causality NOT established:** the builder is Railpack, not Nixpacks. Five consecutive builds died at `BUILD_IMAGE` with zero log output under Nixpacks, and the first Railpack build produced full output. The isolating experiment has not been run.
+
+Two more service settings:
 
 - **`NODE_ENV=production` must be set on the service.** `loadConfig` requires `NGROK_DOMAIN` in every other environment — a deploy has a real public URL and no tunnel, so production is the documented bypass ([`src/config/loader.ts`](./src/config/loader.ts), `loadNgrokDomain`). Without it the process throws at boot.
 - **`PORT`** is injected by Railway; the app binds it (default `3000`) and Railway's domain `targetPort` must match.
